@@ -1,6 +1,6 @@
 ## Goal
 
-Generate beam search trajectories for the following datasets:
+Generate Chain-of-Thought trajectories for the following datasets:
 
 1.  BFCL v1
 2. BigBench Movie Recommendation
@@ -14,4 +14,11 @@ Generate beam search trajectories for the following datasets:
 10. Math500
 11. HLE
 
+
+Use the following models:
+```
+llama3.1-8B (Instruct)
+openai/gpt-oss-20b (Instruct)
+qwen3 32B (Instruct)
+```
 
