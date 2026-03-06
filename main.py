@@ -6,8 +6,8 @@ from dotenv import load_dotenv
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from utils.enum import MODEL_DICT
 
-
 from prompts.load_prompt import load_prompt
+from evaluate_logiqa import run_logiqa_eval
 
 load_dotenv()
 
@@ -44,6 +44,13 @@ def parse():
         default=10,
         help="Number of samples to process from the dataset."
     )
+    args.add_argument(
+        "--shot_mode",
+        type=str,
+        default="zero",
+        choices=["zero", "few"],
+        help="Prompting mode for LogiQA: zero-shot or few-shot CoT."
+    )
     return args.parse_args()
 
 
@@ -79,15 +86,27 @@ def main(args):
     logger.info("Sample entry:")
     logger.info(json.dumps(dataset[0], indent=2, default=str))
 
-    model = MODEL_DICT[args.model]
+    model_name = MODEL_DICT[args.model]
     sample_size = min(args.sample_size, len(dataset))
+    out_path = f"{args.model}_{args.dataset}_trajectories_{sample_size}.json"
 
+    if args.dataset == "logiqa":
+        # Full LogiQA pipeline: CoT prompting + DynamicCache + structured parsing.
+        results = run_logiqa_eval(
+            model_name=model_name,
+            dataset=dataset[:sample_size],
+            shot_mode=args.shot_mode,
+        )
+        with open(out_path, "w") as f:
+            json.dump(results, f, indent=2)
+        logger.info(f"Results written to {out_path}")
+        return
+
+    # Generic path for all other datasets.
     prompt = load_prompt(args.dataset)
+    trajectories = generate_trajectories(model_name, dataset[:sample_size], prompt)
 
-    trajectories = generate_trajectories(model, dataset[:sample_size], prompt)
-
-
-    with open(f"{args.model}_{args.dataset}_trajectories_{sample_size}.json", "w") as f:
+    with open(out_path, "w") as f:
         for i in range(sample_size):
             json.dump({
                 "index": i,
