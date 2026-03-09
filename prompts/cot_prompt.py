@@ -18,6 +18,9 @@ SYSTEM = (
     "'Final Answer:'."
 )
 
+
+ASSISTANT_START = """Let's think step-by-step.\nStep 1: """
+
 # ---------------------------------------------------------------------------
 # Per-dataset user-turn prompt templates
 # The placeholder {question} will be filled at runtime.
@@ -97,16 +100,7 @@ Question:
 Options:
 {options}
 
-Reason step-by-step through the logical relationships before selecting an \
-answer.
-
-Step 1: Summarize the key facts stated in the context.
-Step 2: Identify what the question is asking.
-Step 3: Evaluate each option against the facts and logical rules.
-Step 4: Eliminate contradictory or unsupported options.
-Step 5: Select the option best supported by the context.
-
-Final Answer: <option label and text>
+Reason step-by-step through the logical relationships before selecting an answer. 'Final Answer:' must be followed by exactly one letter: A, B, C, or D.
 """
 
 # --- CodeQA ----------------------------------------------------------------
@@ -250,16 +244,16 @@ Final Answer: <your answer>
 # ---------------------------------------------------------------------------
 
 PROMPT_REGISTRY: dict[str, tuple[str, str]] = {
-    "bfcl":                 (SYSTEM, BFCL),
-    "bigbench_movie":       (SYSTEM, BIGBENCH_MOVIE),
-    "bigbench_causal":      (SYSTEM, BIGBENCH_CAUSAL),
-    "logiqа":               (SYSTEM, LOGIQIA),   # kept as alias below too
-    "logiqa":               (SYSTEM, LOGIQIA),
-    "codeqa":               (SYSTEM, CODEQA),
-    "cs1qa":                (SYSTEM, CS1QA),
-    "hotpotqa":             (SYSTEM, HOTPOTQA),
-    "college_math_test":    (SYSTEM, COLLEGE_MATH),
-    "olympiadbench":        (SYSTEM, OLYMPIADBENCH),
-    "math500":              (SYSTEM, MATH500),
-    "hle":                  (SYSTEM, HLE),
+    "bfcl":                 (SYSTEM, BFCL, ASSISTANT_START),
+    "bigbench_movie":       (SYSTEM, BIGBENCH_MOVIE, ASSISTANT_START),
+    "bigbench_causal":      (SYSTEM, BIGBENCH_CAUSAL, ASSISTANT_START),
+    "logiqа":               (SYSTEM, LOGIQIA, ASSISTANT_START),   # kept as alias below too
+    "logiqa":               (SYSTEM, LOGIQIA, ASSISTANT_START),
+    "codeqa":               (SYSTEM, CODEQA, ASSISTANT_START),
+    "cs1qa":                (SYSTEM, CS1QA, ASSISTANT_START),
+    "hotpotqa":             (SYSTEM, HOTPOTQA, ASSISTANT_START),
+    "college_math_test":    (SYSTEM, COLLEGE_MATH, ASSISTANT_START),
+    "olympiadbench":        (SYSTEM, OLYMPIADBENCH, ASSISTANT_START),
+    "math500":              (SYSTEM, MATH500, ASSISTANT_START),
+    "hle":                  (SYSTEM, HLE, ASSISTANT_START),
 }
