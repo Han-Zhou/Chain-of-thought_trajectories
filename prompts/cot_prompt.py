@@ -18,6 +18,8 @@ SYSTEM = (
     "'Final Answer:'."
 )
 
+ASSISTANT_START = """Let's think step-by-step.\nStep 1: """
+
 # ---------------------------------------------------------------------------
 # Per-dataset user-turn prompt templates
 # The placeholder {question} will be filled at runtime.
@@ -27,7 +29,7 @@ SYSTEM = (
 
 # --- BFCL v1 ---------------------------------------------------------------
 # Extra fields: {functions}  — JSON description of available API functions.
-BFCL = """\
+BFCL_prev = """\
 You are given a user request and a list of available API functions.
 Your task is to decide which function(s) to call and with what arguments.
 
@@ -47,6 +49,19 @@ Step 4: Verify the chosen call satisfies all constraints in the function \
 schema.
 
 Final Answer: <function call(s) in the required format>
+"""
+
+BFCL = """\
+You are also an expert in composing functions.You are given a question and a set of possible functions. Based on the question, you will need to make one or more function/tool calls to achieve the purpose. If none of the functions can be used, point it out. If the given question lacks the parameters required by the function, also point it out.
+
+You should only return the function calls in your FINAL response.
+
+If you decide to invoke any of the function(s), you MUST put it in the format of [func_name1(params_name1=params_value1, params_name2=params_value2...), func_name2(params)].  You SHOULD NOT include any other text in the FINAL response.
+
+At each turn, you should try your best to complete the tasks requested by the user within the current turn. Continue to output functions to call until you have fulfilled the user's request to the best of your ability. Once you have no more functions to call, the system will consider the current turn complete and proceed to the next turn or task.
+
+Here is a list of functions in json format that you can invoke.
+{functions}
 """
 
 # --- BigBench Movie Recommendation -----------------------------------------
@@ -249,17 +264,17 @@ Final Answer: <your answer>
 # Registry mapping dataset name → (system_prompt, user_prompt_template)
 # ---------------------------------------------------------------------------
 
-PROMPT_REGISTRY: dict[str, tuple[str, str]] = {
-    "bfcl":                 (SYSTEM, BFCL),
-    "bigbench_movie":       (SYSTEM, BIGBENCH_MOVIE),
-    "bigbench_causal":      (SYSTEM, BIGBENCH_CAUSAL),
-    "logiqа":               (SYSTEM, LOGIQIA),   # kept as alias below too
-    "logiqa":               (SYSTEM, LOGIQIA),
-    "codeqa":               (SYSTEM, CODEQA),
-    "cs1qa":                (SYSTEM, CS1QA),
-    "hotpotqa":             (SYSTEM, HOTPOTQA),
-    "college_math_test":    (SYSTEM, COLLEGE_MATH),
-    "olympiadbench":        (SYSTEM, OLYMPIADBENCH),
-    "math500":              (SYSTEM, MATH500),
-    "hle":                  (SYSTEM, HLE),
+PROMPT_REGISTRY: dict[str, tuple[str, str, str]] = {
+    "bfcl":                 (SYSTEM, BFCL, ASSISTANT_START),
+    "bigbench_movie":       (SYSTEM, BIGBENCH_MOVIE, ASSISTANT_START),
+    "bigbench_causal":      (SYSTEM, BIGBENCH_CAUSAL, ASSISTANT_START),
+    "logiqа":               (SYSTEM, LOGIQIA, ASSISTANT_START),   # kept as alias below too
+    "logiqa":               (SYSTEM, LOGIQIA, ASSISTANT_START),
+    "codeqa":               (SYSTEM, CODEQA, ASSISTANT_START),
+    "cs1qa":                (SYSTEM, CS1QA, ASSISTANT_START),
+    "hotpotqa":             (SYSTEM, HOTPOTQA, ASSISTANT_START),
+    "college_math_test":    (SYSTEM, COLLEGE_MATH, ASSISTANT_START),
+    "olympiadbench":        (SYSTEM, OLYMPIADBENCH, ASSISTANT_START),
+    "math500":              (SYSTEM, MATH500, ASSISTANT_START),
+    "hle":                  (SYSTEM, HLE, ASSISTANT_START),
 }
