@@ -226,6 +226,8 @@ def generate_trajectories(model, dataset, dataset_name=None, shot_mode="zero", n
         device_map="auto",
         torch_dtype="auto",
         # attn_implementation="flash_attention_2"
+        torch_dtype="auto",
+        # attn_implementation="flash_attention_2"
     )
 
     trajectories = []
