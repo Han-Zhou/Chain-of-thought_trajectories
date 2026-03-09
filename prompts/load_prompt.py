@@ -16,7 +16,7 @@ from prompts.cot_prompt import PROMPT_REGISTRY
 SUPPORTED_DATASETS = list(PROMPT_REGISTRY.keys())
 
 
-def load_prompt(dataset: str) -> tuple[str, str]:
+def load_prompt(dataset: str) -> tuple[str, str, str]:
     """Return (system_prompt, user_prompt_template) for *dataset*.
 
     The user_prompt_template is a str.format()-compatible string.
