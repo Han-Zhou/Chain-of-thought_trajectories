@@ -19,8 +19,10 @@ SYSTEM = (
 )
 
 
-# ASSISTANT_START = """Let's think step-by-step.\nStep 1: """
-ASSISTANT_START = """<think>\n"""
+ASSISTANT_START = """Let's think step-by-step.\nStep 1: """
+# ASSISTANT_START = """<think>\n"""
+# ASSISTANT_START = ""
+
 
 # ---------------------------------------------------------------------------
 # Per-dataset user-turn prompt templates

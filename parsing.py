@@ -40,11 +40,11 @@ def parse_output(generated_text: str) -> ParsedOutput:
         cot_block = text
         answer_segment = ""
 
-    final_letter = ""
+    final_answer = ""
     if answer_segment:
         m = _FINAL_ANSWER_RE.search(answer_segment)
         if m:
-            final_letter = m.group(1).upper()
+            final_answer = m.group(1).upper()
 
     parts = _STEP_MARKER_RE.split(cot_block)
 
@@ -64,6 +64,7 @@ def parse_output(generated_text: str) -> ParsedOutput:
 
     return ParsedOutput(
         cot_steps=steps,
-        final_answer_letter=final_letter,
+        final_answer=final_answer,
         raw_cot_block=cot_block,
+        answer_char_start=split_pos if split_pos != -1 else None,
     )

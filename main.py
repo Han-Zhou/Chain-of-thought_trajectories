@@ -66,8 +66,8 @@ def parse():
     args.add_argument(
         "--sample_size",
         type=int,
-        default=10,
-        help="Number of samples to process from the dataset."
+        default=None,
+        help="Number of samples to process from the dataset. Defaults to all."
     )
     args.add_argument(
         "--shot_mode",
@@ -110,21 +110,25 @@ def generate_one(
         temperature>0.0 → multinomial sampling.
     """
 
-    # breakpoint()
-
     device = next(model.parameters()).device
     prompt_text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=False,     # MUST be False if you provide the assistant role
-        continue_final_message=True      # MUST be True for Assistant Prefilling
+        continue_final_message=True,      # MUST be True for Assistant Prefilling
+        # add_generation_prompt=True,
+        # continue_final_message=False,
+        chat_template_kwargs={"enable_thinking": True},
+        # enable_thinking=True,
     )
 
-    # breakpoint()
+    print(prompt_text)
+    breakpoint()
 
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
     prompt_len: int = inputs["input_ids"].shape[1]
 
+    # Qwen3.5 has a custom DynamicCache implementation that is required for correct attention behavior.  
     if hasattr(model.config, "layer_types") and "linear_attention" in model.config.layer_types:
         cache = Qwen3_5DynamicCache(config=model.config)
     else:
@@ -142,11 +146,15 @@ def generate_one(
         )
 
     total_len: int = outputs.sequences.shape[1]
-    prompt_positions = list(range(0, prompt_len))
-    generated_positions = list(range(prompt_len, total_len))
+    # prompt_positions - 1 is the end position of the prompt text
+    prompt_positions = prompt_len
+    # generated_positions - 1 is the end position of the generated text
+    generated_positions = total_len
 
     generated_ids = outputs.sequences[0, prompt_len:]
     generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+    breakpoint()
 
     return GenerationResult(
         prompt_text=prompt_text,
@@ -158,13 +166,13 @@ def generate_one(
 
 
 
-def generate_trajectories(model, dataloader, dataset_name=None, shot_mode="zero", n_shots=2):
+def generate_trajectories(model, dataloader, dataset_name=None, shot_mode="zero"):
     tokenizer = AutoTokenizer.from_pretrained(model)
     model = AutoModelForCausalLM.from_pretrained(
         model,
         device_map="auto",
         torch_dtype="auto",
-        # attn_implementation="flash_attention_2"
+        attn_implementation="sdpa"
     )
 
     trajectories = []
@@ -174,34 +182,28 @@ def generate_trajectories(model, dataloader, dataset_name=None, shot_mode="zero"
 
         messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry)
 
-        # if dataset_name == "logiqa":
-        gen: GenerationResult = generate_one(model, tokenizer, messages)
+        gen: GenerationResult = generate_one(model, tokenizer, messages, max_new_tokens=2048)
         parsed: ParsedOutput = parse_output(gen.generated_text)
-        trajectories.append({
-            "id":                        entry["id"],
-            "question":                  entry["question"],
-            "ground_truth":              entry["answer"],
-            "cot_steps":                 parsed.cot_steps,
-            "raw_cot_block":             parsed.raw_cot_block,
-            "generated_text":            gen.generated_text,
-            "prompt_token_positions":    gen.prompt_token_positions,
-            "generated_token_positions": gen.generated_token_positions,
-        })
-        # else:
-        #     inputs = tokenizer.apply_chat_template(
-        #         messages,
-        #         return_tensors="pt",
-        #         add_generation_prompt=False,     # MUST be False if you provide the assistant role
-        #         continue_final_message=True      # MUST be True for Assistant Prefilling
-        #     )
-        #     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-        #     outputs = model.generate(
-        #         **inputs,
-        #         max_length=4096
-        #     )
-        #     output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        #     trajectories.append(output_text)
+        if parsed.answer_char_start is not None:
+            prefix_ids = tokenizer(gen.generated_text[:parsed.answer_char_start], add_special_tokens=False)["input_ids"]
+            answer_token_start_position = gen.prompt_token_positions + len(prefix_ids)
+        else:
+            answer_token_start_position = None
+
+        trajectories.append({
+            "id":                           entry["id"],
+            "question":                     entry["question"],
+            "ground_truth":                 entry["answer"],
+            "cot_steps":                    parsed.cot_steps,
+            "raw_cot_block":                parsed.raw_cot_block,
+            "final_answer":                 parsed.final_answer,
+            "generated_text":               gen.generated_text,
+            "prompt_token_positions":       gen.prompt_token_positions,
+            "generated_token_positions":    gen.generated_token_positions,
+            "answer_token_start_position":  answer_token_start_position,
+            "past_key_values":              gen.past_key_values,
+        })
 
     return trajectories
 
@@ -213,7 +215,7 @@ def main(args):
     logger.info(json.dumps(dataset[0], indent=2, default=str))
 
     model_name = MODEL_DICT[args.model]
-    sample_size = min(args.sample_size, len(dataset))
+    sample_size = len(dataset) if args.sample_size is None else min(args.sample_size, len(dataset))
     dataloader = make_dataloader(dataset, n=sample_size)
 
     trajectories = generate_trajectories(
@@ -223,14 +225,26 @@ def main(args):
     )
 
 
-    out_path = f"{args.model}_{args.dataset}_trajectories_{sample_size}.json"
-    with open(out_path, "w") as f:
-        for i in range(sample_size):
-            json.dump({
+    out_dir = f"trajectories/{args.model}_{args.dataset}_{args.shot_mode}_{sample_size}"
+    os.makedirs(out_dir, exist_ok=True)
+
+    out_file = os.path.join(out_dir, f"{args.model}_{args.dataset}_{args.shot_mode}_trajectories_{sample_size}.json")
+    with open(out_file, "w") as f:
+        for i, traj in enumerate(trajectories):
+            cache = traj.pop("past_key_values")
+            torch.save(cache, os.path.join(out_dir, f"cache_{i}.pt"))
+
+            prompt_len = traj.pop("prompt_token_positions")
+            gen_len = traj.pop("generated_token_positions")
+            traj["prompt_token_positions"] = list(range(0, prompt_len))
+            traj["generated_token_positions"] = list(range(prompt_len, gen_len))
+
+            entry = {
                 "index": i,
-                "question": dataset[i]["question"],
-                "trajectory": trajectories[i]
-            }, f, indent=2)
+                "question": traj["question"],
+                "trajectory": traj,
+            }
+            json.dump(entry, f, indent=2)
             f.write("\n")
 
 
