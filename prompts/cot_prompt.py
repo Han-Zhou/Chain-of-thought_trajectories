@@ -19,7 +19,8 @@ SYSTEM = (
 )
 
 
-ASSISTANT_START = """Let's think step-by-step.\nStep 1: """
+# ASSISTANT_START = """Let's think step-by-step.\nStep 1: """
+ASSISTANT_START = """<think>\n"""
 
 # ---------------------------------------------------------------------------
 # Per-dataset user-turn prompt templates
@@ -102,6 +103,12 @@ Final Answer: <Yes / No / your conclusion>
 
 # --- LogiQA ----------------------------------------------------------------
 LOGIQIA = """\
+You are an expert in logical reasoning.
+
+Reason step-by-step through the logical relationships before selecting an answer. 'Final Answer:' must be followed by exactly one letter: A, B, C, or D.
+"""
+
+LOGIQIA_experimental_system = """\
 You are an expert in logical reasoning.
 
 Context:

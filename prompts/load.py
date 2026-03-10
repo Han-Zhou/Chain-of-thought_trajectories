@@ -16,12 +16,12 @@ def load_prompt_from_registry(dataset: str) -> tuple[str, str, str]:
         )
     return PROMPT_REGISTRY[key]
 
-# Few-shot demonstrations loaded from prompts/few_shot_examples/logiqa.json.
-_FEW_SHOT_PATH = (
-    pathlib.Path(__file__).parent / "prompts" / "few_shot_examples" / "logiqa.json"
-)
-with _FEW_SHOT_PATH.open() as _f:
-    FEW_SHOT_EXAMPLES: list = json.load(_f)
+# # Few-shot demonstrations loaded from prompts/few_shot_examples/logiqa.json.
+# _FEW_SHOT_PATH = (
+#     pathlib.Path(__file__).parent / "prompts" / "few_shot_examples" / "logiqa.json"
+# )
+# with _FEW_SHOT_PATH.open() as _f:
+#     FEW_SHOT_EXAMPLES: list = json.load(_f)
 
 
 def load_few_shot(dataset: str) -> str:
