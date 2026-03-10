@@ -23,12 +23,14 @@ import json
 import torch
 from dotenv import load_dotenv
 from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
 
 from utils.enum import MODEL_DICT
 from utils.structures import GenerationResult, ParsedOutput
 from prompts.load import load_messages
 from prompts.cot_prompt import SYSTEM as _SYSTEM_BASE
-from load_datasets import load
+from dataloader import load_dataset, make_dataloader
+from parsing import parse_output
 
 load_dotenv()
 
@@ -36,9 +38,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Section 1 – Prompt Formatting (LogiQA)
-# =============================================================================
 
 LETTERS = "ABCD"
 
@@ -110,17 +109,26 @@ def generate_one(
         temperature=0.0 → greedy decoding (deterministic, good for evals).
         temperature>0.0 → multinomial sampling.
     """
+
+    # breakpoint()
+
     device = next(model.parameters()).device
     prompt_text = tokenizer.apply_chat_template(
         messages,
-        return_tensors="pt",
+        tokenize=False,
         add_generation_prompt=False,     # MUST be False if you provide the assistant role
         continue_final_message=True      # MUST be True for Assistant Prefilling
     )
+
+    # breakpoint()
+
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
     prompt_len: int = inputs["input_ids"].shape[1]
 
-    cache = DynamicCache()
+    if hasattr(model.config, "layer_types") and "linear_attention" in model.config.layer_types:
+        cache = Qwen3_5DynamicCache(config=model.config)
+    else:
+        cache = DynamicCache()
 
     with torch.inference_mode():
         outputs = model.generate(
@@ -149,138 +157,67 @@ def generate_one(
     )
 
 
-# =============================================================================
-# Section 3 – Parsing (LogiQA)
-# =============================================================================
 
-# Matches: "Final Answer: B" / "final answer: (C)" / "Final Answer: [d]" etc.
-_FINAL_ANSWER_RE = re.compile(
-    r"final\s+answer\s*:?\s*[\(\[]?\s*([A-Da-d])\s*[\)\]]?",
-    re.IGNORECASE,
-)
-
-# Matches "Step 1:", "Step 2:", ... as step delimiters inside the CoT block.
-_STEP_MARKER_RE = re.compile(r"(Step\s+\d+\s*:)", re.IGNORECASE)
-
-
-def parse_output(generated_text: str) -> ParsedOutput:
-    """Split a raw generation into structured CoT steps and the final answer.
-
-    Strategy:
-      1. Find "Final Answer:" to split the text into a CoT block and an
-         answer segment.  Case- and punctuation-insensitive.
-      2. Within the CoT block, split on "Step N:" markers to get individual
-         steps.  If no markers are found, fall back to blank-line splitting,
-         then single-line splitting.
-      3. Extract the letter (A-D) from the answer segment with a lenient regex
-         that handles parentheses, brackets, and lowercase letters.
-    """
-    text = generated_text.strip()
-
-    split_pos = text.lower().find("final answer")
-    if split_pos != -1:
-        cot_block = text[:split_pos].strip()
-        answer_segment = text[split_pos:]
-    else:
-        cot_block = text
-        answer_segment = ""
-
-    final_letter = ""
-    if answer_segment:
-        m = _FINAL_ANSWER_RE.search(answer_segment)
-        if m:
-            final_letter = m.group(1).upper()
-
-    parts = _STEP_MARKER_RE.split(cot_block)
-
-    steps: list = []
-    if len(parts) > 1:
-        preamble = parts[0].strip()
-        if preamble:
-            steps.append(preamble)
-        for i in range(1, len(parts) - 1, 2):
-            marker = parts[i].strip()
-            body = parts[i + 1].strip() if i + 1 < len(parts) else ""
-            steps.append(f"{marker} {body}".strip())
-    else:
-        steps = [s.strip() for s in re.split(r"\n{2,}", cot_block) if s.strip()]
-        if len(steps) <= 1:
-            steps = [s.strip() for s in cot_block.splitlines() if s.strip()]
-
-    return ParsedOutput(
-        cot_steps=steps,
-        final_answer_letter=final_letter,
-        raw_cot_block=cot_block,
-    )
-
-
-# =============================================================================
-# CLI
-# =============================================================================
-
-
-def generate_trajectories(model, dataset, dataset_name=None, shot_mode="zero", n_shots=2):
+def generate_trajectories(model, dataloader, dataset_name=None, shot_mode="zero", n_shots=2):
     tokenizer = AutoTokenizer.from_pretrained(model)
     model = AutoModelForCausalLM.from_pretrained(
         model,
         device_map="auto",
         torch_dtype="auto",
         # attn_implementation="flash_attention_2"
-        torch_dtype="auto",
-        # attn_implementation="flash_attention_2"
     )
 
     trajectories = []
 
-
-    for i, entry in enumerate(dataset):
-        logger.info(f"Generating {i}/{len(dataset)}")
+    for i, entry in enumerate(dataloader):
+        logger.info(f"Generating {i}/{len(dataloader)}")
 
         messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry)
 
-        if dataset_name == "logiqa":
-            gen: GenerationResult = generate_one(model, tokenizer, messages)
-            parsed: ParsedOutput = parse_output(gen.generated_text)
-            trajectories.append({
-                "id":                        entry["id"],
-                "question":                  entry["question"],
-                "ground_truth":              entry["answer"],
-                "cot_steps":                 parsed.cot_steps,
-                "raw_cot_block":             parsed.raw_cot_block,
-                "generated_text":            gen.generated_text,
-                "prompt_token_positions":    gen.prompt_token_positions,
-                "generated_token_positions": gen.generated_token_positions,
-            })
-        else:
-            inputs = tokenizer.apply_chat_template(
-                messages,
-                return_tensors="pt",
-                add_generation_prompt=False,     # MUST be False if you provide the assistant role
-                continue_final_message=True      # MUST be True for Assistant Prefilling
-            )
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        # if dataset_name == "logiqa":
+        gen: GenerationResult = generate_one(model, tokenizer, messages)
+        parsed: ParsedOutput = parse_output(gen.generated_text)
+        trajectories.append({
+            "id":                        entry["id"],
+            "question":                  entry["question"],
+            "ground_truth":              entry["answer"],
+            "cot_steps":                 parsed.cot_steps,
+            "raw_cot_block":             parsed.raw_cot_block,
+            "generated_text":            gen.generated_text,
+            "prompt_token_positions":    gen.prompt_token_positions,
+            "generated_token_positions": gen.generated_token_positions,
+        })
+        # else:
+        #     inputs = tokenizer.apply_chat_template(
+        #         messages,
+        #         return_tensors="pt",
+        #         add_generation_prompt=False,     # MUST be False if you provide the assistant role
+        #         continue_final_message=True      # MUST be True for Assistant Prefilling
+        #     )
+        #     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-            outputs = model.generate(
-                **inputs,
-                max_length=4096
-            )
-            output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-            trajectories.append(output_text)
+        #     outputs = model.generate(
+        #         **inputs,
+        #         max_length=4096
+        #     )
+        #     output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        #     trajectories.append(output_text)
 
     return trajectories
 
 
 def main(args):
-    dataset = load(args.dataset)
+    dataset = load_dataset(args.dataset)
     logger.info(f"Loaded {len(dataset)} entries from '{args.dataset}'.")
     logger.info("Sample entry:")
     logger.info(json.dumps(dataset[0], indent=2, default=str))
 
     model_name = MODEL_DICT[args.model]
     sample_size = min(args.sample_size, len(dataset))
+    dataloader = make_dataloader(dataset, n=sample_size)
 
     trajectories = generate_trajectories(
-        model_name, dataset[:sample_size],
+        model_name, dataloader,
         dataset_name=args.dataset,
         shot_mode=args.shot_mode,
     )
