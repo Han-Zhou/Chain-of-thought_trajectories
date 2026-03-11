@@ -120,38 +120,6 @@ def generate_one(
 
     model_name = model.config._name_or_path
 
-    # if "qwen" in model_name.lower():
-    #     # Patch the template at load time
-    #     tokenizer.chat_template = tokenizer.chat_template.replace(
-    #         "<think>\n</think>\n", ""
-    #     )
-
-    # if "qwen" in model_name.lower():
-    #     prompt_text = tokenizer.apply_chat_template(
-    #         messages,
-    #         tokenize=False,
-    #         add_generation_prompt=False,     # MUST be False if you provide the assistant role
-    #         continue_final_message=True,      # MUST be True for Assistant Prefilling
-    #         # add_generation_prompt=True,
-    #         # continue_final_message=False,
-    #         # chat_template_kwargs={"enable_thinking": True},
-    #         # enable_thinking=True,
-    #     )
-    # elif "gpt" in model_name.lower():
-    #     prompt_text = tokenizer.apply_chat_template(
-    #         messages,
-    #         tokenize=False,
-    #         add_generation_prompt=False,     # MUST be False if you provide the assistant role
-    #         continue_final_message=True,
-    #     )
-    # elif "llama" in model_name.lower():
-    #     prompt_text = tokenizer.apply_chat_template(
-    #         messages,
-    #         tokenize=False,
-    #         add_generation_prompt=False,     # MUST be False if you provide the assistant role
-    #         continue_final_message=True,
-    #     )
-
     prompt_text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -223,25 +191,18 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     if model_name in MODEL_DICT["qwen"]: 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            torch_dtype="auto",
-            attn_implementation="sdpa"
-        )
+        attn_implementation = "sdpa" 
     elif model_name in MODEL_DICT["gpt"] or model_name in MODEL_DICT["llama"]:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            torch_dtype="auto",
-            attn_implementation="flash_attention_2",
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            torch_dtype="auto",
-        )
+        attn_implementation = "flash_attention_2"
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        torch_dtype="auto",
+        attn_implementation=attn_implementation
+    )
+
+
 
     trajectories = []
 
