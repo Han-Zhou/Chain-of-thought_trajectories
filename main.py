@@ -212,10 +212,16 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
         messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry)
 
         gen: GenerationResult = generate_one(model, tokenizer, messages, max_new_tokens=max_new_tokens)
-        parsed: ParsedOutput = parse_output(gen.generated_text)
+
+        assistant_prefill = next((m["content"] for m in reversed(messages) if m["role"] == "assistant"), "")
+        full_generated_text = assistant_prefill + gen.generated_text
+        parsed: ParsedOutput = parse_output(full_generated_text)
 
         if parsed.answer_char_start is not None:
-            prefix_ids = tokenizer(gen.generated_text[:parsed.answer_char_start], add_special_tokens=False)["input_ids"]
+            # answer_char_start is an offset into full_generated_text (prefill + new tokens).
+            # Token positions only count newly generated tokens, so strip the prefill chars first.
+            generated_prefix = full_generated_text[len(assistant_prefill):parsed.answer_char_start]
+            prefix_ids = tokenizer(generated_prefix, add_special_tokens=False)["input_ids"]
             answer_token_start_position = gen.prompt_token_positions + len(prefix_ids)
         else:
             answer_token_start_position = None
@@ -227,7 +233,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
             "cot_steps":                    parsed.cot_steps,
             "raw_cot_block":                parsed.raw_cot_block,
             "final_answer":                 parsed.final_answer,
-            "generated_text":               gen.generated_text,
+            "generated_text":               full_generated_text,
             "prompt_token_positions":       gen.prompt_token_positions,
             "generated_token_positions":    gen.generated_token_positions,
             "answer_token_start_position":  answer_token_start_position,
