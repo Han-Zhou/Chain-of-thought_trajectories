@@ -76,6 +76,12 @@ def parse():
         choices=["zero", "few"],
         help="Prompting mode for LogiQA: zero-shot or few-shot CoT."
     )
+    args.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=512,
+        help="Maximum number of new tokens to generate for each prompt."
+    )
     return args.parse_args()
 
 
@@ -84,7 +90,7 @@ def generate_one(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     messages: list[dict[str, str]],
-    max_new_tokens: int = 512,
+    max_new_tokens: int,
     temperature: float = 0.0,
 ) -> GenerationResult:
     """Run one forward pass through model.generate() with a DynamicCache.
@@ -111,6 +117,41 @@ def generate_one(
     """
 
     device = next(model.parameters()).device
+
+    model_name = model.config._name_or_path
+
+    # if "qwen" in model_name.lower():
+    #     # Patch the template at load time
+    #     tokenizer.chat_template = tokenizer.chat_template.replace(
+    #         "<think>\n</think>\n", ""
+    #     )
+
+    # if "qwen" in model_name.lower():
+    #     prompt_text = tokenizer.apply_chat_template(
+    #         messages,
+    #         tokenize=False,
+    #         add_generation_prompt=False,     # MUST be False if you provide the assistant role
+    #         continue_final_message=True,      # MUST be True for Assistant Prefilling
+    #         # add_generation_prompt=True,
+    #         # continue_final_message=False,
+    #         # chat_template_kwargs={"enable_thinking": True},
+    #         # enable_thinking=True,
+    #     )
+    # elif "gpt" in model_name.lower():
+    #     prompt_text = tokenizer.apply_chat_template(
+    #         messages,
+    #         tokenize=False,
+    #         add_generation_prompt=False,     # MUST be False if you provide the assistant role
+    #         continue_final_message=True,
+    #     )
+    # elif "llama" in model_name.lower():
+    #     prompt_text = tokenizer.apply_chat_template(
+    #         messages,
+    #         tokenize=False,
+    #         add_generation_prompt=False,     # MUST be False if you provide the assistant role
+    #         continue_final_message=True,
+    #     )
+
     prompt_text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -118,13 +159,26 @@ def generate_one(
         continue_final_message=True,      # MUST be True for Assistant Prefilling
         # add_generation_prompt=True,
         # continue_final_message=False,
-        chat_template_kwargs={"enable_thinking": True},
+        # chat_template_kwargs={"enable_thinking": True},
         # enable_thinking=True,
     )
 
-    print(prompt_text)
-    breakpoint()
+    # Post-process: strip the empty think block that Qwen injects
+    if "qwen" in model_name.lower():
+        prompt_text = re.sub(r"<think>\s*</think>\s*", "", prompt_text)
 
+    # Post-process: GPT-OSS templates default to <|channel|>final for the assistant prefill.
+    # Switch the last occurrence to <|channel|>analysis so the model reasons before answering.
+    if "gpt" in model_name.lower():
+        target = "<|channel|>final"
+        last_idx = prompt_text.rfind(target)
+        if last_idx != -1:
+            prompt_text = prompt_text[:last_idx] + "<|channel|>analysis" + prompt_text[last_idx + len(target):]
+
+    print(prompt_text)
+
+    breakpoint()
+        
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
     prompt_len: int = inputs["input_ids"].shape[1]
 
@@ -154,7 +208,6 @@ def generate_one(
     generated_ids = outputs.sequences[0, prompt_len:]
     generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-    breakpoint()
 
     return GenerationResult(
         prompt_text=prompt_text,
@@ -166,14 +219,29 @@ def generate_one(
 
 
 
-def generate_trajectories(model, dataloader, dataset_name=None, shot_mode="zero"):
-    tokenizer = AutoTokenizer.from_pretrained(model)
-    model = AutoModelForCausalLM.from_pretrained(
-        model,
-        device_map="auto",
-        torch_dtype="auto",
-        attn_implementation="sdpa"
-    )
+def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=None, shot_mode="zero"):
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    if model_name in MODEL_DICT["qwen"]: 
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            torch_dtype="auto",
+            attn_implementation="sdpa"
+        )
+    elif model_name in MODEL_DICT["gpt"] or model_name in MODEL_DICT["llama"]:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            torch_dtype="auto",
+            attn_implementation="flash_attention_2",
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="auto",
+            torch_dtype="auto",
+        )
 
     trajectories = []
 
@@ -182,7 +250,7 @@ def generate_trajectories(model, dataloader, dataset_name=None, shot_mode="zero"
 
         messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry)
 
-        gen: GenerationResult = generate_one(model, tokenizer, messages, max_new_tokens=2048)
+        gen: GenerationResult = generate_one(model, tokenizer, messages, max_new_tokens=max_new_tokens)
         parsed: ParsedOutput = parse_output(gen.generated_text)
 
         if parsed.answer_char_start is not None:
@@ -219,7 +287,7 @@ def main(args):
     dataloader = make_dataloader(dataset, n=sample_size)
 
     trajectories = generate_trajectories(
-        model_name, dataloader,
+        model_name, dataloader, args.max_new_tokens,
         dataset_name=args.dataset,
         shot_mode=args.shot_mode,
     )
@@ -234,10 +302,8 @@ def main(args):
             cache = traj.pop("past_key_values")
             torch.save(cache, os.path.join(out_dir, f"cache_{i}.pt"))
 
-            prompt_len = traj.pop("prompt_token_positions")
-            gen_len = traj.pop("generated_token_positions")
-            traj["prompt_token_positions"] = list(range(0, prompt_len))
-            traj["generated_token_positions"] = list(range(prompt_len, gen_len))
+            traj["prompt_token_positions"] = traj.pop("prompt_token_positions")
+            traj["generated_token_positions"] = traj.pop("generated_token_positions")
 
             entry = {
                 "index": i,

@@ -52,8 +52,6 @@ def load_messages(dataset: str, few_shot: bool, entry: dict) -> list[dict[str, s
             few_shot_messages = load_few_shot_prompt_from_registry(dataset)
             messages = messages[0:1] + few_shot_messages + messages[1:]
 
-        # breakpoint()
-
         return messages
 
     else:

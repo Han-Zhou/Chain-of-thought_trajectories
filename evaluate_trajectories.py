@@ -4,8 +4,16 @@ from huggingface_hub import snapshot_download
 import argparse
 
 
+RUN = "qwen_logiqa_zero_1"
 
-FILE_PATH = "./trajectories/qwen_logiqa_zero_trajectories_10.json"
+# place 'trajectories' before the last underscore in RUN
+if "_" in RUN:
+    prefix, suffix = RUN.rsplit("_", 1)
+    file_name = f"{prefix}_trajectories_{suffix}.json"
+else:
+    file_name = f"{RUN}_trajectories.json"
+
+FILE_PATH = f"./trajectories/{RUN}/{file_name}"
 
 def main():
     with open(FILE_PATH, "r") as f:

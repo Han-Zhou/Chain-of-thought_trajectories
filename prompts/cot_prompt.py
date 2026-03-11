@@ -20,7 +20,7 @@ SYSTEM = (
 
 
 ASSISTANT_START = """Let's think step-by-step.\nStep 1: """
-# ASSISTANT_START = """<think>\n"""
+# ASSISTANT_START = """<think>\nLet's think step-by-step.\nStep 1: """
 # ASSISTANT_START = ""
 
 
