@@ -18,7 +18,11 @@ SYSTEM = (
     "'Final Answer:'."
 )
 
+
 ASSISTANT_START = """Let's think step-by-step.\nStep 1: """
+# ASSISTANT_START = """<think>\nLet's think step-by-step.\nStep 1: """
+# ASSISTANT_START = ""
+
 
 # ---------------------------------------------------------------------------
 # Per-dataset user-turn prompt templates
@@ -103,6 +107,12 @@ Final Answer: <Yes / No / your conclusion>
 LOGIQIA = """\
 You are an expert in logical reasoning.
 
+Reason step-by-step through the logical relationships before selecting an answer. 'Final Answer:' must be followed by exactly one letter: A, B, C, or D.
+"""
+
+LOGIQIA_experimental_system = """\
+You are an expert in logical reasoning.
+
 Context:
 {context}
 
@@ -112,16 +122,7 @@ Question:
 Options:
 {options}
 
-Reason step-by-step through the logical relationships before selecting an \
-answer.
-
-Step 1: Summarize the key facts stated in the context.
-Step 2: Identify what the question is asking.
-Step 3: Evaluate each option against the facts and logical rules.
-Step 4: Eliminate contradictory or unsupported options.
-Step 5: Select the option best supported by the context.
-
-Final Answer: <option label and text>
+Reason step-by-step through the logical relationships before selecting an answer. 'Final Answer:' must be followed by exactly one letter: A, B, C, or D.
 """
 
 # --- CodeQA ----------------------------------------------------------------

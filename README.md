@@ -18,7 +18,7 @@ Generate Chain-of-Thought trajectories for the following datasets:
 Use the following models:
 ```
 llama3.1-8B (Instruct)
-openai/gpt-oss-20b (Instruct)
-qwen3 32B (Instruct)
+openai/gpt-oss-20b
+qwen3.5/27B
 ```
 
