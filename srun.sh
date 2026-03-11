@@ -17,7 +17,6 @@ srun \
         ./actual_run.sh
     "
 
-    # --nodelist=lux-2-node-22 \
 
 # srun \
 #     --job-name=trial_cot_trajectories \
