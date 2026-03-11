@@ -1,3 +1,3 @@
-from prompts.load import load_messages
+from prompts.load_prompt import load_prompt
 
-__all__ = ["load_messages"]
+__all__ = ["load_prompt"]
