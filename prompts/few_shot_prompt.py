@@ -33,7 +33,7 @@ LOGIQA_FEW_SHOT_MESSAGES = [
     {
         "role": "assistant",
         "content": (
-            "Let's think step-by-step.\n"
+            "{thinking_token_open}Let's think step-by-step.\n"
             "Step 1: From the hypothesis, Hypertension = (Genetic trait to save salt) + (Western high-salt diet).\n"
             "Step 2: Identify the Necessary Evidence: I need to find a group where the \"Genetic trait\""
             " is missing to see if the \"Hypertension\" also disappears.\n"
@@ -41,7 +41,7 @@ LOGIQA_FEW_SHOT_MESSAGES = [
             " Their descendants in the West have normal blood pressure.\n"
             "Step 4: This confirms that when the \"salt-deficient\" genetic history is removed,"
             " the Western diet doesn't cause the same level of hypertension.\n"
-            "Step 5: Option A is the best fit.\n"
+            "Step 5: Option A is the best fit.{thinking_token_close}\n"
             "Final Answer: A"
         ),
     },
@@ -68,7 +68,7 @@ LOGIQA_FEW_SHOT_MESSAGES = [
     {
         "role": "assistant",
         "content": (
-            "Let's think step-by-step.\n"
+            "{thinking_token_open}Let's think step-by-step.\n"
             "Step 1: The argument claims that ads don't work because young people already know cigarettes exist"
             " and where to buy them. It assumes ads only function as a source of \"missing information.\"\n"
             "Step 2: The argument overlooks that advertising isn't just about providing information;"
@@ -78,7 +78,7 @@ LOGIQA_FEW_SHOT_MESSAGES = [
             "Step 4: A directly addresses this by stating ads increase the desire to obtain the product."
             " B and C discuss the consequences for companies, not the behavior of young people."
             " D talks about anti-smoking ads, which doesn't explain why cigarette ads themselves are effective or ineffective.\n"
-            "Step 5: Option A is the best choice to weaken the argument.\n"
+            "Step 5: Option A is the best choice to weaken the argument.{thinking_token_close}\n"
             "Final Answer: A"
         ),
     },
@@ -104,5 +104,16 @@ FEW_SHOT_PROMPT_REGISTRY: dict[str, dict[str, str]] = {
     # "math500":              (SYSTEM, MATH500, ASSISTANT_START),
     # "hle":                  (SYSTEM, HLE, ASSISTANT_START),
 }
+
+
+THINKING_TOKENS: dict[str, tuple[str, str]] = {
+    "none": ("", ""),
+    "Qwen/Qwen3.5-27B": ("<think>\n", "\n<\\think>"),
+    # Gpt-OSS uses OpenAI Harmony format: https://developers.openai.com/cookbook/articles/openai-harmony/
+    # "openai/gpt-oss-20b": ("<|channel|>analysis<|message|>\n", "\n<|end|>")
+    "openai/gpt-oss-20b": ("", "")
+}
+
+
 
 
