@@ -4,7 +4,7 @@ from huggingface_hub import snapshot_download
 import argparse
 
 
-RUN = "qwen_logiqa_zero_1"
+RUN = "qwen_regular_logiqa_zero_1"
 
 # place 'trajectories' before the last underscore in RUN
 if "_" in RUN:

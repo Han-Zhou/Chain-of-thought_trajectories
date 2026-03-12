@@ -270,10 +270,10 @@ def main(args):
     )
 
 
-    out_dir = f"trajectories/{args.model}_{args.dataset}_{args.shot_mode}_{sample_size}"
+    out_dir = f"trajectories/{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{sample_size}"
     os.makedirs(out_dir, exist_ok=True)
 
-    out_file = os.path.join(out_dir, f"{args.model}_{args.dataset}_{args.shot_mode}_trajectories_{sample_size}.json")
+    out_file = os.path.join(out_dir, f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_trajectories_{sample_size}.json")
     with open(out_file, "w") as f:
         for i, traj in enumerate(trajectories):
             cache = traj.pop("past_key_values")
