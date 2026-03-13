@@ -82,6 +82,13 @@ def parse():
         default=512,
         help="Maximum number of new tokens to generate for each prompt."
     )
+    args.add_argument(
+        "--thinking",
+        action="store_true",
+        default=False,
+        help="Whether to use thinking.",
+    )
+
     return args.parse_args()
 
 
@@ -91,6 +98,7 @@ def generate_one(
     tokenizer: AutoTokenizer,
     messages: list[dict[str, str]],
     max_new_tokens: int,
+    thinking: bool,
     temperature: float = 0.0,
 ) -> GenerationResult:
     """Run one forward pass through model.generate() with a DynamicCache.
@@ -131,13 +139,14 @@ def generate_one(
         # enable_thinking=True,
     )
 
-    # Post-process: strip the empty think block that Qwen injects
+    # Post processing
+    # For qwen: strip the empty think block that Qwen injects
     if "qwen" in model_name.lower():
         prompt_text = re.sub(r"<think>\s*</think>\s*", "", prompt_text)
 
-    # Post-process: GPT-OSS templates default to <|channel|>final for the assistant prefill.
-    # Switch the last occurrence to <|channel|>analysis so the model reasons before answering.
-    if "gpt" in model_name.lower():
+    # For gpt: GPT-OSS templates default to <|channel|>final for the assistant prefill.
+    # if we are using thinking mode, Switch the last occurrence to <|channel|>analysis so the model reasons before answering.
+    if "gpt" in model_name.lower() and thinking:
         target = "<|channel|>final"
         last_idx = prompt_text.rfind(target)
         if last_idx != -1:
@@ -176,7 +185,6 @@ def generate_one(
     generated_ids = outputs.sequences[0, prompt_len:]
     generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-
     return GenerationResult(
         prompt_text=prompt_text,
         generated_text=generated_text,
@@ -187,7 +195,7 @@ def generate_one(
 
 
 
-def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=None, shot_mode="zero"):
+def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=None, shot_mode="zero", thinking=False):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     if model_name in MODEL_DICT["qwen"]: 
@@ -209,9 +217,9 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
     for i, entry in enumerate(dataloader):
         logger.info(f"Generating {i}/{len(dataloader)}")
 
-        messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry)
+        messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking)
 
-        gen: GenerationResult = generate_one(model, tokenizer, messages, max_new_tokens=max_new_tokens)
+        gen: GenerationResult = generate_one(model, tokenizer, messages, max_new_tokens=max_new_tokens, thinking=thinking)
 
         assistant_prefill = next((m["content"] for m in reversed(messages) if m["role"] == "assistant"), "")
         full_generated_text = assistant_prefill + gen.generated_text
@@ -257,13 +265,14 @@ def main(args):
         model_name, dataloader, args.max_new_tokens,
         dataset_name=args.dataset,
         shot_mode=args.shot_mode,
+        thinking=args.thinking,
     )
 
 
-    out_dir = f"trajectories/{args.model}_{args.dataset}_{args.shot_mode}_{sample_size}"
+    out_dir = f"trajectories/{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{sample_size}"
     os.makedirs(out_dir, exist_ok=True)
 
-    out_file = os.path.join(out_dir, f"{args.model}_{args.dataset}_{args.shot_mode}_trajectories_{sample_size}.json")
+    out_file = os.path.join(out_dir, f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_trajectories_{sample_size}.json")
     with open(out_file, "w") as f:
         for i, traj in enumerate(trajectories):
             cache = traj.pop("past_key_values")
