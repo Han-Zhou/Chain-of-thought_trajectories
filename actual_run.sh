@@ -13,8 +13,8 @@ python3 main.py \
     --dataset logiqa \
     --model gpt \
     --sample_size 1 \
-    --shot_mode few 
-    # --thinking
+    --shot_mode few \
+    --thinking
     # --max_new_tokens 4096
 
 

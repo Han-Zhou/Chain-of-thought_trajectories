@@ -62,14 +62,30 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
         if few_shot:
             few_shot_messages_raw = load_few_shot_prompt_from_registry(dataset)
 
+            use_thinking_field = thinking and "gpt" in model_name.lower()
+
             few_shot_messages = []
             for message in few_shot_messages_raw:
                 if message["role"] == "assistant":
-                    message["content"] = message["content"].format(
+                    content = message["content"].format(
                         thinking_token_open=thinking_token_open,
                         thinking_token_close=thinking_token_close,
                     )
-                few_shot_messages.append(message)
+                    if use_thinking_field:
+                        sep = "\nFinal Answer:"
+                        idx = content.find(sep)
+                        if idx != -1:
+                            few_shot_messages.append({
+                                "role": "assistant",
+                                "thinking": content[:idx].strip(),
+                                "content": content[idx + 1:].strip(),
+                            })
+                        else:
+                            few_shot_messages.append({"role": "assistant", "content": content})
+                    else:
+                        few_shot_messages.append({"role": "assistant", "content": content})
+                else:
+                    few_shot_messages.append(message)
 
             messages = messages[0:1] + few_shot_messages + messages[1:]
 

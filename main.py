@@ -185,7 +185,6 @@ def generate_one(
     generated_ids = outputs.sequences[0, prompt_len:]
     generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-
     return GenerationResult(
         prompt_text=prompt_text,
         generated_text=generated_text,
