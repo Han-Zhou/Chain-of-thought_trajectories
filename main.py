@@ -154,9 +154,24 @@ def generate_one(
 
     print(prompt_text)
 
-    breakpoint()
+    # breakpoint()
         
     inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
+    
+    # input_ids = inputs["input_ids"][0]
+    # tokens = tokenizer.tokenize(prompt_text)
+
+    # print("Last 20 tokens with input_ids:")
+    # for token, token_id in zip(tokens[-20:], input_ids[-20:].tolist()):
+    #     print(f"  {token_id}: {token}")
+
+    # breakpoint()
+
+
+    
+
+
+
     prompt_len: int = inputs["input_ids"].shape[1]
 
     # Qwen3.5 has a custom DynamicCache implementation that is required for correct attention behavior.  
