@@ -1,5 +1,4 @@
 
-import pathlib
 import json
 from prompts.cot_prompt import PROMPT_REGISTRY
 from prompts.few_shot_prompt import FEW_SHOT_PROMPT_REGISTRY, THINKING_TOKENS
@@ -91,6 +90,132 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
 
             # breakpoint()
 
+        return messages
+
+    elif dataset == "codeqa":
+        # For CodeQA, SYSTEM is the generic CoT instruction (system message),
+        # and CODEQA template is filled in as the user message.
+        system_reasoning_prompt, system_specific_prompt, assistant_start = load_prompt_from_registry(dataset)
+
+        user_prompt = (
+            f"Code snippet:\n```python\n{entry['context']}\n```\n\n"
+            f"Question:\n{entry['question']}"
+        )
+
+        messages = [
+            {"role": "system", "content": system_reasoning_prompt + "\n\n" + system_specific_prompt},
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": assistant_start}
+        ]
+
+        if few_shot:
+            few_shot_messages = load_few_shot_prompt_from_registry(dataset)
+            messages = messages[0:1] + few_shot_messages + messages[1:]
+
+        return messages
+
+    elif dataset == "bfcl":
+        system_prompt, bfcl_template, assistant_start = load_prompt_from_registry(dataset)
+        functions = entry.get("metadata", {}).get("functions", [])
+        functions_json = json.dumps(functions, indent=2)
+        system_content = system_prompt + "\n\n" + bfcl_template.format(functions=functions_json)
+        messages = [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": entry["question"]},
+            {"role": "assistant", "content": assistant_start},
+        ]
+        return messages
+
+    elif dataset in ("bigbench_movie", "bigbench_causal"):
+        system_reasoning_prompt, system_specific_prompt, assistant_start = load_prompt_from_registry(dataset)
+        user_prompt = entry["question"]
+        if entry.get("choices"):
+            choices_text = "\n".join(entry["choices"])
+            user_prompt += f"\n\nChoices:\n{choices_text}"
+        messages = [
+            {"role": "system", "content": system_reasoning_prompt + "\n\n" + system_specific_prompt},
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": assistant_start},
+        ]
+        return messages
+
+    elif dataset == "cs1qa":
+        system_reasoning_prompt, system_specific_prompt, assistant_start = load_prompt_from_registry(dataset)
+        if entry.get("context"):
+            user_prompt = (
+                f"Code:\n```python\n{entry['context']}\n```\n\n"
+                f"Question:\n{entry['question']}"
+            )
+        else:
+            user_prompt = f"Question:\n{entry['question']}"
+        messages = [
+            {"role": "system", "content": system_reasoning_prompt + "\n\n" + system_specific_prompt},
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": assistant_start},
+        ]
+        return messages
+
+    elif dataset == "hotpotqa":
+        system_reasoning_prompt, system_specific_prompt, assistant_start = load_prompt_from_registry(dataset)
+        context = entry.get("context") or ""
+        user_prompt = (
+            f"Supporting passages:\n{context}\n\n"
+            f"Question:\n{entry['question']}"
+        )
+        messages = [
+            {"role": "system", "content": system_reasoning_prompt + "\n\n" + system_specific_prompt},
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": assistant_start},
+        ]
+        return messages
+
+    elif dataset == "college_math_test":
+        system_reasoning_prompt, system_specific_prompt, assistant_start = load_prompt_from_registry(dataset)
+        user_prompt = f"Problem:\n{entry['question']}"
+        if entry.get("choices"):
+            choices_text = "\n".join(entry["choices"])
+            user_prompt += f"\n\nChoices:\n{choices_text}"
+        messages = [
+            {"role": "system", "content": system_reasoning_prompt + "\n\n" + system_specific_prompt},
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": assistant_start},
+        ]
+        return messages
+
+    elif dataset == "olympiadbench":
+        system_reasoning_prompt, system_specific_prompt, assistant_start = load_prompt_from_registry(dataset)
+        if entry.get("context"):
+            user_prompt = f"Context:\n{entry['context']}\n\nProblem:\n{entry['question']}"
+        else:
+            user_prompt = f"Problem:\n{entry['question']}"
+        messages = [
+            {"role": "system", "content": system_reasoning_prompt + "\n\n" + system_specific_prompt},
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": assistant_start},
+        ]
+        return messages
+
+    elif dataset == "math500":
+        system_reasoning_prompt, system_specific_prompt, assistant_start = load_prompt_from_registry(dataset)
+        user_prompt = f"Problem:\n{entry['question']}"
+        messages = [
+            {"role": "system", "content": system_reasoning_prompt + "\n\n" + system_specific_prompt},
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": assistant_start},
+        ]
+        return messages
+
+    elif dataset == "hle":
+        system_reasoning_prompt, system_specific_prompt, assistant_start = load_prompt_from_registry(dataset)
+        user_prompt = entry["question"]
+        if entry.get("choices"):
+            choices_text = "\n".join(entry["choices"])
+            user_prompt += f"\n\nChoices:\n{choices_text}"
+        messages = [
+            {"role": "system", "content": system_reasoning_prompt + "\n\n" + system_specific_prompt},
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": assistant_start},
+        ]
         return messages
 
     else:

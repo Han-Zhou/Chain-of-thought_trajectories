@@ -269,7 +269,6 @@ PROMPT_REGISTRY: dict[str, tuple[str, str, str]] = {
     "bfcl":                 (SYSTEM, BFCL, ASSISTANT_START),
     "bigbench_movie":       (SYSTEM, BIGBENCH_MOVIE, ASSISTANT_START),
     "bigbench_causal":      (SYSTEM, BIGBENCH_CAUSAL, ASSISTANT_START),
-    "logiqа":               (SYSTEM, LOGIQIA, ASSISTANT_START),   # kept as alias below too
     "logiqa":               (SYSTEM, LOGIQIA, ASSISTANT_START),
     "codeqa":               (SYSTEM, CODEQA, ASSISTANT_START),
     "cs1qa":                (SYSTEM, CS1QA, ASSISTANT_START),

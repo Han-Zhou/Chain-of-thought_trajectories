@@ -3,11 +3,11 @@ main.py
 
 Entry point for the CoT evaluation pipeline.
 
-Supports multiple datasets via --dataset. For LogiQA, runs a full
+Supports multiple datasets via --dataset. For LogiQA and CodeQA, runs a full
 Chain-of-Thought pipeline with DynamicCache-based generation and structured
 output parsing. All other datasets use the generic generate_trajectories() path.
 
-LogiQA pipeline sections (inlined below):
+Pipeline sections (inlined below):
   1. Prompt Formatting   – zero-shot and few-shot CoT builders
   2. Generation          – model.generate() with DynamicCache + position tracking
   3. Parsing             – CoT step extraction and final-answer detection
@@ -53,7 +53,7 @@ def parse():
         help=(
             "Dataset to process. One of: bfcl, bigbench_movie, "
             "bigbench_causal, logiqa, codeqa, cs1qa, hotpotqa, "
-            "college_math, olympiadbench, math500, hle."
+            "college_math_test, olympiadbench, math500, hle."
         )
     )
     args.add_argument(
@@ -74,7 +74,7 @@ def parse():
         type=str,
         default="zero",
         choices=["zero", "few"],
-        help="Prompting mode for LogiQA: zero-shot or few-shot CoT."
+        help="Prompting mode: zero-shot or few-shot CoT."
     )
     args.add_argument(
         "--max_new_tokens",
@@ -213,9 +213,9 @@ def generate_one(
 def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=None, shot_mode="zero", thinking=False):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    if model_name in MODEL_DICT["qwen"]: 
-        attn_implementation = "sdpa" 
-    elif model_name in MODEL_DICT["gpt"] or model_name in MODEL_DICT["llama"]:
+    if model_name == MODEL_DICT["qwen"]:
+        attn_implementation = "sdpa"
+    elif model_name in (MODEL_DICT["gpt"], MODEL_DICT["llama"]):
         attn_implementation = "flash_attention_2"
 
     model = AutoModelForCausalLM.from_pretrained(
@@ -238,7 +238,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
 
         assistant_prefill = next((m["content"] for m in reversed(messages) if m["role"] == "assistant"), "")
         full_generated_text = assistant_prefill + gen.generated_text
-        parsed: ParsedOutput = parse_output(full_generated_text)
+        parsed: ParsedOutput = parse_output(full_generated_text, dataset_name=dataset_name)
 
         if parsed.answer_char_start is not None:
             # answer_char_start is an offset into full_generated_text (prefill + new tokens).
@@ -292,9 +292,6 @@ def main(args):
         for i, traj in enumerate(trajectories):
             cache = traj.pop("past_key_values")
             torch.save(cache, os.path.join(out_dir, f"cache_{i}.pt"))
-
-            traj["prompt_token_positions"] = traj.pop("prompt_token_positions")
-            traj["generated_token_positions"] = traj.pop("generated_token_positions")
 
             entry = {
                 "index": i,
