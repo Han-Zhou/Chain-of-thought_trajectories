@@ -19,7 +19,7 @@ SYSTEM = (
 )
 
 
-ASSISTANT_START = """Let's think step-by-step.\nStep 1: """
+ASSISTANT_START = """{thinking_token_open}Let's think step-by-step.\nStep 1: """
 # ASSISTANT_START = """<think>\nLet's think step-by-step.\nStep 1: """
 # ASSISTANT_START = ""
 

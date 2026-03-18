@@ -12,10 +12,11 @@ echo "Starting run ..."
 
 
 python3 main.py \
-    --dataset codeqa \
-    --model qwen \
+    --dataset logiqa \
+    --model gpt \
     --sample_size 1 \
-    --shot_mode zero 
+    --shot_mode few \
+    --thinking
     # --max_new_tokens 4096
 
 
