@@ -22,8 +22,7 @@ class HLEDataLoader(BaseBenchmarkDataset):
                 "and set HF_TOKEN=<your_token>."
             )
 
-        from datasets import load_dataset as hf_load
-        ds = hf_load("cais/hle", split="test", token=token)
+        ds = self._hf("cais/hle", "test", token=token)
         entries = []
         for i, row in enumerate(ds):
             choices = None

@@ -60,10 +60,12 @@ class BaseBenchmarkDataset(Dataset, ABC):
                 return [json.loads(line) for line in f if line.strip()]
 
     @staticmethod
-    def _hf(repo: str, split: str, *, name: str | None = None) -> Any:
+    def _hf(repo: str, split: str, *, name: str | None = None, token: str | None = None) -> Any:
         """Load a HuggingFace dataset split."""
         from datasets import load_dataset
         kwargs: dict = {}
         if name:
             kwargs["name"] = name
+        if token:
+            kwargs["token"] = token
         return load_dataset(repo, split=split, **kwargs)

@@ -7,7 +7,7 @@ from dataloader.base import BaseBenchmarkDataset
 
 
 class CodeQADataLoader(BaseBenchmarkDataset):
-    """Question answering over source code (lissadesu/codeqa_v2).
+    """Question answering over source code (vm2825/codeqa-dataset).
 
     Set CODEQA_PATH env var to a local JSON/JSONL file to skip the HF download.
     """
@@ -17,17 +17,16 @@ class CodeQADataLoader(BaseBenchmarkDataset):
         if local:
             rows = self._load_json_or_jsonl(Path(local))
         else:
-            rows = list(self._hf("lissadesu/codeqa_v2", "train"))
+            rows = list(self._hf("vm2825/codeqa-dataset", "train"))
 
         entries = []
         for i, row in enumerate(rows):
             entries.append(self._entry(
                 id_=str(row.get("id", i)),
-                question=row["question"],
-                answer=row.get("answer", ""),
-                context=row.get("code") or row.get("code_processed") or None,
+                question=row["Instruction"],
+                answer=row.get("output_code", ""),
+                context=row.get("input_code") or None,
                 source="codeqa",
-                question_type=row.get("questionType", ""),
             ))
         print(f"[codeqa] {len(entries)} entries")
         return entries
