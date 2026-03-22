@@ -30,7 +30,7 @@ def load_few_shot_prompt_from_registry(dataset: str) -> dict[str, str]:
 
 
 
-def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, thinking: bool) -> list[dict[str, str]]:
+def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, thinking: bool, prompt_type: int = 1) -> list[dict[str, str]]:
     if dataset == "logiqa":
         # For LogiQA, we want to use the system prompt as the reasoning prompt and the original prompt as the specific prompt.
         system_reasoning_prompt, system_specific_prompt, assistant_start = load_prompt_from_registry(dataset)
@@ -49,15 +49,25 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
             except KeyError:
                 raise ValueError(f'"{model_name}" does not support thinking yet')
 
-        assistant_start = assistant_start.format(
-            thinking_token_open=thinking_token_open,
-        )
+        if prompt_type == 1:
+            # Type 1: assistant prefill with thinking tokens + "Step 1:"
+            assistant_start = assistant_start.format(
+                thinking_token_open=thinking_token_open,
+            )
 
-        messages = [
-            {"role": "system", "content": system_reasoning_prompt + "\n\n" + system_specific_prompt},
-            {"role": "user", "content": user_prompt},
-            {"role": "assistant", "content": assistant_start}
-        ]
+            messages = [
+                {"role": "system", "content": system_reasoning_prompt + "\n\n" + system_specific_prompt},
+                {"role": "user", "content": user_prompt},
+                {"role": "assistant", "content": assistant_start}
+            ]
+        else:
+            # Type 2: "Let's think step-by-step." appended to user prompt, no assistant prefill
+            user_prompt += "\n\nLet's think step-by-step."
+
+            messages = [
+                {"role": "system", "content": system_reasoning_prompt + "\n\n" + system_specific_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
 
         if few_shot:
             few_shot_messages_raw = load_few_shot_prompt_from_registry(dataset)
@@ -67,10 +77,17 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
             few_shot_messages = []
             for message in few_shot_messages_raw:
                 if message["role"] == "assistant":
-                    content = message["content"].format(
-                        thinking_token_open=thinking_token_open,
-                        thinking_token_close=thinking_token_close,
-                    )
+                    if prompt_type == 2:
+                        # Type 2: steps outside thinking blocks — strip thinking tokens
+                        content = message["content"].format(
+                            thinking_token_open="",
+                            thinking_token_close="",
+                        )
+                    else:
+                        content = message["content"].format(
+                            thinking_token_open=thinking_token_open,
+                            thinking_token_close=thinking_token_close,
+                        )
                     if use_thinking_field:
                         sep = "\nFinal Answer:"
                         idx = content.find(sep)

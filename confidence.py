@@ -332,7 +332,7 @@ def dropout_forward(
     # Build late token tensor: decode the tail, append suffix, retokenize together
     # (avoids incorrect tokens at the boundary from separate tokenization)
     late_text = llm.tokenizer.decode(
-        generated_ids[early_late_split_gen:], skip_special_tokens=False)
+        generated_ids[early_late_split_gen:], skip_special_tokens=True)
     combined_text = late_text + suffix_text
     late_ids = torch.tensor(
         llm.tokenizer.encode(combined_text, add_special_tokens=False),

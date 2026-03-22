@@ -82,6 +82,7 @@ class LLM():
         max_new_tokens: int,
         temperature: float = 0.0,
         output_scores: bool = False,
+        has_assistant_prefill: bool = True,
     ) -> GenerationResult:
         """Run one forward pass through model.generate() with a DynamicCache.
 
@@ -108,16 +109,20 @@ class LLM():
 
         device = next(self.model.parameters()).device
 
-        prompt_text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,     # MUST be False if you provide the assistant role
-            continue_final_message=True,      # MUST be True for Assistant Prefilling
-            # add_generation_prompt=True,
-            # continue_final_message=False,
-            # chat_template_kwargs={"enable_thinking": True},
-            # enable_thinking=True,
-        )
+        if has_assistant_prefill:
+            prompt_text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,     # MUST be False if you provide the assistant role
+                continue_final_message=True,      # MUST be True for Assistant Prefilling
+            )
+        else:
+            prompt_text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,       # Let the template add the assistant header
+                continue_final_message=False,
+            )
 
         # Post processing
         # For qwen: strip the empty think block that Qwen injects

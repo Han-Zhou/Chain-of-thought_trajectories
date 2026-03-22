@@ -3,11 +3,11 @@ main.py
 
 Entry point for the CoT evaluation pipeline.
 
-Supports multiple datasets via --dataset. For LogiQA and CodeQA, runs a full
+Supports multiple datasets via --dataset. For LogiQA, runs a full
 Chain-of-Thought pipeline with DynamicCache-based generation and structured
 output parsing. All other datasets use the generic generate_trajectories() path.
 
-Pipeline sections (inlined below):
+LogiQA pipeline sections (inlined below):
   1. Prompt Formatting   – zero-shot and few-shot CoT builders
   2. Generation          – model.generate() with DynamicCache + position tracking
   3. Parsing             – CoT step extraction and final-answer detection
@@ -19,27 +19,32 @@ import argparse
 import os
 import logging
 import json
+import time
+import pickle
 
 import torch
 from dotenv import load_dotenv
 from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+# from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
 
-from utils.enum import MODEL_DICT
-from utils.structures import GenerationResult, ParsedOutput
+from utils.enum import MODEL_DICT, LETTERS
+from dataclasses import asdict
+from utils.structures import GenerationResult, ParsedOutput, AllConfidenceData, ConfidenceScores
 from prompts.load import load_messages
 from prompts.cot_prompt import SYSTEM as _SYSTEM_BASE
 from dataloader import load_dataset, make_dataloader
 from parsing import parse_output
+# from utils.confidence_prev import compute_confidence_metrics
+from confidence import compute_all_confidence_scores
+from llm import LLM
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+#
 
 
-
-LETTERS = "ABCD"
 
 
 
@@ -53,7 +58,7 @@ def parse():
         help=(
             "Dataset to process. One of: bfcl, bigbench_movie, "
             "bigbench_causal, logiqa, codeqa, cs1qa, hotpotqa, "
-            "college_math_test, olympiadbench, math500, hle."
+            "college_math, olympiadbench, math500, hle."
         )
     )
     args.add_argument(
@@ -74,7 +79,7 @@ def parse():
         type=str,
         default="zero",
         choices=["zero", "few"],
-        help="Prompting mode: zero-shot or few-shot CoT."
+        help="Prompting mode for LogiQA: zero-shot or few-shot CoT."
     )
     args.add_argument(
         "--max_new_tokens",
@@ -89,179 +94,157 @@ def parse():
         help="Whether to use thinking.",
     )
 
+    args.add_argument(
+        "--type",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help=(
+            "Prompt type. "
+            "1 (default): assistant prefill with thinking tokens and 'Step 1:'. "
+            "2: 'Let's think step-by-step.' in user prompt, no assistant prefill."
+        ),
+    )
+    args.add_argument(
+        "--confidence",
+        action="store_true",
+        default=False,
+        help="Whether or not to evaluate confidence on the COTs."
+    )
+    args.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Skip generation and load from saved pickle files in debug_cache/."
+    )
     return args.parse_args()
 
 
 
-def generate_one(
-    model: AutoModelForCausalLM,
-    tokenizer: AutoTokenizer,
-    messages: list[dict[str, str]],
-    max_new_tokens: int,
-    thinking: bool,
-    temperature: float = 0.0,
-) -> GenerationResult:
-    """Run one forward pass through model.generate() with a DynamicCache.
-
-    Key HuggingFace arguments and why they are used here:
-
-    past_key_values=DynamicCache()
-        Passes a pre-initialised DynamicCache object into generate().
-        Transformers fills it in-place during the forward passes; the
-        populated cache is returned via outputs.past_key_values.
-        This avoids re-computing attention keys/values on the prompt for any
-        subsequent continuation (useful if you want to branch or re-use).
-
-    return_dict_in_generate=True
-        Makes generate() return a GenerateDecoderOnlyOutput (a structured
-        object) instead of a raw tensor.  This gives access to:
-          .sequences        – full token IDs (prompt + generated)
-          .past_key_values  – the updated DynamicCache
-          .scores           – per-step logits (if output_scores=True)
-
-    do_sample / temperature
-        temperature=0.0 → greedy decoding (deterministic, good for evals).
-        temperature>0.0 → multinomial sampling.
-    """
-
-    device = next(model.parameters()).device
-
-    model_name = model.config._name_or_path
-
-    prompt_text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=False,     # MUST be False if you provide the assistant role
-        continue_final_message=True,      # MUST be True for Assistant Prefilling
-        # add_generation_prompt=True,
-        # continue_final_message=False,
-        # chat_template_kwargs={"enable_thinking": True},
-        # enable_thinking=True,
-    )
-
-    # Post processing
-    # For qwen: strip the empty think block that Qwen injects
-    if "qwen" in model_name.lower():
-        prompt_text = re.sub(r"<think>\s*</think>\s*", "", prompt_text)
-
-    # For gpt: GPT-OSS templates default to <|channel|>final for the assistant prefill.
-    # if we are using thinking mode, Switch the last occurrence to <|channel|>analysis so the model reasons before answering.
-    if "gpt" in model_name.lower() and thinking:
-        target = "<|channel|>final"
-        last_idx = prompt_text.rfind(target)
-        if last_idx != -1:
-            prompt_text = prompt_text[:last_idx] + "<|channel|>analysis" + prompt_text[last_idx + len(target):]
-
-    print(prompt_text)
-
-    # breakpoint()
-        
-    inputs = tokenizer(prompt_text, return_tensors="pt").to(device)
-    
-    # input_ids = inputs["input_ids"][0]
-    # tokens = tokenizer.tokenize(prompt_text)
-
-    # print("Last 20 tokens with input_ids:")
-    # for token, token_id in zip(tokens[-20:], input_ids[-20:].tolist()):
-    #     print(f"  {token_id}: {token}")
-
-    # breakpoint()
 
 
-    
+def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1):
 
+    debug_dir = "debug_cache"
 
+    if debug:
+        # Load pre-saved generation results instead of running the model
+        cache_file = os.path.join(debug_dir, "gen_parsed.pkl")
+        if not os.path.exists(cache_file):
+            raise FileNotFoundError(f"Debug cache not found at {cache_file}. Run without --debug first to generate it.")
+        logger.info(f"Debug mode: loading cached generation results from {cache_file}")
+        with open(cache_file, "rb") as f:
+            cached_entries = pickle.load(f)
 
-    prompt_len: int = inputs["input_ids"].shape[1]
-
-    # Qwen3.5 has a custom DynamicCache implementation that is required for correct attention behavior.  
-    if hasattr(model.config, "layer_types") and "linear_attention" in model.config.layer_types:
-        cache = Qwen3_5DynamicCache(config=model.config)
+        # Only need the tokenizer for answer_token_start_position computation
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        llm_for_confidence = None
     else:
-        cache = DynamicCache()
-
-    with torch.inference_mode():
-        outputs = model.generate(
-            **inputs,
-            past_key_values=cache,
-            return_dict_in_generate=True,
-            max_new_tokens=max_new_tokens,
-            do_sample=(temperature > 0.0),
-            temperature=temperature if temperature > 0.0 else None,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-
-    total_len: int = outputs.sequences.shape[1]
-    # prompt_positions - 1 is the end position of the prompt text
-    prompt_positions = prompt_len
-    # generated_positions - 1 is the end position of the generated text
-    generated_positions = total_len
-
-    generated_ids = outputs.sequences[0, prompt_len:]
-    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-
-    return GenerationResult(
-        prompt_text=prompt_text,
-        generated_text=generated_text,
-        prompt_token_positions=prompt_positions,
-        generated_token_positions=generated_positions,
-        past_key_values=outputs.past_key_values,
-    )
-
-
-
-def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=None, shot_mode="zero", thinking=False):
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    if model_name == MODEL_DICT["qwen"]:
-        attn_implementation = "sdpa"
-    elif model_name in (MODEL_DICT["gpt"], MODEL_DICT["llama"]):
-        attn_implementation = "flash_attention_2"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        torch_dtype="auto",
-        attn_implementation=attn_implementation
-    )
-
-
+        llm = LLM(model_name, thinking)
+        tokenizer = llm.tokenizer
+        cached_entries = None
+        os.makedirs(debug_dir, exist_ok=True)
+        entries_to_save = []
 
     trajectories = []
 
     for i, entry in enumerate(dataloader):
         logger.info(f"Generating {i}/{len(dataloader)}")
+        t0 = time.time()
 
-        messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking)
+        if debug:
+            gen, parsed, assistant_prefill, full_generated_text = cached_entries[i]
+        else:
+            messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type)
+            has_assistant_prefill = messages[-1]["role"] == "assistant"
+            gen: GenerationResult = llm.generate_one(messages, max_new_tokens=max_new_tokens, output_scores=bool(confidence), has_assistant_prefill=has_assistant_prefill)
+            assistant_prefill = next((m["content"] for m in reversed(messages) if m["role"] == "assistant"), "")
+            full_generated_text = assistant_prefill + gen.generated_text
 
-        gen: GenerationResult = generate_one(model, tokenizer, messages, max_new_tokens=max_new_tokens, thinking=thinking)
+            # For type 2 the model generates freely and may wrap reasoning in
+            # <think>...</think>.  We parse only the text *after* the think block
+            # so that CoT steps are extracted from the visible output.
+            # We then shift the character offsets back so they are relative to
+            # full_generated_text (which confidence.py indexes into).
+            if prompt_type == 2:
+                think_match = re.search(r"<think>[\s\S]*?</think>\s*", full_generated_text)
+                think_block_len = len(think_match.group()) if think_match else 0
+                text_for_parsing = full_generated_text[think_block_len:]
+            else:
+                think_block_len = 0
+                text_for_parsing = full_generated_text
+            parsed: ParsedOutput = parse_output(text_for_parsing)
+            # Shift character offsets back to full_generated_text coordinates
+            if think_block_len > 0:
+                if parsed.answer_fullstring_start is not None:
+                    parsed.answer_fullstring_start += think_block_len
+                if parsed.answer_start is not None:
+                    parsed.answer_start += think_block_len
+            entries_to_save.append((gen, parsed, assistant_prefill, full_generated_text))
 
-        assistant_prefill = next((m["content"] for m in reversed(messages) if m["role"] == "assistant"), "")
-        full_generated_text = assistant_prefill + gen.generated_text
-        parsed: ParsedOutput = parse_output(full_generated_text, dataset_name=dataset_name)
-
-        if parsed.answer_char_start is not None:
-            # answer_char_start is an offset into full_generated_text (prefill + new tokens).
+        if parsed.answer_fullstring_start is not None:
+            # answer_fullstring_start is an offset into full_generated_text (prefill + new tokens).
             # Token positions only count newly generated tokens, so strip the prefill chars first.
-            generated_prefix = full_generated_text[len(assistant_prefill):parsed.answer_char_start]
+            generated_prefix = full_generated_text[len(assistant_prefill):parsed.answer_fullstring_start]
             prefix_ids = tokenizer(generated_prefix, add_special_tokens=False)["input_ids"]
-            answer_token_start_position = gen.prompt_token_positions + len(prefix_ids)
+            answer_token_start_position = gen.prompt_end_position + len(prefix_ids)
         else:
             answer_token_start_position = None
 
+        if confidence and parsed.final_answer:
+            if debug and llm_for_confidence is None:
+                llm_for_confidence = LLM(model_name, thinking)
+            active_llm = llm_for_confidence if debug else llm
+            confidence_score: AllConfidenceData = compute_all_confidence_scores(
+                active_llm,
+                gen,
+                parsed,
+                nb_dropout_samples=3,
+                use_fullstring=False,   # whether to apply dropout to the entire "Final Answer: ..." string or just the answer tokens
+                assistant_prefill=assistant_prefill,
+            )
+            confidence_score = asdict(confidence_score)
+        else:
+            confidence_score = None
+
+        #  - id — the unique identifier from the dataset entry (e.g., a BFCL question ID)
+        #   - question — the raw question text from the dataset
+        #   - ground_truth — the expected correct answer from the dataset, used for evaluation
+        #   - cot_steps — the parsed chain-of-thought steps (e.g., "Step 1: ...", "Step 2: ...") extracted from the model's output by parse_output()
+        #   - raw_cot_block — the full unparsed reasoning block as a single string (everything before "Final Answer:")
+        #   - final_answer — the model's extracted final answer (the text after "Final Answer:")
+        #   - generated_text — the complete raw output including the assistant prefill + all generated tokens, before any parsing
+        #   - prompt_end_position — the number of tokens in the prompt (i.e., the index where generation starts). Useful for indexing into scores/cache
+        #   - generated_end_position — the total sequence length (prompt + generated). So generated_end_position - prompt_end_position = number of new
+        #   tokens
+        #   - answer_token_start_position — the absolute token position where the "Final Answer:" content begins. This is the boundary between CoT and answer tokens
+        #   — critical for computing confidence only over the answer portion
+        #   - confidence_metric — which confidence method was used (e.g., the string passed via --confidence), or None if confidence wasn't computed
+        #   - confidence_score — the computed confidence value for the answer tokens using the specified metric, or None
+        #   - past_key_values — the KV cache from generation (a DynamicCache object). This gets popped out and saved as a separate .pt file at write time
+        #   (main.py:298) so you can resume/branch generation later without recomputing the prompt
         trajectories.append({
             "id":                           entry["id"],
             "question":                     entry["question"],
             "ground_truth":                 entry["answer"],
             "cot_steps":                    parsed.cot_steps,
-            "raw_cot_block":                parsed.raw_cot_block,
             "final_answer":                 parsed.final_answer,
+            "raw_cot_block":                parsed.raw_cot_block,
             "generated_text":               full_generated_text,
-            "prompt_token_positions":       gen.prompt_token_positions,
-            "generated_token_positions":    gen.generated_token_positions,
+            "prompt_end_position":           gen.prompt_end_position,
+            "generated_end_position":       gen.generated_end_position,
             "answer_token_start_position":  answer_token_start_position,
+            # "confidence_metric": confidence if confidence else None,
+            "confidence_score": confidence_score,
+            "runtime_seconds":              time.time() - t0,
             "past_key_values":              gen.past_key_values,
         })
+
+    if not debug:
+        cache_file = os.path.join(debug_dir, "gen_parsed.pkl")
+        logger.info(f"Saving debug cache to {cache_file}")
+        with open(cache_file, "wb") as f:
+            pickle.dump(entries_to_save, f)
 
     return trajectories
 
@@ -281,17 +264,23 @@ def main(args):
         dataset_name=args.dataset,
         shot_mode=args.shot_mode,
         thinking=args.thinking,
+        confidence=args.confidence,
+        debug=args.debug,
+        prompt_type=args.type,
     )
 
 
-    out_dir = f"trajectories/{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{sample_size}"
+    out_dir = f"trajectories/{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{sample_size}_type{args.type}_{'conf' if args.confidence else 'vanilla'}"
     os.makedirs(out_dir, exist_ok=True)
 
     out_file = os.path.join(out_dir, f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_trajectories_{sample_size}.json")
     with open(out_file, "w") as f:
         for i, traj in enumerate(trajectories):
             cache = traj.pop("past_key_values")
-            torch.save(cache, os.path.join(out_dir, f"cache_{i}.pt"))
+            # torch.save(cache, os.path.join(out_dir, f"cache_{i}.pt"))
+
+            traj["prompt_end_position"] = traj.pop("prompt_end_position")
+            traj["generated_end_position"] = traj.pop("generated_end_position")
 
             entry = {
                 "index": i,

@@ -32,7 +32,7 @@ def parse_output(generated_text: str) -> ParsedOutput:
     """
     text = generated_text.strip()
 
-    split_pos = text.lower().find("final answer:")
+    split_pos = text.lower().rfind("final answer:")
     if split_pos != -1:
         cot_block = text[:split_pos].strip()
         answer_segment = text[split_pos:]
