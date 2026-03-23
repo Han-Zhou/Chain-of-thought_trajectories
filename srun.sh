@@ -35,4 +35,3 @@ srun \
 #         conda activate cot
 #         python3 temp.py
 #     "
-

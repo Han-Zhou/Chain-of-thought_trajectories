@@ -32,7 +32,7 @@ def main():
         trajectories.append(obj)
         idx = end
 
-        # dict_keys(['id', 'question', 'ground_truth', 'cot_steps', 'raw_cot_block', 'generated_text', 'prompt_token_positions', 'generated_token_positions'])
+        # dict_keys(['id', 'question', 'ground_truth', 'cot_steps', 'raw_cot_block', 'generated_text', 'prompt_end_position', 'generated_end_position'])
         t = trajectories[0]["trajectory"]
 
         breakpoint()
@@ -42,4 +42,6 @@ def main():
 if __name__ == "__main__":
     main()
 
-    
+
+
+

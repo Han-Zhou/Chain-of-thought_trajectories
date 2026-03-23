@@ -28,7 +28,7 @@ _REGISTRY: dict[str, type[BaseBenchmarkDataset]] = {
     "codeqa":          CodeQADataLoader,
     "cs1qa":           CS1QADataLoader,
     "hotpotqa":        HotPotQADataLoader,
-    "college_math_test":    CollegeMathDataLoader,
+    "college_math":    CollegeMathDataLoader,
     "olympiadbench":   OlympiadBenchDataLoader,
     "math500":         Math500DataLoader,
     "hle":             HLEDataLoader,

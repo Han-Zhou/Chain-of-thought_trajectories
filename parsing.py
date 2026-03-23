@@ -5,49 +5,20 @@ from utils.structures import ParsedOutput
 
 
 # =============================================================================
-# Section 3 – Parsing
+# Section 3 – Parsing (LogiQA)
 # =============================================================================
 
-# Maps a regex pattern to a post-processing function that extracts the
-# final answer string from the first capture group.
-_PARSING_REGEX: dict[str, tuple[re.Pattern, callable]] = {
-    # MCQ datasets: capture exactly one letter (A-D), return it uppercased.
-    "mcq": (
-        re.compile(r"final\s+answer\s*:?\s*[\(\[]?\s*([A-Da-d])\s*[\)\]]?", re.IGNORECASE),
-        lambda m: m.group(1).upper(),
-    ),
-    # Extended MCQ datasets (e.g. MMLU-Pro with options A-J): capture one letter A-J.
-    "mcq_extended": (
-        re.compile(r"final\s+answer\s*:?\s*[\(\[]?\s*([A-Ja-j])\s*[\)\]]?", re.IGNORECASE),
-        lambda m: m.group(1).upper(),
-    ),
-    # Open-ended datasets: capture all remaining text after "Final Answer:".
-    "open_ended": (
-        re.compile(r"final\s+answer\s*:\s*([\s\S]+)", re.IGNORECASE),
-        lambda m: m.group(1).strip(),
-    ),
-}
-
-# Maps dataset names to a key in _PARSING_REGEX. Unlisted datasets default to "mcq".
-_DATASET_PARSING_MODE: dict[str, str] = {
-    "logiqa":               "mcq",
-    "college_math_test":    "mcq_extended",
-    "codeqa":           "open_ended",
-    "bfcl":             "open_ended",
-    "bigbench_movie":   "open_ended",
-    "bigbench_causal":  "open_ended",
-    "cs1qa":            "open_ended",
-    "hotpotqa":         "open_ended",
-    "olympiadbench":    "open_ended",
-    "math500":          "open_ended",
-    "hle":              "open_ended",
-}
+# Matches: "Final Answer: B" / "final answer: (C)" / "Final Answer: [d]" etc.
+_FINAL_ANSWER_RE = re.compile(
+    r"final\s+answer\s*:?\s*[\(\[]?\s*([A-Da-d])\s*[\)\]]?",
+    re.IGNORECASE,
+)
 
 # Matches "Step 1:", "Step 2:", ... as step delimiters inside the CoT block.
 _STEP_MARKER_RE = re.compile(r"(Step\s+\d+\s*:)", re.IGNORECASE)
 
 
-def parse_output(generated_text: str, dataset_name: str = "logiqa") -> ParsedOutput:
+def parse_output(generated_text: str) -> ParsedOutput:
     """Split a raw generation into structured CoT steps and the final answer.
 
     Strategy:
@@ -56,14 +27,12 @@ def parse_output(generated_text: str, dataset_name: str = "logiqa") -> ParsedOut
       2. Within the CoT block, split on "Step N:" markers to get individual
          steps.  If no markers are found, fall back to blank-line splitting,
          then single-line splitting.
-      3. Extract the final answer from the answer segment using the regex and
-         post-processor registered for the given dataset_name in _PARSING_REGEX.
-         MCQ datasets yield a single uppercase letter; open-ended datasets yield
-         the full text after "Final Answer:".
+      3. Extract the letter (A-D) from the answer segment with a lenient regex
+         that handles parentheses, brackets, and lowercase letters.
     """
     text = generated_text.strip()
 
-    split_pos = text.lower().find("final answer")
+    split_pos = text.lower().rfind("final answer:")
     if split_pos != -1:
         cot_block = text[:split_pos].strip()
         answer_segment = text[split_pos:]
@@ -71,14 +40,13 @@ def parse_output(generated_text: str, dataset_name: str = "logiqa") -> ParsedOut
         cot_block = text
         answer_segment = ""
 
-    mode = _DATASET_PARSING_MODE.get(dataset_name, "mcq")
-    pattern, extract = _PARSING_REGEX[mode]
-
     final_answer = ""
+    answer_start = None
     if answer_segment:
-        m = pattern.search(answer_segment)
+        m = _FINAL_ANSWER_RE.search(answer_segment)
         if m:
-            final_answer = extract(m)
+            final_answer = m.group(1).upper()
+            answer_start = split_pos + m.start(1)
 
     parts = _STEP_MARKER_RE.split(cot_block)
 
@@ -100,5 +68,6 @@ def parse_output(generated_text: str, dataset_name: str = "logiqa") -> ParsedOut
         cot_steps=steps,
         final_answer=final_answer,
         raw_cot_block=cot_block,
-        answer_char_start=split_pos if split_pos != -1 else None,
+        answer_fullstring_start=split_pos if split_pos != -1 else None,
+        answer_start=answer_start,
     )

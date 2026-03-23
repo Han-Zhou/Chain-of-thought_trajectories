@@ -16,6 +16,7 @@ SYSTEM = (
     "Label each reasoning step as 'Step 1:', 'Step 2:', etc. "
     "After all steps, write your final answer on a new line starting with "
     "'Final Answer:'."
+    "Keep your reasoning concise, and be brief in each step."
 )
 
 
@@ -269,6 +270,7 @@ PROMPT_REGISTRY: dict[str, tuple[str, str, str]] = {
     "bfcl":                 (SYSTEM, BFCL, ASSISTANT_START),
     "bigbench_movie":       (SYSTEM, BIGBENCH_MOVIE, ASSISTANT_START),
     "bigbench_causal":      (SYSTEM, BIGBENCH_CAUSAL, ASSISTANT_START),
+    "logiqа":               (SYSTEM, LOGIQIA, ASSISTANT_START),   # kept as alias below too
     "logiqa":               (SYSTEM, LOGIQIA, ASSISTANT_START),
     "codeqa":               (SYSTEM, CODEQA, ASSISTANT_START),
     "cs1qa":                (SYSTEM, CS1QA, ASSISTANT_START),

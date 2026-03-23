@@ -7,3 +7,6 @@ MODEL_DICT = MappingProxyType({
     "qwen": "Qwen/Qwen3.5-27B"
 })    
 
+
+LETTERS = "ABCD"
+
