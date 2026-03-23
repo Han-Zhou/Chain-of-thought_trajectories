@@ -1,21 +1,14 @@
+import re
+import json
 import numpy as np
 import torch
 import copy
 from collections import defaultdict
+from transformers import DynamicCache
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
 from llm import LLM
 from utils.text_utils import find_token_indices_from_end
-from utils.structures import ParsedOutput, GenerationResult, ConfidenceScores, AllConfidenceData
-
-
-def crop_kv_cache(llm, cache, max_length):
-    """Crop KV cache, with fallback for caches missing .crop() (e.g. Qwen 3.5)."""
-    if "qwen3_5" in llm.model.config.model_type:
-        for layer_idx in range(len(cache.key_cache)):
-            if cache.key_cache[layer_idx] is not None:
-                cache.key_cache[layer_idx] = cache.key_cache[layer_idx][:, :, :max_length, :]
-                cache.value_cache[layer_idx] = cache.value_cache[layer_idx][:, :, :max_length, :]
-    else:
-        cache.crop(max_length)
+from utils.structures import ParsedOutput, ConfidenceScores, AllConfidenceData
 
 
 ANSWER_TOKENS = {
@@ -36,23 +29,32 @@ def get_token_ids(tokenizer, tokens):
     return labels
 
 
-
 def compute_all_confidence_scores(
     llm: LLM,
-    generation_result: GenerationResult,
+    messages: list[dict],
+    generated_text: str,
     parsed_output: ParsedOutput,
     nb_dropout_samples: int = 10,
     use_fullstring: bool = False,
     assistant_prefill: str = "",
+    debug_conf: bool = False,
 ) -> AllConfidenceData:
-    vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy = \
-        dropout_answerlogits(llm, generation_result, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill)
+    debug_info = {}
 
-    vanilla_ptrue1, vanilla_ptrue2, dropout_ptrue1, dropout_ptrue2 = \
-        dropout_indirectlogits(llm, generation_result, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill)
+    vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg = \
+        dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf)
+    if dbg:
+        debug_info["answer_logits"] = dbg
 
-    vanilla_verbconf, dropout_verbconf = \
-        dropout_verbalconf(llm, generation_result, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill)
+    vanilla_ptrue1, vanilla_ptrue2, dropout_ptrue1, dropout_ptrue2, dbg = \
+        dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf)
+    if dbg:
+        debug_info["indirect_logits"] = dbg
+
+    vanilla_verbconf, dropout_verbconf, dbg = \
+        dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf)
+    if dbg:
+        debug_info["verbconf"] = dbg
 
     return AllConfidenceData(
         vanilla_confidences=ConfidenceScores(
@@ -69,14 +71,14 @@ def compute_all_confidence_scores(
             indirect_ptrue2_probabilities=dropout_ptrue2,
             verbconf_probabilities=dropout_verbconf,
         ),
+        debug_info=debug_info,
     )
 
 
-
-def dropout_answerlogits(llm, generation_result, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill=""):
+def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False):
     """Logit-based confidence on the answer tokens themselves."""
     late_tokens, vanilla_out, dropout_out, ans_start, ans_end = \
-        dropout_forward(llm, generation_result, parsed_output,
+        dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text="", nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill)
 
@@ -85,12 +87,8 @@ def dropout_answerlogits(llm, generation_result, parsed_output, nb_dropout_sampl
 
     # --- Vanilla ---
     # Logit at position t-1 predicts token at position t
-    v_logits = vanilla_out.logits[0, ans_start - 1:ans_end - 1, :] # dimension: [nb_answer_tokens, vocab_size]
+    v_logits = vanilla_out.logits[0, ans_start - 1:ans_end - 1, :]
     v_probs = v_logits.softmax(dim=-1)
-
-    breakpoint()
-
-
 
     vanilla_answer_probs = [v_probs[t, answer_tokens[t]].item() for t in range(nb_answer_tokens)]
 
@@ -111,10 +109,13 @@ def dropout_answerlogits(llm, generation_result, parsed_output, nb_dropout_sampl
         dropout_answer_probs = []
         dropout_answer_entropy = []
 
-    return vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy
+    # --- Debug ---
+    dbg = _debug_answer_logit_tokens(llm, late_tokens, ans_start, ans_end, v_probs, vanilla_answer_probs) if debug_conf else None
+
+    return vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg
 
 
-def dropout_indirectlogits(llm, generation_result, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill=""):
+def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False):
     """P(True) and P(Yes) probing after the answer."""
     positive_true_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' True'])
     negative_false_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' False'])
@@ -123,21 +124,17 @@ def dropout_indirectlogits(llm, generation_result, parsed_output, nb_dropout_sam
 
     # ptrue1: "True/False:"
     _, vanilla1, dropout1, _, _ = \
-        dropout_forward(llm, generation_result, parsed_output,
+        dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text="\nTrue/False:",
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill)
 
     # ptrue2: "Is the answer <X> correct?"
     _, vanilla2, dropout2, _, _ = \
-        dropout_forward(llm, generation_result, parsed_output,
+        dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text=f"\nIs the answer {parsed_output.final_answer} correct?",
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill)
-
-
-    #  NOTE: need to make sure that for our models, the true/false/yes/no are only one token
-
 
     # Vanilla ptrue1
     v_pos1 = vanilla1.logits[0, -1, positive_true_ids].sum()
@@ -153,10 +150,6 @@ def dropout_indirectlogits(llm, generation_result, parsed_output, nb_dropout_sam
         torch.stack([v_pos2.float(), v_neg2.float()]), dim=0
     )[0].item()
 
-
-    # breakpoint()
-
-
     # Dropout
     if dropout1 is not None:
         d_pos1 = dropout1.logits[:, -1, positive_true_ids].sum(-1)
@@ -170,16 +163,20 @@ def dropout_indirectlogits(llm, generation_result, parsed_output, nb_dropout_sam
         dropout_ptrue2 = torch.softmax(
             torch.stack([d_pos2.float(), d_neg2.float()], dim=-1), dim=-1
         )[:, 0].cpu().numpy().tolist()
-
-
-        # breakpoint()
-
-
     else:
         dropout_ptrue1 = []
         dropout_ptrue2 = []
 
-    return [vanilla_ptrue1], [vanilla_ptrue2], dropout_ptrue1, dropout_ptrue2
+    # --- Debug ---
+    if debug_conf:
+        dbg = {
+            "ptrue1_true_false": _debug_indirect_logit_tokens(llm, vanilla1, positive_true_ids, negative_false_ids, "True/False"),
+            "ptrue2_yes_no": _debug_indirect_logit_tokens(llm, vanilla2, positive_yes_ids, negative_no_ids, "Yes/No"),
+        }
+    else:
+        dbg = None
+
+    return [vanilla_ptrue1], [vanilla_ptrue2], dropout_ptrue1, dropout_ptrue2, dbg
 
 
 def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
@@ -211,18 +208,10 @@ def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
         return joint_logprobs.softmax(-1)
 
     # --- depth >= 1: one forward pass per unique prefix token ---
-    # Walk depth by depth. At each depth d, group sequences by their
-    # token at depth d-1 (the prefix token that must be fed to the model).
-    # Each unique prefix gets its own cloned KV cache for exact conditioning.
-
-    # Build a mapping: prefix_token -> {cache, kv after feeding that token}
-    # so deeper levels can chain off the correct cache.
-    # Key: tuple of tokens up to depth d-1 (the full prefix fed so far)
     prefix_cache = {(): model_output.past_key_values}
 
     for d in range(1, max_depth):
-        # Group sequences that still have a token at depth d by their prefix so far
-        groups = defaultdict(list)  # prefix_tuple -> [(seq_index, token_at_depth_d)]
+        groups = defaultdict(list)
         for i, seq in enumerate(token_seqs):
             if len(seq) > d:
                 prefix = tuple(seq[:d])
@@ -249,7 +238,6 @@ def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
             for seq_idx, next_tok in entries:
                 joint_logprobs[:, seq_idx] += logprobs_d[:, next_tok]
 
-            # Store this cache in case even deeper levels need it
             new_prefix_cache[prefix] = out.past_key_values
 
         prefix_cache = new_prefix_cache
@@ -257,9 +245,8 @@ def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
     return joint_logprobs.softmax(-1)
 
 
-def dropout_verbalconf(llm, generation_result, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill=""):
+def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False):
     """Verbalized confidence (0-100 score)."""
-    # NOTE may change this for gpt-oss
     suffix = (
         "\nPlease respond with a score from 0 to 100 in <confidence> </confidence> tags."
         "\nHow confident are you in your previous answer?"
@@ -267,7 +254,7 @@ def dropout_verbalconf(llm, generation_result, parsed_output, nb_dropout_samples
     )
 
     _, vanilla_out, dropout_out, _, _ = \
-        dropout_forward(llm, generation_result, parsed_output,
+        dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text=suffix,
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill)
@@ -281,24 +268,50 @@ def dropout_verbalconf(llm, generation_result, parsed_output, nb_dropout_samples
     v_probs = _compute_verbconf_joint_probs(llm, vanilla_out, token_seqs, device)
     vanilla_verbconf = (score_values * v_probs).sum().item()
 
-    # breakpoint()
-
     # Dropout
     if dropout_out is not None:
         d_probs = _compute_verbconf_joint_probs(llm, dropout_out, token_seqs, device)
         dropout_verbconf = (score_values * d_probs).sum(-1).numpy().tolist()
-
-        # breakpoint()
-
     else:
         dropout_verbconf = []
 
-    return [vanilla_verbconf], dropout_verbconf
+    # --- Debug ---
+    dbg = _debug_verbconf_tokens(llm, token_seqs, v_probs, vanilla_verbconf) if debug_conf else None
+
+    return [vanilla_verbconf], dropout_verbconf, dbg
+
+
+def _tokenize_for_confidence(llm, messages, full_assistant_content):
+    """Tokenize a conversation with the full assistant response.
+
+    Matches the tokenization approach in llm.generate_one() for consistency,
+    including model-specific post-processing.
+    """
+    conf_messages = copy.deepcopy(messages)
+    if conf_messages[-1]["role"] == "assistant":
+        conf_messages[-1]["content"] = full_assistant_content
+    else:
+        conf_messages.append({"role": "assistant", "content": full_assistant_content})
+
+    prompt_text = llm.tokenizer.apply_chat_template(
+        conf_messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        continue_final_message=True,
+    )
+
+    # Apply same post-processing as generate_one()
+    if "qwen" in llm.model_name.lower():
+        prompt_text = re.sub(r"<think>\s*</think>\s*", "", prompt_text)
+
+    tokens = llm.tokenizer(prompt_text, return_tensors="pt")["input_ids"]
+    return tokens
 
 
 def dropout_forward(
     llm: LLM,
-    generation_result: GenerationResult,
+    messages: list[dict],
+    generated_text: str,
     parsed_output: ParsedOutput,
     suffix_text: str = "",
     nb_dropout_samples: int = 10,
@@ -306,102 +319,88 @@ def dropout_forward(
     threshold: float = 0.5,
     assistant_prefill: str = "",
 ):
-    """Core forward pass for dropout experiment. Crop the generation KV-cache, run a vanilla + dropout forward pass on the late (answer-region) tokens.
+    """Core forward pass for dropout experiment.
+
+    Builds the full prompt+response+suffix as text, tokenizes from scratch,
+    splits into early (prompt+CoT) and late (answer+suffix), then runs
+    a vanilla and dropout forward pass on the late portion.
     """
-    generated_ids = generation_result.generated_ids          # 1-D, on CPU
-    prompt_end = generation_result.prompt_end_position
-    generated_text = generation_result.generated_text
     device = next(llm.model.parameters()).device
 
-    # answer_fullstring_start was computed on (assistant_prefill + generated_text).strip(),
-    # so adjust for the prefill length to index into generated_text alone.
-    offset = max(parsed_output.answer_fullstring_start - len(assistant_prefill), 0)
-    fullstring_text = generated_text[offset:]
-    fs_start, _ = find_token_indices_from_end(
-        llm.tokenizer, generated_ids, fullstring_text)
+    # Build full assistant content with suffix
+    full_content = (assistant_prefill + generated_text + suffix_text).strip()
 
-    # Early / late split (late split is answer regin & onwards)
-    # One token before "Final Answer" stays in the early cache as context (context token)
-    early_late_split_gen = fs_start - 1           # index in generated_ids
-    early_late_split_abs = prompt_end + early_late_split_gen   # absolute position
+    # Tokenize the full conversation from scratch
+    tokens = _tokenize_for_confidence(llm, messages, full_content)  # [1, seq_len]
 
+    # Find the answer region ("Final Answer: ...") in the full token sequence
+    full_text = (assistant_prefill + generated_text).strip()
+    fullstring_text = full_text[parsed_output.answer_fullstring_start:]
+    fs_start, _ = find_token_indices_from_end(llm.tokenizer, tokens[0], fullstring_text)
 
-    breakpoint()
+    # Early/late split: one token before the answer fullstring as context
+    early_late_split = fs_start - 1
 
+    early_tokens = tokens[:, :early_late_split].to(device)
+    late_tokens = tokens[:, early_late_split:].to(device)
 
-    # Build late token tensor: decode the tail, append suffix, retokenize together
-    # (avoids incorrect tokens at the boundary from separate tokenization)
-    late_text = llm.tokenizer.decode(
-        generated_ids[early_late_split_gen:], skip_special_tokens=True)
-    combined_text = late_text + suffix_text
-    late_ids = torch.tensor(
-        llm.tokenizer.encode(combined_text, add_special_tokens=False),
-        dtype=generated_ids.dtype)
-
-
-    breakpoint()
-
-    # Recompute answer positions within the retokenized late_ids
+    # Find answer positions within late tokens
     answer_start_late, answer_end_late = find_token_indices_from_end(
-        llm.tokenizer, late_ids, parsed_output.final_answer)
+        llm.tokenizer, late_tokens[0], parsed_output.final_answer)
 
     if use_fullstring:
-        modify_start_late = 1                    # first "Final Answer" token
-        modify_end_late = len(late_ids)          # cover everything incl. suffix
+        modify_start_late = 1
+        modify_end_late = len(late_tokens[0])
     else:
         modify_start_late = answer_start_late
         modify_end_late = answer_end_late
 
-    late_tokens = late_ids.unsqueeze(0).to(device)           # [1, late_len]
+    # -- Early forward pass ---------------------------------------------------
+    with torch.no_grad():
+        empty_cache = Qwen3_5DynamicCache(llm.model.config) if "qwen" in llm.model_name.lower() else DynamicCache()
+        early_output = llm.model(input_ids=early_tokens, past_key_values=empty_cache)
 
-    # Crop KV cache to the early portion
-    kv_cache = copy.deepcopy(generation_result.past_key_values)
-    crop_kv_cache(llm, kv_cache, early_late_split_abs)
+    early_cache = early_output.past_key_values
+    nb_early_tokens = early_tokens.shape[1]
 
     # -- Vanilla forward ------------------------------------------------------
     with torch.no_grad():
         vanilla_output = llm.model.forward(
             input_ids=late_tokens,
-            past_key_values=copy.deepcopy(kv_cache),
+            past_key_values=copy.deepcopy(early_cache),
             output_hidden_states=True,
         )
 
     # -- Dropout forward ------------------------------------------------------
     dropout_output = None
     if nb_dropout_samples > 0 and len(parsed_output.cot_steps) > 1:
-        step_token_ids = torch.cat([generation_result.prompt_tail_ids, generated_ids[:early_late_split_gen]])
-        tail_len = len(generation_result.prompt_tail_ids)
         dropout_output = dropout_late_forward(
             llm,
             parsed_output.cot_steps,
-            step_token_ids,
-            copy.deepcopy(kv_cache),
+            early_tokens[0],
+            copy.deepcopy(early_cache),
             late_tokens,
             modify_start_late,
             modify_end_late,
-            early_late_split_abs,          # == nb_early_tokens
-            prompt_end,
+            nb_early_tokens,
             nb_dropout_samples,
             threshold,
-            tail_len,
         )
 
     return late_tokens, vanilla_output, dropout_output, answer_start_late, answer_end_late
 
 
 def dropout_late_forward(
-    llm,                  # LLM instance (need llm.model and llm.tokenizer)
-    cot_steps,            # list of reasoning step strings from ParsedOutput
-    step_token_ids,       # 1D tensor: prompt tail + generated token IDs containing the steps (before the answer region)
-    early_cache,          # cropped KV cache covering [prompt + steps]
+    llm,
+    cot_steps,
+    early_token_ids,      # 1D tensor: all tokens in the early portion (prompt + CoT steps)
+    early_cache,
     late_tokens,          # [1, late_len] tensor: tokens to run forward on (answer region + suffix)
-    modify_start_late,    # int: first token in late_tokens to apply dropout masking to
-    modify_end_late,      # int: one-past-last token in late_tokens to apply dropout masking to
-    nb_early_tokens,      # int: total length of the early cache (prompt + steps) == early_late_split_abs
-    prompt_end,           # int: number of prompt tokens — used to convert step positions to absolute mask columns
-    nb_dropout_samples,   # int: how many dropout samples to run in the batch
-    threshold,            # float: probability of keeping each step (0.5 = 50% chance each step is masked)
-    tail_len=0,           # int: number of prompt tail tokens prepended to step_token_ids
+    modify_start_late,
+    modify_end_late,
+    nb_early_tokens,
+    nb_dropout_samples,
+    threshold,
 ):
     """Batched forward with per-sample dropout attention masks.
 
@@ -420,35 +419,24 @@ def dropout_late_forward(
     late_mask[late_mask == 0] = -10000.
     late_mask[late_mask == 1] = 0.
     late_mask = late_mask.repeat(nb_dropout_samples, 1, 1).unsqueeze(1)
-    # shape: [nb_dropout_samples, 1, nb_late, nb_early + nb_late]
 
     # Randomly select which steps to keep per sample
     is_step_selected = (np.random.random((nb_dropout_samples, len(steps))) <= threshold)
 
-    # Walk backwards through steps, finding each one's token range and masking
-    remaining_ids = step_token_ids.clone()
+    # Walk backwards through steps, finding each one's token range and masking.
+    # Positions in early_token_ids directly correspond to early cache columns.
+    remaining_ids = early_token_ids.clone()
     for step_id, step in reversed(list(enumerate(steps))):
         try:
-            step_start, step_end = find_token_indices_from_end(llm.tokenizer, remaining_ids, step)
+            step_start, step_end = find_token_indices_from_end(
+                llm.tokenizer, remaining_ids, step)
         except ValueError:
-            # Step text overlaps with the prompt region (not fully in generated tokens).
-            # All earlier steps will too, so stop here.
             break
-        # Absolute position in the full sequence (for mask column index)
-        abs_start = prompt_end + step_start - tail_len
-        abs_end = prompt_end + step_end - tail_len
-
-        # If the step falls (partially) in the prompt region, skip it
-        if abs_start < prompt_end:
-            remaining_ids = remaining_ids[:step_start + 1]
-            continue
 
         for i in range(nb_dropout_samples):
-            # Rows = answer-region positions (shifted -1 for next-token prediction)
-            # Cols = step positions in the early cache
             late_mask[i, 0,
                       modify_start_late - 1:modify_end_late - 1,
-                      abs_start:abs_end] = 0. if is_step_selected[i, step_id] else -10000.
+                      step_start:step_end] = 0. if is_step_selected[i, step_id] else -10000.
 
         remaining_ids = remaining_ids[:step_start + 1]
 
@@ -456,10 +444,6 @@ def dropout_late_forward(
     late_tokens_batch = late_tokens.expand(nb_dropout_samples, -1)
     early_cache.reorder_cache(torch.tensor([0] * nb_dropout_samples))
     late_mask = late_mask.to(device=device, dtype=next(llm.model.parameters()).dtype)
-
-
-    breakpoint()
-
 
     with torch.no_grad():
         late_output = llm.model.forward(
@@ -471,3 +455,110 @@ def dropout_late_forward(
         late_output['input_ids'] = late_tokens_batch
 
     return late_output
+
+
+# ---------------------------------------------------------------------------
+# Debug helpers — return dicts for JSON serialization
+# ---------------------------------------------------------------------------
+
+def _debug_early_late_split(llm, early_tokens, late_tokens, answer_start_late, answer_end_late, parsed_output, suffix_text=""):
+    """Return debug info about the early/late token split and answer region."""
+    return {
+        "early_token_count": early_tokens.shape[1],
+        "late_token_count": late_tokens.shape[1],
+        "total_token_count": early_tokens.shape[1] + late_tokens.shape[1],
+        "early_tail_30_tokens": llm.tokenizer.decode(early_tokens[0][-30:]),
+        "late_tokens_full": llm.tokenizer.decode(late_tokens[0]),
+        "answer_start_late": answer_start_late,
+        "answer_end_late": answer_end_late,
+        "expected_answer": parsed_output.final_answer,
+        "decoded_answer_tokens": llm.tokenizer.decode(late_tokens[0, answer_start_late:answer_end_late]),
+        "suffix_text": suffix_text,
+        "late_tail_after_answer": llm.tokenizer.decode(late_tokens[0, answer_end_late:]) if suffix_text else None,
+    }
+
+
+def _debug_answer_logit_tokens(llm, late_tokens, ans_start, ans_end, v_probs, vanilla_answer_probs):
+    """Return debug info about per-token answer probabilities."""
+    answer_tokens = late_tokens[0, ans_start:ans_end]
+    per_token = []
+    for t in range(len(answer_tokens)):
+        tok_id = answer_tokens[t].item()
+        tok_str = llm.tokenizer.decode([tok_id])
+        context_tok = llm.tokenizer.decode([late_tokens[0, ans_start - 1 + t].item()])
+        top5_probs, top5_ids = v_probs[t].topk(5)
+        top5 = [{"token": llm.tokenizer.decode([tid.item()]), "prob": round(p, 6)}
+                for tid, p in zip(top5_ids, top5_probs.tolist())]
+        per_token.append({
+            "position": t,
+            "context_token": context_tok,
+            "predicted_token": tok_str,
+            "token_id": tok_id,
+            "prob": round(vanilla_answer_probs[t], 6),
+            "top5": top5,
+        })
+    return {
+        "ans_start": ans_start,
+        "ans_end": ans_end,
+        "full_answer_text": llm.tokenizer.decode(answer_tokens),
+        "per_token": per_token,
+    }
+
+
+def _debug_indirect_logit_tokens(llm, vanilla_out, positive_ids, negative_ids, label="True/False"):
+    """Return debug info about indirect P(True) probing tokens."""
+    logits = vanilla_out.logits[0, -1, :]
+    probs = logits.float().softmax(-1)
+    pos_entries = [{"token": llm.tokenizer.decode([tid]), "id": tid,
+                    "logit": round(logits[tid].item(), 4), "prob": round(probs[tid].item(), 6)}
+                   for tid in positive_ids]
+    neg_entries = [{"token": llm.tokenizer.decode([tid]), "id": tid,
+                    "logit": round(logits[tid].item(), 4), "prob": round(probs[tid].item(), 6)}
+                   for tid in negative_ids]
+    pos_sum = logits[positive_ids].sum()
+    neg_sum = logits[negative_ids].sum()
+    normalized = torch.softmax(torch.stack([pos_sum.float(), neg_sum.float()]), dim=0)
+    return {
+        "label": label,
+        "positive_tokens": pos_entries,
+        "negative_tokens": neg_entries,
+        "p_positive": round(normalized[0].item(), 6),
+        "p_negative": round(normalized[1].item(), 6),
+    }
+
+
+def _debug_verbconf_tokens(llm, token_seqs, v_probs, vanilla_verbconf):
+    """Return debug info about verbalized confidence token predictions."""
+    probs_1d = v_probs[0] if v_probs.dim() > 1 else v_probs
+    top_vals, top_idxs = probs_1d.topk(min(10, len(probs_1d)))
+    top_numbers = []
+    for val, idx in zip(top_vals, top_idxs):
+        num = idx.item()
+        tok_ids = token_seqs[num]
+        tok_str = llm.tokenizer.decode(tok_ids)
+        top_numbers.append({
+            "number": num,
+            "token_ids": tok_ids,
+            "token_str": tok_str,
+            "prob": round(val.item(), 6),
+        })
+    return {
+        "weighted_score": round(vanilla_verbconf, 6),
+        "top10_numbers": top_numbers,
+    }
+
+
+def _debug_masked_text(llm, early_token_ids, late_mask, modify_start_late, nb_early_tokens, is_step_selected, steps, nb_dropout_samples):
+    """Return debug info about which text is masked/kept per dropout sample."""
+    samples = []
+    for i in range(nb_dropout_samples):
+        mask_row = late_mask[i, 0, modify_start_late - 1, :nb_early_tokens]
+        masked_positions = (mask_row == -10000.).nonzero(as_tuple=True)[0]
+        kept_positions = (mask_row == 0.).nonzero(as_tuple=True)[0]
+        samples.append({
+            "sample_idx": i,
+            "kept_text": llm.tokenizer.decode(early_token_ids[kept_positions]),
+            "masked_text": llm.tokenizer.decode(early_token_ids[masked_positions]),
+            "dropped_steps": [steps[j] for j in range(len(steps)) if not is_step_selected[i, j]],
+        })
+    return samples

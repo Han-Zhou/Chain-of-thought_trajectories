@@ -3,6 +3,7 @@ import re
 # os.environ["CURL_CA_BUNDLE"]=""
 # os.environ["REQUESTS_CA_BUNDLE"]=""
 import copy
+import logging
 import urllib3
 import warnings
 warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
@@ -22,6 +23,10 @@ from utils.structures import GenerationResult
 
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+
 
 
 class _StopAfterFinalAnswer(StoppingCriteria):
@@ -137,7 +142,7 @@ class LLM():
             if last_idx != -1:
                 prompt_text = prompt_text[:last_idx] + "<|channel|>analysis" + prompt_text[last_idx + len(target):]
 
-        print(prompt_text)
+        logger.info(prompt_text)
 
         # breakpoint()
             

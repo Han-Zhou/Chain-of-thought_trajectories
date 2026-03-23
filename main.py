@@ -117,19 +117,25 @@ def parse():
         default=False,
         help="Skip generation and load from saved pickle files in debug_cache/."
     )
+    args.add_argument(
+        "--debug_conf",
+        action="store_true",
+        default=False,
+        help="Save detailed confidence debug info to debug_conf.json in the output directory."
+    )
     return args.parse_args()
 
 
 
 
 
-def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1):
+def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False):
 
     debug_dir = "debug_cache"
 
     if debug:
         # Load pre-saved generation results instead of running the model
-        cache_file = os.path.join(debug_dir, "gen_parsed.pkl")
+        cache_file = os.path.join(debug_dir, f"gen_parsed_type{prompt_type}.pkl")
         if not os.path.exists(cache_file):
             raise FileNotFoundError(f"Debug cache not found at {cache_file}. Run without --debug first to generate it.")
         logger.info(f"Debug mode: loading cached generation results from {cache_file}")
@@ -153,7 +159,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
         t0 = time.time()
 
         if debug:
-            gen, parsed, assistant_prefill, full_generated_text = cached_entries[i]
+            gen, parsed, assistant_prefill, full_generated_text, messages = cached_entries[i]
         else:
             messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type)
             has_assistant_prefill = messages[-1]["role"] == "assistant"
@@ -167,8 +173,8 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
             # We then shift the character offsets back so they are relative to
             # full_generated_text (which confidence.py indexes into).
             if prompt_type == 2:
-                think_match = re.search(r"<think>[\s\S]*?</think>\s*", full_generated_text)
-                think_block_len = len(think_match.group()) if think_match else 0
+                think_match = re.search(r"</think>\s*", full_generated_text)
+                think_block_len = think_match.end() if think_match else 0
                 text_for_parsing = full_generated_text[think_block_len:]
             else:
                 think_block_len = 0
@@ -180,7 +186,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
                     parsed.answer_fullstring_start += think_block_len
                 if parsed.answer_start is not None:
                     parsed.answer_start += think_block_len
-            entries_to_save.append((gen, parsed, assistant_prefill, full_generated_text))
+            entries_to_save.append((gen, parsed, assistant_prefill, full_generated_text, messages))
 
         if parsed.answer_fullstring_start is not None:
             # answer_fullstring_start is an offset into full_generated_text (prefill + new tokens).
@@ -197,15 +203,20 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
             active_llm = llm_for_confidence if debug else llm
             confidence_score: AllConfidenceData = compute_all_confidence_scores(
                 active_llm,
-                gen,
+                messages,
+                gen.generated_text,
                 parsed,
                 nb_dropout_samples=3,
                 use_fullstring=False,   # whether to apply dropout to the entire "Final Answer: ..." string or just the answer tokens
                 assistant_prefill=assistant_prefill,
+                debug_conf=debug_conf,
             )
+            debug_info = confidence_score.debug_info if debug_conf else None
             confidence_score = asdict(confidence_score)
+            confidence_score.pop("debug_info", None)
         else:
             confidence_score = None
+            debug_info = None
 
         #  - id — the unique identifier from the dataset entry (e.g., a BFCL question ID)
         #   - question — the raw question text from the dataset
@@ -236,12 +247,13 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
             "answer_token_start_position":  answer_token_start_position,
             # "confidence_metric": confidence if confidence else None,
             "confidence_score": confidence_score,
+            "debug_info": debug_info,
             "runtime_seconds":              time.time() - t0,
             "past_key_values":              gen.past_key_values,
         })
 
     if not debug:
-        cache_file = os.path.join(debug_dir, "gen_parsed.pkl")
+        cache_file = os.path.join(debug_dir, f"gen_parsed_type{prompt_type}.pkl")
         logger.info(f"Saving debug cache to {cache_file}")
         with open(cache_file, "wb") as f:
             pickle.dump(entries_to_save, f)
@@ -267,6 +279,7 @@ def main(args):
         confidence=args.confidence,
         debug=args.debug,
         prompt_type=args.type,
+        debug_conf=args.debug_conf,
     )
 
 
@@ -274,9 +287,13 @@ def main(args):
     os.makedirs(out_dir, exist_ok=True)
 
     out_file = os.path.join(out_dir, f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_trajectories_{sample_size}.json")
+    all_debug_info = []
     with open(out_file, "w") as f:
         for i, traj in enumerate(trajectories):
             cache = traj.pop("past_key_values")
+            debug_info = traj.pop("debug_info", None)
+            if debug_info is not None:
+                all_debug_info.append({"index": i, "id": traj["id"], **debug_info})
             # torch.save(cache, os.path.join(out_dir, f"cache_{i}.pt"))
 
             traj["prompt_end_position"] = traj.pop("prompt_end_position")
@@ -289,6 +306,12 @@ def main(args):
             }
             json.dump(entry, f, indent=2)
             f.write("\n")
+
+    if all_debug_info:
+        debug_file = os.path.join(out_dir, "debug_conf.json")
+        with open(debug_file, "w") as f:
+            json.dump(all_debug_info, f, indent=2)
+        logger.info(f"Saved confidence debug info to {debug_file}")
 
 
 if __name__ == "__main__":
