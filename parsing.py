@@ -4,10 +4,6 @@ from utils.structures import ParsedOutput
 
 
 
-# =============================================================================
-# Section 3 – Parsing
-# =============================================================================
-
 # Matches "Step 1:", "Step 2:", ... as step delimiters inside the CoT block.
 _STEP_MARKER_RE = re.compile(r"(Step\s+\d+\s*:)", re.IGNORECASE)
 
@@ -30,6 +26,7 @@ def _extract_boxed_with_positions(text: str):
 
     brace_start = i
     num_open = 0
+    last_close = -1
     while i < len(text):
         if text[i] == "{":
             num_open += 1
@@ -38,7 +35,13 @@ def _extract_boxed_with_positions(text: str):
             if num_open == 0:
                 content = text[brace_start + 1 : i]
                 return content, idx, brace_start + 1, i
+            last_close = i
         i += 1
+
+    # Braces never balanced — fall back to content up to the last '}' seen.
+    if last_close > brace_start:
+        content = text[brace_start + 1 : last_close]
+        return content, idx, brace_start + 1, last_close
 
     return None, None, None, None
 

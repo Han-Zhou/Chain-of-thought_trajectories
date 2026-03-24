@@ -29,29 +29,29 @@ logger = logging.getLogger(__name__)
 
 
 
-class _StopAfterBoxedAnswer(StoppingCriteria):
-    """Stop generation once '\\boxed{...}' with matched braces is produced."""
-
-    def __init__(self, tokenizer, prompt_len: int):
-        self.tokenizer = tokenizer
-        self.prompt_len = prompt_len
-
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        generated_ids = input_ids[0, self.prompt_len:]
-        text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        idx = text.find("\\boxed{")
-        if idx == -1:
-            return False
-        # Count braces from the opening { of \boxed{
-        num_open = 0
-        for i in range(idx + len("\\boxed"), len(text)):
-            if text[i] == "{":
-                num_open += 1
-            elif text[i] == "}":
-                num_open -= 1
-                if num_open == 0:
-                    return True  # Matched braces — stop generation
-        return False
+# class _StopAfterBoxedAnswer(StoppingCriteria):
+#     """Stop generation once '\\boxed{...}' with matched braces is produced."""
+#
+#     def __init__(self, tokenizer, prompt_len: int):
+#         self.tokenizer = tokenizer
+#         self.prompt_len = prompt_len
+#
+#     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+#         generated_ids = input_ids[0, self.prompt_len:]
+#         text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+#         idx = text.find("\\boxed{")
+#         if idx == -1:
+#             return False
+#         # Count braces from the opening { of \boxed{
+#         num_open = 0
+#         for i in range(idx + len("\\boxed"), len(text)):
+#             if text[i] == "{":
+#                 num_open += 1
+#             elif text[i] == "}":
+#                 num_open -= 1
+#                 if num_open == 0:
+#                     return True  # Matched braces — stop generation
+#         return False
 
 
 class LLM():
@@ -164,9 +164,9 @@ class LLM():
 
         # cache = DynamicCache(config=self.model.config)
 
-        stop_criteria = StoppingCriteriaList([
-            _StopAfterBoxedAnswer(self.tokenizer, prompt_len),
-        ])
+        # stop_criteria = StoppingCriteriaList([
+        #     _StopAfterBoxedAnswer(self.tokenizer, prompt_len),
+        # ])
 
         with torch.inference_mode():
             outputs = self.model.generate(
@@ -179,7 +179,7 @@ class LLM():
                 temperature=temperature if temperature > 0.0 else None,
                 pad_token_id=self.tokenizer.eos_token_id,
                 output_scores=output_scores,
-                stopping_criteria=stop_criteria,
+                # stopping_criteria=stop_criteria,
             )
 
         total_len: int = outputs.sequences.shape[1]

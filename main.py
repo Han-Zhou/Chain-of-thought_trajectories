@@ -164,7 +164,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
             messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type)
             has_assistant_prefill = messages[-1]["role"] == "assistant"
             gen: GenerationResult = llm.generate_one(messages, max_new_tokens=max_new_tokens, output_scores=bool(confidence), has_assistant_prefill=has_assistant_prefill)
-            assistant_prefill = next((m["content"] for m in reversed(messages) if m["role"] == "assistant"), "")
+            assistant_prefill = messages[-1]["content"] if messages[-1]["role"] == "assistant" else ""
             full_generated_text = assistant_prefill + gen.generated_text
 
             # For type 2 the model generates freely and may wrap reasoning in
@@ -210,6 +210,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
                 use_fullstring=False,   # whether to apply dropout to the entire "\boxed{...}" string or just the answer tokens
                 assistant_prefill=assistant_prefill,
                 debug_conf=debug_conf,
+                gen_cache=gen.past_key_values,
             )
             debug_info = confidence_score.debug_info if debug_conf else None
             confidence_score = asdict(confidence_score)

@@ -15,7 +15,7 @@ SYSTEM = (
     "before giving your final answer. "
     "Label each reasoning step as 'Step 1:', 'Step 2:', etc. "
     "After all steps, write your final answer on a new line in "
-    "\\boxed{your answer} format."
+    "\\boxed{your answer} format. You must double-escape all LaTeX backslashes. For example, output \\boxed instead of \boxed."
     "Keep your reasoning concise, and be brief in each step."
 )
 

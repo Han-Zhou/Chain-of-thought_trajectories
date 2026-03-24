@@ -46,3 +46,17 @@ def find_token_indices_from_end(tokenizer, token_ids, string):
         breakpoint()
         raise ValueError(f"Cannot find '{string}' in '...{tokens}'")
     return start, end
+
+
+def find_token_overlap(base_ids, suffix_ids):
+    """Length of the longest common prefix between two 1D token ID tensors.
+
+    Compares element-wise from index 0 and returns the count of leading
+    tokens that are identical.  Used to determine how much of a generation
+    KV cache can be reused after appending a suffix and re-tokenizing.
+    """
+    min_len = min(len(base_ids), len(suffix_ids))
+    for i in range(min_len):
+        if base_ids[i] != suffix_ids[i]:
+            return i
+    return min_len

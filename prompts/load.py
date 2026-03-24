@@ -79,15 +79,13 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
                 if message["role"] == "assistant":
                     if prompt_type == 2:
                         # Type 2: steps outside thinking blocks — strip thinking tokens
-                        content = message["content"].format(
-                            thinking_token_open="",
-                            thinking_token_close="",
-                        )
+                        content = (message["content"]
+                            .replace("{thinking_token_open}", "")
+                            .replace("{thinking_token_close}", ""))
                     else:
-                        content = message["content"].format(
-                            thinking_token_open=thinking_token_open,
-                            thinking_token_close=thinking_token_close,
-                        )
+                        content = (message["content"]
+                            .replace("{thinking_token_open}", thinking_token_open)
+                            .replace("{thinking_token_close}", thinking_token_close))
                     if use_thinking_field:
                         sep = "\\boxed{"
                         idx = content.find(sep)
