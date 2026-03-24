@@ -23,6 +23,6 @@ module load cuda/12.4
 module load conda
 conda activate cot
 
-./actual_run.sh
+./batched_run.sh
 
 

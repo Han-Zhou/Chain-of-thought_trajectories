@@ -89,13 +89,13 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
                             thinking_token_close=thinking_token_close,
                         )
                     if use_thinking_field:
-                        sep = "\n\\boxed{"
+                        sep = "\\boxed{"
                         idx = content.find(sep)
                         if idx != -1:
                             few_shot_messages.append({
                                 "role": "assistant",
                                 "thinking": content[:idx].strip(),
-                                "content": content[idx + 1:].strip(),
+                                "content": content[idx:].strip(),
                             })
                         else:
                             few_shot_messages.append({"role": "assistant", "content": content})
