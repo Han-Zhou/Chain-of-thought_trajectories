@@ -19,6 +19,8 @@ class CodeQADataLoader(BaseBenchmarkDataset):
         else:
             rows = list(self._hf("lissadesu/codeqa_v2", "train"))
 
+        rows = rows[2:]  # skip first 2 entries (used as few-shot examples)
+
         entries = []
         for i, row in enumerate(rows):
             entries.append(self._entry(
