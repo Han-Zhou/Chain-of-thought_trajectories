@@ -333,7 +333,7 @@ def dropout_forward(
     # Tokenize the full conversation from scratch
     tokens = _tokenize_for_confidence(llm, messages, full_content)  # [1, seq_len]
 
-    # Find the answer region ("Final Answer: ...") in the full token sequence
+    # Find the answer region ("\boxed{...}") in the full token sequence
     full_text = (assistant_prefill + generated_text).strip()
     fullstring_text = full_text[parsed_output.answer_fullstring_start:]
     fs_start, _ = find_token_indices_from_end(llm.tokenizer, tokens[0], fullstring_text)

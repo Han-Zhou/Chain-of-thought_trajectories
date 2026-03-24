@@ -22,9 +22,9 @@ class ParsedOutput:
     """Structured view of a single model generation."""
     cot_steps: list           # individual reasoning steps as strings
     final_answer: str         # MCQ or other strings
-    raw_cot_block: str        # the full CoT text before the Final Answer line
-    answer_fullstring_start: int | None  # char offset in generated_text where "final answer" begins (None if not found)
-    answer_start: int | None # Immediate beginning of the answer after "final answer: "
+    raw_cot_block: str        # the full CoT text before the \boxed{} answer
+    answer_fullstring_start: int | None  # char offset in generated_text where "\boxed{" begins (None if not found)
+    answer_start: int | None # char offset of the first character inside \boxed{...} braces
 
 
 @dataclass

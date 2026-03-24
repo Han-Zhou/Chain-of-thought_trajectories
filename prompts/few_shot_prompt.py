@@ -42,7 +42,7 @@ LOGIQA_FEW_SHOT_MESSAGES = [
             "Step 4: This confirms that when the \"salt-deficient\" genetic history is removed,"
             " the Western diet doesn't cause the same level of hypertension.\n"
             "Step 5: Option A is the best fit.{thinking_token_close}\n"
-            "Final Answer: A"
+            "\\boxed{A}"
         ),
     },
     {
@@ -79,7 +79,7 @@ LOGIQA_FEW_SHOT_MESSAGES = [
             " B and C discuss the consequences for companies, not the behavior of young people."
             " D talks about anti-smoking ads, which doesn't explain why cigarette ads themselves are effective or ineffective.\n"
             "Step 5: Option A is the best choice to weaken the argument.{thinking_token_close}\n"
-            "Final Answer: A"
+            "\\boxed{A}"
         ),
     },
 ]
@@ -113,7 +113,7 @@ BIGBENCH_MOVIE = [
             "Step 6: The Lion King (1994) is a massive mainstream Hollywood blockbuster from the same era,"
             " fitting perfectly with the pattern of widely popular, commercially successful early-90s films.\n"
             "Step 7: The Lion King is the best match.{thinking_token_close}\n"
-            "Final Answer: B"
+            "\\boxed{B}"
         ),
     },
     {
@@ -140,7 +140,7 @@ BIGBENCH_MOVIE = [
             "Step 6: Terminator 2: Judgment Day (1991) is a hugely popular, critically acclaimed,"
             " culturally iconic blockbuster from the same era — a perfect match.\n"
             "Step 7: Terminator 2 Judgment Day is the best match.{thinking_token_close}\n"
-            "Final Answer: A"
+            "\\boxed{A}"
         ),
     },
 ]
@@ -180,7 +180,7 @@ BIGBENCH_CAUSAL = [
             "Lauren was acting within the rules, while Jane was breaking the official policy.\n"
             "Step 5: Because Jane's action was the norm-violating one, a typical person would say "
             "Jane caused the crash.{thinking_token_close}\n"
-            "Final Answer: Yes"
+            "\\boxed{Yes}"
         ),
     },
     {
@@ -215,7 +215,7 @@ BIGBENCH_CAUSAL = [
             "because MAX DRY was already on.\n"
             "Step 5: A typical person recognizes that David's change was redundant. The clothes would have dried "
             "in sixty minutes regardless. So his action is not seen as the cause.{thinking_token_close}\n"
-            "Final Answer: No"
+            "\\boxed{No}"
         ),
     },
 ]
@@ -250,7 +250,7 @@ CODEQA_FEW_SHOT = [
             "and normalizes it with Normalize().\n"
             "Step 4: Finally, it returns the suite object. "
             "The code makes a suite.{thinking_token_close}\n"
-            "Final Answer: a suite"
+            "\\boxed{a suite}"
         ),
     },
     {
@@ -280,7 +280,7 @@ CODEQA_FEW_SHOT = [
             "Step 3: The function then configures it with SetDict and Normalize, "
             "and returns it.\n"
             "Step 4: Yes, the code does make a suite.{thinking_token_close}\n"
-            "Final Answer: Yes"
+            "\\boxed{Yes}"
         ),
     },
 ]
@@ -328,9 +328,9 @@ CS1QA_FEW_SHOT = [
             "Step 4: So append here serves to grow the Fibonacci sequence one "
             "element at a time, adding each new Fibonacci number to the end of "
             "the list to be returned.{thinking_token_close}\n"
-            "Final Answer: The append function adds an element to the end of "
+            "\\boxed{The append function adds an element to the end of "
             "the list. It serves to add a new Fibonacci number to the list to "
-            "be returned."
+            "be returned.}"
         ),
     },
     {
@@ -370,9 +370,9 @@ CS1QA_FEW_SHOT = [
             "Step 4: The direction checked is an absolute compass direction "
             "(north), so the result depends only on the robot's current heading, "
             "not its initial orientation.{thinking_token_close}\n"
-            "Final Answer: Yes, it returns True or False. It is True when "
+            "\\boxed{Yes, it returns True or False. It is True when "
             "the robot is facing north, and the direction is absolute, so "
-            "it is not affected by Hubo's initial orientation."
+            "it is not affected by Hubo's initial orientation.}"
         ),
     },
 ]
@@ -407,7 +407,7 @@ HOTPOTQA_FEW_SHOT = [
             "Step 3: From the First for Women passage: \"The magazine was started in 1989.\"\n"
             "Step 4: Comparing the two dates, 1844 is earlier than 1989. "
             "Therefore Arthur's Magazine was started first.{thinking_token_close}\n"
-            "Final Answer: Arthur's Magazine"
+            "\\boxed{Arthur's Magazine}"
         ),
     },
     {
@@ -435,7 +435,7 @@ HOTPOTQA_FEW_SHOT = [
             "its head office in Delhi.\"\n"
             "Step 4: Bridging these two facts — the Oberoi family is part of The Oberoi Group, "
             "and The Oberoi Group's head office is in Delhi.{thinking_token_close}\n"
-            "Final Answer: Delhi"
+            "\\boxed{Delhi}"
         ),
     },
 ]
@@ -456,7 +456,7 @@ COLLEGE_MATH_FEW_SHOT = [
             "Step 2: Rewrite the expression: $-10 - 4n + 20$.\n"
             "Step 3: Combine the constant terms: $-10 + 20 = 10$.\n"
             "Step 4: The simplified expression is $10 - 4n$.{thinking_token_close}\n"
-            "Final Answer: $10-4 n$"
+            "\\boxed{10-4 n}"
         ),
     },
     {
@@ -480,7 +480,7 @@ COLLEGE_MATH_FEW_SHOT = [
             "Step 7: When $x = 45$, $y = \\frac{90}{45} = 2$. "
             "When $x = -10$, $y = \\frac{90}{-10} = -9$.\n"
             "Step 8: The solutions are $(45, 2)$ and $(-10, -9)$.{thinking_token_close}\n"
-            "Final Answer: $(45,2),(-10,-9)$"
+            "\\boxed{(45,2),(-10,-9)}"
         ),
     },
 ]
@@ -521,7 +521,7 @@ OLYMPIADBENCH_FEW_SHOT = [
             "Xenia can return $\\{b_1,\\ldots,b_k\\}$ making $N=1$ and $N=M+1=2521$ "
             "indistinguishable, so one move is insufficient.\n"
             "Step 4: Therefore the answer is 2.{thinking_token_close}\n"
-            "Final Answer: 2"
+            "\\boxed{2}"
         ),
     },
     {
@@ -555,7 +555,7 @@ OLYMPIADBENCH_FEW_SHOT = [
             "$\\lfloor m_1/2 \\rfloor + \\sum \\lfloor m_i/2 \\rfloor + \\lfloor m_k/2 \\rfloor "
             "\\leq \\sum m_i - k + 2$ shows the opposite case leads to $2 < 2$, a contradiction.\n"
             "Step 5: Therefore $\\mu = \\frac{1}{2(n+1)}$.{thinking_token_close}\n"
-            "Final Answer: $\\frac{1}{2 n+2}$"
+            "\\boxed{\\frac{1}{2 n+2}}"
         ),
     },
 ]
@@ -581,7 +581,7 @@ MATH500_FEW_SHOT = [
             "so the angle with the positive $x$-axis is $\\frac{\\pi}{2}$.\n"
             "Step 3: Therefore the polar coordinates are "
             "$\\left( 3, \\frac{\\pi}{2} \\right)$.{thinking_token_close}\n"
-            "Final Answer: $\\left( 3, \\frac{\\pi}{2} \\right)$"
+            "\\boxed{\\left( 3, \\frac{\\pi}{2} \\right)}"
         ),
     },
     {
@@ -612,7 +612,7 @@ MATH500_FEW_SHOT = [
             "adding them back cancels: "
             "$\\left(p - 1\\right) - \\left(q - 1\\right) = p - q$.\n"
             "Step 5: The answer is $p - q$.{thinking_token_close}\n"
-            "Final Answer: $p - q$"
+            "\\boxed{p - q}"
         ),
     },
 ]
@@ -651,7 +651,7 @@ HLE_FEW_SHOT = [
             "Step 4: This directly violates Weak Non-Sadism, since adding positive-welfare "
             "lives can be worse than adding negative-welfare lives.\n"
             "Step 5: The answer is D.{thinking_token_close}\n"
-            "Final Answer: D"
+            "\\boxed{D}"
         ),
     },
     {
@@ -688,7 +688,7 @@ HLE_FEW_SHOT = [
             "(7.34 x 10^22 kg) than to the Earth (5.97 x 10^24 kg). "
             "The second letter of \"Moon\" is 'o'. So c5 = o.\n"
             "Step 6: Concatenating c1, c2, c4, c5 = y, e, y, o = \"yeyo\".{thinking_token_close}\n"
-            "Final Answer: yeyo"
+            "\\boxed{yeyo}"
         ),
     },
 ]
@@ -723,7 +723,7 @@ BFCL_FEW_SHOT = [
             "Step 2: The function temperature.convert takes value, from_unit, and to_unit. "
             "value=25, from_unit=\"celsius\", to_unit=\"fahrenheit\".\n"
             "Step 3: All required parameters are provided. I will make a single call.{thinking_token_close}\n"
-            "Final Answer: [temperature.convert(value=25, from_unit=\"celsius\", to_unit=\"fahrenheit\")]"
+            "\\boxed{[temperature.convert(value=25, from_unit=\"celsius\", to_unit=\"fahrenheit\")]}"
         ),
     },
     # Example 2: parallel calls to two different functions
@@ -759,8 +759,8 @@ BFCL_FEW_SHOT = [
             "Step 3: For the hotel, I use hotels.reserve with city=\"London\", "
             "check_in=\"2025-08-15\", nights=3.\n"
             "Step 4: These are independent requests, so I should make both calls in parallel.{thinking_token_close}\n"
-            "Final Answer: [flights.search(origin=\"New York\", destination=\"London\", "
-            "date=\"2025-08-15\"), hotels.reserve(city=\"London\", check_in=\"2025-08-15\", nights=3)]"
+            "\\boxed{[flights.search(origin=\"New York\", destination=\"London\", "
+            "date=\"2025-08-15\"), hotels.reserve(city=\"London\", check_in=\"2025-08-15\", nights=3)]}"
         ),
     },
 ]

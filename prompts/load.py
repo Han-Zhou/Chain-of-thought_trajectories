@@ -89,7 +89,7 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
                             thinking_token_close=thinking_token_close,
                         )
                     if use_thinking_field:
-                        sep = "\nFinal Answer:"
+                        sep = "\n\\boxed{"
                         idx = content.find(sep)
                         if idx != -1:
                             few_shot_messages.append({

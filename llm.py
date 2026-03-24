@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 
 
-class _StopAfterFinalAnswer(StoppingCriteria):
-    """Stop generation once 'Final Answer: ...' followed by a newline is produced."""
+class _StopAfterBoxedAnswer(StoppingCriteria):
+    """Stop generation once '\\boxed{...}' with matched braces is produced."""
 
     def __init__(self, tokenizer, prompt_len: int):
         self.tokenizer = tokenizer
@@ -39,12 +39,19 @@ class _StopAfterFinalAnswer(StoppingCriteria):
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
         generated_ids = input_ids[0, self.prompt_len:]
         text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-        idx = text.lower().find("final answer:")
+        idx = text.find("\\boxed{")
         if idx == -1:
             return False
-        # Stop once there's a newline (or 20+ chars) after "Final Answer:"
-        after = text[idx + len("final answer:"):]
-        return "\n" in after or len(after) > 20
+        # Count braces from the opening { of \boxed{
+        num_open = 0
+        for i in range(idx + len("\\boxed"), len(text)):
+            if text[i] == "{":
+                num_open += 1
+            elif text[i] == "}":
+                num_open -= 1
+                if num_open == 0:
+                    return True  # Matched braces — stop generation
+        return False
 
 
 class LLM():
@@ -158,7 +165,7 @@ class LLM():
         # cache = DynamicCache(config=self.model.config)
 
         stop_criteria = StoppingCriteriaList([
-            _StopAfterFinalAnswer(self.tokenizer, prompt_len),
+            _StopAfterBoxedAnswer(self.tokenizer, prompt_len),
         ])
 
         with torch.inference_mode():

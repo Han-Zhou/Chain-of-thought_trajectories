@@ -207,7 +207,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
                 gen.generated_text,
                 parsed,
                 nb_dropout_samples=3,
-                use_fullstring=False,   # whether to apply dropout to the entire "Final Answer: ..." string or just the answer tokens
+                use_fullstring=False,   # whether to apply dropout to the entire "\boxed{...}" string or just the answer tokens
                 assistant_prefill=assistant_prefill,
                 debug_conf=debug_conf,
             )
@@ -222,13 +222,13 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
         #   - question — the raw question text from the dataset
         #   - ground_truth — the expected correct answer from the dataset, used for evaluation
         #   - cot_steps — the parsed chain-of-thought steps (e.g., "Step 1: ...", "Step 2: ...") extracted from the model's output by parse_output()
-        #   - raw_cot_block — the full unparsed reasoning block as a single string (everything before "Final Answer:")
-        #   - final_answer — the model's extracted final answer (the text after "Final Answer:")
+        #   - raw_cot_block — the full unparsed reasoning block as a single string (everything before "\boxed{}")
+        #   - final_answer — the model's extracted final answer (the content inside "\boxed{...}")
         #   - generated_text — the complete raw output including the assistant prefill + all generated tokens, before any parsing
         #   - prompt_end_position — the number of tokens in the prompt (i.e., the index where generation starts). Useful for indexing into scores/cache
         #   - generated_end_position — the total sequence length (prompt + generated). So generated_end_position - prompt_end_position = number of new
         #   tokens
-        #   - answer_token_start_position — the absolute token position where the "Final Answer:" content begins. This is the boundary between CoT and answer tokens
+        #   - answer_token_start_position — the absolute token position where the "\boxed{...}" content begins. This is the boundary between CoT and answer tokens
         #   — critical for computing confidence only over the answer portion
         #   - confidence_metric — which confidence method was used (e.g., the string passed via --confidence), or None if confidence wasn't computed
         #   - confidence_score — the computed confidence value for the answer tokens using the specified metric, or None

@@ -14,8 +14,8 @@ SYSTEM = (
     "For every problem you receive, think carefully and reason step-by-step "
     "before giving your final answer. "
     "Label each reasoning step as 'Step 1:', 'Step 2:', etc. "
-    "After all steps, write your final answer on a new line starting with "
-    "'Final Answer:'."
+    "After all steps, write your final answer on a new line in "
+    "\\boxed{your answer} format."
     "Keep your reasoning concise, and be brief in each step."
 )
 
@@ -53,7 +53,7 @@ Step 3: Determine the correct argument values from the request.
 Step 4: Verify the chosen call satisfies all constraints in the function \
 schema.
 
-Final Answer: <function call(s) in the required format>
+\\boxed{function call(s) in the required format}
 """
 
 BFCL = """\
@@ -76,7 +76,7 @@ BIGBENCH_MOVIE = """\
 Think carefully about the movies listed and the options provided. Reason \
 step-by-step before choosing the best answer.
 
-Final Answer: <your answer>
+\\boxed{your answer}
 """
 
 # --- BigBench Causal Judgement ----------------------------------------------
@@ -85,14 +85,14 @@ BIGBENCH_CAUSAL = """\
 
 Reason through the causal relationships step-by-step before answering.
 
-Final Answer: <Yes / No>
+\\boxed{Yes or No}
 """
 
 # --- LogiQA ----------------------------------------------------------------
 LOGIQIA = """\
 You are an expert in logical reasoning.
 
-Reason step-by-step through the logical relationships before selecting an answer. 'Final Answer:' must be followed by exactly one letter: A, B, C, or D.
+Reason step-by-step through the logical relationships before selecting an answer. Put your answer in \\boxed{} with exactly one letter: A, B, C, or D.
 """
 
 LOGIQIA_experimental_system = """\
@@ -107,7 +107,7 @@ Question:
 Options:
 {options}
 
-Reason step-by-step through the logical relationships before selecting an answer. 'Final Answer:' must be followed by exactly one letter: A, B, C, or D.
+Reason step-by-step through the logical relationships before selecting an answer. Put your answer in \\boxed{} with exactly one letter: A, B, C, or D.
 """
 
 # --- CodeQA ----------------------------------------------------------------
@@ -123,7 +123,7 @@ Question:
 
 Analyze the code step-by-step and answer the question accurately.
 
-Final Answer: <your answer>
+\\boxed{your answer}
 """
 
 # --- CS1QA -----------------------------------------------------------------
@@ -141,7 +141,7 @@ Step 2: Recall the relevant rules or definitions.
 Step 3: Apply those rules to the specific scenario in the question.
 Step 4: Arrive at the correct answer and explain it clearly.
 
-Final Answer: <your answer>
+\\boxed{your answer}
 """
 
 # --- HotPotQA --------------------------------------------------------------
@@ -155,7 +155,7 @@ Question:
 
 Answer the question by reasoning across the passages step-by-step.
 
-Final Answer: <your answer>
+\\boxed{your answer}
 """
 
 # --- College Math Test -----------------------------------------------------
@@ -164,7 +164,7 @@ Question: {question}
 
 Solve the problem step-by-step, showing all work clearly.
 
-Final Answer: <exact answer>
+\\boxed{exact answer}
 """
 
 # --- OlympiadBench ---------------------------------------------------------
@@ -173,7 +173,7 @@ Question: {question}
 
 Approach the problem rigorously and creatively, step-by-step.
 
-Final Answer: <exact answer or proof conclusion>
+\\boxed{exact answer or proof conclusion}
 """
 
 # --- Math500 ---------------------------------------------------------------
@@ -182,7 +182,7 @@ Question: {question}
 
 Solve step-by-step, showing all reasoning clearly.
 
-Final Answer: <exact answer in simplified form>
+\\boxed{exact answer in simplified form}
 """
 
 # --- HLE (Humanity's Last Exam) --------------------------------------------
@@ -193,7 +193,7 @@ Question:
 This is a highly challenging question that may require deep, multi-domain \
 reasoning. Think carefully and systematically.
 
-Final Answer: <your answer>
+\\boxed{your answer}
 """
 
 # ---------------------------------------------------------------------------
