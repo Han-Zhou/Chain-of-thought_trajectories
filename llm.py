@@ -156,7 +156,7 @@ class LLM():
             if last_idx != -1:
                 prompt_text = prompt_text[:last_idx] + "<|channel|>analysis" + prompt_text[last_idx + len(target):]
 
-        logger.info(prompt_text)
+        # logger.info(prompt_text)
 
         # breakpoint()
             

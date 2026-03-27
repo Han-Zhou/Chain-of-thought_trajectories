@@ -7,9 +7,9 @@
 #SBATCH --qos=high
 #SBATCH --partition=compute
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #--time=5-00:00:00
-#SBATCH --time=8:00:00
+#SBATCH --time=1-8:00:00
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=24
 #SBATCH --qos=high
@@ -24,6 +24,6 @@ module load cuda/12.4
 module load conda
 conda activate cot
 
-./batched_run.sh
+./batched_run2.sh
 
 
