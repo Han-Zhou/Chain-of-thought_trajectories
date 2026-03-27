@@ -22,7 +22,8 @@ python3 main.py \
     --thinking \
     --max_new_tokens 20000 \
     --type 2 \
-    --debug_conf
+    --debug_conf \
+    --confidence
 
 # few-shot, no-thinking
 python3 main.py \
@@ -32,7 +33,8 @@ python3 main.py \
     --shot_mode few \
     --max_new_tokens 20000 \
     --type 1 \
-    --debug_conf
+    --debug_conf \
+    --confidence
 
 # # zero-shot, type 1
 # python3 main.py \
@@ -54,7 +56,8 @@ python3 main.py \
     --thinking \
     --max_new_tokens 20000 \
     --type 2 \
-    --debug_conf
+    --debug_conf \
+    --confidence
 
 
 # zero-shot, no-thinking
@@ -65,7 +68,8 @@ python3 main.py \
     --shot_mode zero \
     --max_new_tokens 20000 \
     --type 1 \
-    --debug_conf
+    --debug_conf \
+    --confidence
 
 
 
@@ -79,7 +83,8 @@ python3 main.py \
     --thinking \
     --max_new_tokens 20000 \
     --type 1 \
-    --debug_conf
+    --debug_conf \
+    --confidence
 
 # zero-shot, type 1
 python3 main.py \
@@ -90,4 +95,5 @@ python3 main.py \
     --thinking \
     --max_new_tokens 20000 \
     --type 1 \
-    --debug_conf
+    --debug_conf \
+    --confidence

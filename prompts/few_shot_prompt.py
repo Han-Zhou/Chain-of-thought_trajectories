@@ -784,6 +784,8 @@ FEW_SHOT_PROMPT_REGISTRY: dict[str, dict[str, str]] = {
 THINKING_TOKENS: dict[str, tuple[str, str]] = {
     "none": ("", ""),
     "Qwen/Qwen3.5-27B": ("<think>\n", "\n</think>"),
+    "Qwen/Qwen3.5-27B-FP8": ("<think>\n", "\n</think>"),
+    "Qwen/Qwen3.5-27B-GPTQ-Int4": ("<think>\n", "\n</think>"),
     # Gpt-OSS uses OpenAI Harmony format: https://developers.openai.com/cookbook/articles/openai-harmony/
     # "openai/gpt-oss-20b": ("<|channel|>analysis<|message|>\n", "\n<|end|>")
     "openai/gpt-oss-20b": ("", "")

@@ -65,7 +65,7 @@ def parse():
         "--model",
         type=str,
         default="llama",
-        choices=["llama", "gpt", "qwen"],
+        choices=["llama", "gpt", "qwen", "qwen-fp8", "qwen-gptq"],
         help="Model to use for inference."
     )
     args.add_argument(
@@ -123,15 +123,28 @@ def parse():
         default=False,
         help="Save detailed confidence debug info to debug_conf.json in the output directory."
     )
+    args.add_argument(
+        "--experimental_jacknife",
+        action="store_true",
+        default=False,
+        help=(
+            "Use jackknife step masking instead of coin-flip dropout. "
+            "Masks exactly floor(k/2) of k CoT steps per sample (uniform random without replacement) "
+            "rather than flipping an independent coin per step."
+        ),
+    )
     return args.parse_args()
 
 
 
 
 
-def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False):
+def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jacknife=False):
 
     debug_dir = "debug_cache"
+
+    llm = LLM(model_name, thinking)
+    tokenizer = llm.tokenizer
 
     if debug:
         # Load pre-saved generation results instead of running the model
@@ -141,117 +154,146 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
         logger.info(f"Debug mode: loading cached generation results from {cache_file}")
         with open(cache_file, "rb") as f:
             cached_entries = pickle.load(f)
-
-        # Only need the tokenizer for answer_token_start_position computation
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        llm_for_confidence = None
     else:
-        llm = LLM(model_name, thinking)
-        tokenizer = llm.tokenizer
         cached_entries = None
         os.makedirs(debug_dir, exist_ok=True)
         entries_to_save = []
 
     trajectories = []
+    errors = []
 
     for i, entry in enumerate(dataloader):
         logger.info(f"Generating {i}/{len(dataloader)}")
         t0 = time.time()
 
-        if debug:
-            gen, parsed, assistant_prefill, full_generated_text, messages = cached_entries[i]
-        else:
-            messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type)
-            has_assistant_prefill = messages[-1]["role"] == "assistant"
-            gen: GenerationResult = llm.generate_one(messages, max_new_tokens=max_new_tokens, output_scores=bool(confidence), has_assistant_prefill=has_assistant_prefill)
-            assistant_prefill = messages[-1]["content"] if messages[-1]["role"] == "assistant" else ""
-            full_generated_text = assistant_prefill + gen.generated_text
-
-            # For type 2 the model generates freely and may wrap reasoning in
-            # <think>...</think>.  We parse only the text *after* the think block
-            # so that CoT steps are extracted from the visible output.
-            # We then shift the character offsets back so they are relative to
-            # full_generated_text (which confidence.py indexes into).
-            if prompt_type == 2:
-                think_match = re.search(r"</think>\s*", full_generated_text)
-                think_block_len = think_match.end() if think_match else 0
-                text_for_parsing = full_generated_text[think_block_len:]
+        try:
+            if debug:
+                gen, parsed, assistant_prefill, full_generated_text, messages = cached_entries[i]
             else:
-                think_block_len = 0
-                text_for_parsing = full_generated_text
-            parsed: ParsedOutput = parse_output(text_for_parsing)
-            # Shift character offsets back to full_generated_text coordinates
-            if think_block_len > 0:
-                if parsed.answer_fullstring_start is not None:
-                    parsed.answer_fullstring_start += think_block_len
-                if parsed.answer_start is not None:
-                    parsed.answer_start += think_block_len
-            entries_to_save.append((gen, parsed, assistant_prefill, full_generated_text, messages))
+                messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type)
+                has_assistant_prefill = messages[-1]["role"] == "assistant"
+                gen: GenerationResult = llm.generate_one(messages, max_new_tokens=max_new_tokens, output_scores=False, has_assistant_prefill=has_assistant_prefill)
+                assistant_prefill = messages[-1]["content"] if messages[-1]["role"] == "assistant" else ""
+                full_generated_text = assistant_prefill + gen.generated_text
 
-        if parsed.answer_fullstring_start is not None:
-            # answer_fullstring_start is an offset into full_generated_text (prefill + new tokens).
-            # Token positions only count newly generated tokens, so strip the prefill chars first.
-            generated_prefix = full_generated_text[len(assistant_prefill):parsed.answer_fullstring_start]
-            prefix_ids = tokenizer(generated_prefix, add_special_tokens=False)["input_ids"]
-            answer_token_start_position = gen.prompt_end_position + len(prefix_ids)
-        else:
-            answer_token_start_position = None
+                # For type 2 the model generates freely and may wrap reasoning in
+                # <think>...</think>.  We parse only the text *after* the think block
+                # so that CoT steps are extracted from the visible output.
+                # We then shift the character offsets back so they are relative to
+                # full_generated_text (which confidence.py indexes into).
+                if prompt_type == 2:
+                    think_match = re.search(r"</think>\s*", full_generated_text)
+                    think_block_len = think_match.end() if think_match else 0
+                    text_for_parsing = full_generated_text[think_block_len:]
+                else:
+                    think_block_len = 0
+                    text_for_parsing = full_generated_text
+                parsed: ParsedOutput = parse_output(text_for_parsing)
+                # Shift character offsets back to full_generated_text coordinates
+                if think_block_len > 0:
+                    if parsed.answer_fullstring_start is not None:
+                        parsed.answer_fullstring_start += think_block_len
+                    if parsed.answer_start is not None:
+                        parsed.answer_start += think_block_len
+                entries_to_save.append((gen, parsed, assistant_prefill, full_generated_text, messages))
 
-        if confidence and parsed.final_answer:
-            if debug and llm_for_confidence is None:
-                llm_for_confidence = LLM(model_name, thinking)
-            active_llm = llm_for_confidence if debug else llm
-            confidence_score: AllConfidenceData = compute_all_confidence_scores(
-                active_llm,
-                messages,
-                gen.generated_text,
-                parsed,
-                nb_dropout_samples=3,
-                use_fullstring=False,   # whether to apply dropout to the entire "\boxed{...}" string or just the answer tokens
-                assistant_prefill=assistant_prefill,
-                debug_conf=debug_conf,
-                gen_cache=gen.past_key_values,
-            )
-            debug_info = confidence_score.debug_info if debug_conf else None
-            confidence_score = asdict(confidence_score)
-            confidence_score.pop("debug_info", None)
-        else:
-            confidence_score = None
-            debug_info = None
+            if parsed.answer_fullstring_start is not None:
+                # answer_fullstring_start is an offset into full_generated_text (prefill + new tokens).
+                # Token positions only count newly generated tokens, so strip the prefill chars first.
+                generated_prefix = full_generated_text[len(assistant_prefill):parsed.answer_fullstring_start]
+                prefix_ids = tokenizer(generated_prefix, add_special_tokens=False)["input_ids"]
+                answer_token_start_position = gen.prompt_end_position + len(prefix_ids)
+            else:
+                answer_token_start_position = None
 
-        #  - id — the unique identifier from the dataset entry (e.g., a BFCL question ID)
-        #   - question — the raw question text from the dataset
-        #   - ground_truth — the expected correct answer from the dataset, used for evaluation
-        #   - cot_steps — the parsed chain-of-thought steps (e.g., "Step 1: ...", "Step 2: ...") extracted from the model's output by parse_output()
-        #   - raw_cot_block — the full unparsed reasoning block as a single string (everything before "\boxed{}")
-        #   - final_answer — the model's extracted final answer (the content inside "\boxed{...}")
-        #   - generated_text — the complete raw output including the assistant prefill + all generated tokens, before any parsing
-        #   - prompt_end_position — the number of tokens in the prompt (i.e., the index where generation starts). Useful for indexing into scores/cache
-        #   - generated_end_position — the total sequence length (prompt + generated). So generated_end_position - prompt_end_position = number of new
-        #   tokens
-        #   - answer_token_start_position — the absolute token position where the "\boxed{...}" content begins. This is the boundary between CoT and answer tokens
-        #   — critical for computing confidence only over the answer portion
-        #   - confidence_metric — which confidence method was used (e.g., the string passed via --confidence), or None if confidence wasn't computed
-        #   - confidence_score — the computed confidence value for the answer tokens using the specified metric, or None
-        #   - past_key_values — the KV cache from generation (a DynamicCache object). This gets popped out and saved as a separate .pt file at write time
-        #   (main.py:298) so you can resume/branch generation later without recomputing the prompt
-        trajectories.append({
-            "id":                           entry["id"],
-            "question":                     entry["question"],
-            "ground_truth":                 entry["answer"],
-            "cot_steps":                    parsed.cot_steps,
-            "final_answer":                 parsed.final_answer,
-            "raw_cot_block":                parsed.raw_cot_block,
-            "generated_text":               full_generated_text,
-            "prompt_end_position":           gen.prompt_end_position,
-            "generated_end_position":       gen.generated_end_position,
-            "answer_token_start_position":  answer_token_start_position,
-            # "confidence_metric": confidence if confidence else None,
-            "confidence_score": confidence_score,
-            "debug_info": debug_info,
-            "runtime_seconds":              time.time() - t0,
-            "past_key_values":              gen.past_key_values,
-        })
+            if confidence and parsed.final_answer:
+                llm.set_attn_implementation("sdpa")
+                confidence_score: AllConfidenceData = compute_all_confidence_scores(
+                    llm,
+                    messages,
+                    gen.generated_text,
+                    parsed,
+                    nb_dropout_samples=3,
+                    use_fullstring=False,   # whether to apply dropout to the entire "\boxed{...}" string or just the answer tokens
+                    assistant_prefill=assistant_prefill,
+                    debug_conf=debug_conf,
+                    gen_cache=gen.past_key_values,
+                    experimental_jacknife=experimental_jacknife,
+                )
+                llm.set_attn_implementation(llm._generation_attn_impl)
+                debug_info = confidence_score.debug_info if debug_conf else None
+                confidence_score = asdict(confidence_score)
+                confidence_score.pop("debug_info", None)
+            else:
+                confidence_score = None
+                debug_info = None
+
+            # Free KV cache — only needed for confidence scoring above.
+            # Prevents N caches from accumulating in the trajectories list.
+            del gen.past_key_values
+            gen.past_key_values = None
+            torch.cuda.empty_cache()
+
+            #  - id — the unique identifier from the dataset entry (e.g., a BFCL question ID)
+            #   - question — the raw question text from the dataset
+            #   - ground_truth — the expected correct answer from the dataset, used for evaluation
+            #   - cot_steps — the parsed chain-of-thought steps (e.g., "Step 1: ...", "Step 2: ...") extracted from the model's output by parse_output()
+            #   - raw_cot_block — the full unparsed reasoning block as a single string (everything before "\boxed{}")
+            #   - final_answer — the model's extracted final answer (the content inside "\boxed{...}")
+            #   - generated_text — the complete raw output including the assistant prefill + all generated tokens, before any parsing
+            #   - prompt_end_position — the number of tokens in the prompt (i.e., the index where generation starts). Useful for indexing into scores/cache
+            #   - generated_end_position — the total sequence length (prompt + generated). So generated_end_position - prompt_end_position = number of new
+            #   tokens
+            #   - answer_token_start_position — the absolute token position where the "\boxed{...}" content begins. This is the boundary between CoT and answer tokens
+            #   — critical for computing confidence only over the answer portion
+            #   - confidence_metric — which confidence method was used (e.g., the string passed via --confidence), or None if confidence wasn't computed
+            #   - confidence_score — the computed confidence value for the answer tokens using the specified metric, or None
+            #   - past_key_values — the KV cache from generation (a DynamicCache object). This gets popped out and saved as a separate .pt file at write time
+            #   (main.py:298) so you can resume/branch generation later without recomputing the prompt
+            trajectories.append({
+                "id":                           entry["id"],
+                "question":                     entry["question"],
+                "ground_truth":                 entry["answer"],
+                "cot_steps":                    parsed.cot_steps,
+                "final_answer":                 parsed.final_answer,
+                "raw_cot_block":                parsed.raw_cot_block,
+                "generated_text":               full_generated_text,
+                "prompt_end_position":           gen.prompt_end_position,
+                "generated_end_position":       gen.generated_end_position,
+                "answer_token_start_position":  answer_token_start_position,
+                # "confidence_metric": confidence if confidence else None,
+                "confidence_score": confidence_score,
+                "confidence_method": "coin_flip+jacknife" if experimental_jacknife else "coin_flip",
+                "debug_info": debug_info,
+                "runtime_seconds":              time.time() - t0,
+                "past_key_values":              None,
+            })
+
+        except Exception as e:
+            logger.error(f"Error processing entry {i} (id={entry['id']}): {e}", exc_info=True)
+            # Recover GPU memory after OOM so subsequent iterations can proceed
+            if isinstance(e, torch.cuda.OutOfMemoryError):
+                torch.cuda.empty_cache()
+                logger.warning("Cleared CUDA cache after OOM error")
+            errors.append({"index": i, "id": entry["id"], "error": str(e)})
+            trajectories.append({
+                "id":                           entry["id"],
+                "question":                     entry["question"],
+                "ground_truth":                 entry["answer"],
+                "error":                        str(e),
+                "cot_steps":                    None,
+                "final_answer":                 None,
+                "raw_cot_block":                None,
+                "generated_text":               None,
+                "prompt_end_position":           None,
+                "generated_end_position":       None,
+                "answer_token_start_position":  None,
+                "confidence_score":             None,
+                "confidence_method":           None,
+                "debug_info":                   None,
+                "runtime_seconds":              time.time() - t0,
+                "past_key_values":              None,
+            })
 
     if not debug:
         cache_file = os.path.join(debug_dir, f"gen_parsed_type{prompt_type}.pkl")
@@ -259,7 +301,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
         with open(cache_file, "wb") as f:
             pickle.dump(entries_to_save, f)
 
-    return trajectories
+    return trajectories, errors
 
 
 def main(args):
@@ -272,7 +314,7 @@ def main(args):
     sample_size = len(dataset) if args.sample_size is None else min(args.sample_size, len(dataset))
     dataloader = make_dataloader(dataset, n=sample_size)
 
-    trajectories = generate_trajectories(
+    trajectories, errors = generate_trajectories(
         model_name, dataloader, args.max_new_tokens,
         dataset_name=args.dataset,
         shot_mode=args.shot_mode,
@@ -281,6 +323,7 @@ def main(args):
         debug=args.debug,
         prompt_type=args.type,
         debug_conf=args.debug_conf,
+        experimental_jacknife=args.experimental_jacknife,
     )
 
 
@@ -291,7 +334,7 @@ def main(args):
     all_debug_info = []
     with open(out_file, "w") as f:
         for i, traj in enumerate(trajectories):
-            cache = traj.pop("past_key_values")
+            # cache = traj.pop("past_key_values")
             debug_info = traj.pop("debug_info", None)
             if debug_info is not None:
                 all_debug_info.append({"index": i, "id": traj["id"], **debug_info})
@@ -313,6 +356,12 @@ def main(args):
         with open(debug_file, "w") as f:
             json.dump(all_debug_info, f, indent=2)
         logger.info(f"Saved confidence debug info to {debug_file}")
+
+    if errors:
+        errors_file = os.path.join(out_dir, "errors.json")
+        with open(errors_file, "w") as f:
+            json.dump(errors, f, indent=2)
+        logger.warning(f"{len(errors)} errors encountered. Saved to {errors_file}")
 
 
 if __name__ == "__main__":

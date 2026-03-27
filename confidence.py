@@ -1,6 +1,7 @@
 import re
 import json
 import logging
+import time
 import numpy as np
 import torch
 import copy
@@ -59,22 +60,41 @@ def compute_all_confidence_scores(
     assistant_prefill: str = "",
     debug_conf: bool = False,
     gen_cache=None,
+    experimental_jacknife: bool = False,
 ) -> AllConfidenceData:
     debug_info = {}
+
+    if experimental_jacknife:
+        k = len(parsed_output.cot_steps) - 1  # first step is always kept
+        debug_info["jacknife_k"] = k
+        debug_info["jacknife_nb_mask"] = k // 2
 
     # Compute base tokenization (no suffix) once, shared by all methods
     base_content = (assistant_prefill + generated_text).strip()
     base_tokens = _tokenize_for_confidence(llm, messages, base_content)
 
+    # Pre-compute early_cache once — avoids 3 redundant deepcopy(gen_cache) + crop
+    precomputed_early_cache = None
+    if gen_cache is not None:
+        full_text = (assistant_prefill + generated_text).strip()
+        fullstring_text = full_text[parsed_output.answer_fullstring_start:]
+        fs_start, _ = find_token_indices_from_end(llm.tokenizer, base_tokens[0], fullstring_text)
+        early_late_split = fs_start - 1
+        precomputed_early_cache = copy.deepcopy(gen_cache)
+        crop_cache(precomputed_early_cache, early_late_split)
+
+    # --- Coin-flip dropout (always computed) ---
     vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg = \
         dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
-                             gen_cache=gen_cache, base_tokens=base_tokens)
+                             gen_cache=gen_cache, base_tokens=base_tokens,
+                             precomputed_early_cache=precomputed_early_cache)
     if dbg:
         debug_info["answer_logits"] = dbg
 
     vanilla_ptrue1, vanilla_ptrue2, dropout_ptrue1, dropout_ptrue2, dbg = \
         dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
-                               gen_cache=gen_cache, base_tokens=base_tokens)
+                               gen_cache=gen_cache, base_tokens=base_tokens,
+                               precomputed_early_cache=precomputed_early_cache)
     if dbg:
         debug_info["indirect_logits"] = dbg
 
@@ -83,9 +103,50 @@ def compute_all_confidence_scores(
      d_verbconf_dist, d_verbconf_top_scores, d_verbconf_top_probs,
      dbg) = \
         dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
-                           gen_cache=gen_cache, base_tokens=base_tokens)
+                           gen_cache=gen_cache, base_tokens=base_tokens,
+                           precomputed_early_cache=precomputed_early_cache,
+                           consume_early_cache=not experimental_jacknife)
     if dbg:
         debug_info["verbconf"] = dbg
+
+    # --- Jackknife dropout (only when flag is set) ---
+    jacknife_scores = None
+    if experimental_jacknife:
+        _, _, jk_answer_probs, jk_answer_entropy, dbg = \
+            dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+                                 gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=True,
+                                 precomputed_early_cache=precomputed_early_cache)
+        if dbg:
+            debug_info["jacknife_answer_logits"] = dbg
+
+        _, _, jk_ptrue1, jk_ptrue2, dbg = \
+            dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+                                   gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=True,
+                                   precomputed_early_cache=precomputed_early_cache)
+        if dbg:
+            debug_info["jacknife_indirect_logits"] = dbg
+
+        (_, jk_verbconf,
+         _, _, _,
+         jk_verbconf_dist, jk_verbconf_top_scores, jk_verbconf_top_probs,
+         dbg) = \
+            dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+                               gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=True,
+                               precomputed_early_cache=precomputed_early_cache,
+                               consume_early_cache=True)
+        if dbg:
+            debug_info["jacknife_verbconf"] = dbg
+
+        jacknife_scores = ConfidenceScores(
+            answer_probabilities=jk_answer_probs,
+            answer_entropy=jk_answer_entropy,
+            indirect_ptrue1_probabilities=jk_ptrue1,
+            indirect_ptrue2_probabilities=jk_ptrue2,
+            verbconf_probabilities=jk_verbconf,
+            verbconf_distribution=jk_verbconf_dist,
+            verbconf_top_score=jk_verbconf_top_scores,
+            verbconf_top_prob=jk_verbconf_top_probs,
+        )
 
     return AllConfidenceData(
         vanilla_confidences=ConfidenceScores(
@@ -108,17 +169,20 @@ def compute_all_confidence_scores(
             verbconf_top_score=d_verbconf_top_scores,
             verbconf_top_prob=d_verbconf_top_probs,
         ),
+        jacknife_confidences=jacknife_scores,
         debug_info=debug_info,
     )
 
 
-def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None):
+def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jacknife=False, precomputed_early_cache=None, consume_early_cache=False):
     """Logit-based confidence on the answer tokens themselves."""
     late_tokens, vanilla_out, dropout_out, ans_start, ans_end = \
         dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text="", nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
-                        gen_cache=gen_cache, base_tokens=base_tokens)
+                        gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=use_jacknife,
+                        precomputed_early_cache=precomputed_early_cache,
+                        consume_early_cache=consume_early_cache)
 
     answer_tokens = late_tokens[0, ans_start:ans_end]
     nb_answer_tokens = len(answer_tokens)
@@ -157,7 +221,7 @@ def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropou
     return vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg
 
 
-def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None):
+def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jacknife=False, precomputed_early_cache=None, consume_early_cache=False):
     """P(True) and P(Yes) probing after the answer."""
     positive_true_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' True'])
     negative_false_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' False'])
@@ -170,7 +234,8 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
                         suffix_text="\nTrue/False:",
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
-                        gen_cache=gen_cache, base_tokens=base_tokens)
+                        gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=use_jacknife,
+                        precomputed_early_cache=precomputed_early_cache)
 
     # ptrue2: "Is the answer <X> correct?"
     _, vanilla2, dropout2, _, _ = \
@@ -178,7 +243,9 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
                         suffix_text=f"\nIs the answer {parsed_output.final_answer} correct?",
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
-                        gen_cache=gen_cache, base_tokens=base_tokens)
+                        gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=use_jacknife,
+                        precomputed_early_cache=precomputed_early_cache,
+                        consume_early_cache=consume_early_cache)
 
     # Vanilla ptrue1
     v_pos1 = vanilla1.logits[0, -1, positive_true_ids].sum()
@@ -268,7 +335,9 @@ def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
             feed_token = prefix[-1]
 
             parent_kv = prefix_cache[parent_prefix]
+            _t0 = time.perf_counter()
             kv = copy.deepcopy(parent_kv)
+            logger.info("deepcopy(parent_kv) in _compute_verbconf_joint_probs took %.4fs", time.perf_counter() - _t0)
 
             tok_input = torch.full((batch_size, 1), feed_token, device=device)
 
@@ -287,7 +356,7 @@ def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
     return joint_logprobs.softmax(-1)
 
 
-def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None):
+def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jacknife=False, precomputed_early_cache=None, consume_early_cache=False):
     """Verbalized confidence (0-100 score)."""
     suffix = (
         "\nPlease respond with a score from 0 to 100 in <confidence> </confidence> tags."
@@ -300,7 +369,9 @@ def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_
                         suffix_text=suffix,
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
-                        gen_cache=gen_cache, base_tokens=base_tokens)
+                        gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=use_jacknife,
+                        precomputed_early_cache=precomputed_early_cache,
+                        consume_early_cache=consume_early_cache)
 
     verbconf_strings = ANSWER_TOKENS['VERBCONF']
     token_seqs = [llm.tokenizer.encode(s, add_special_tokens=False) for s in verbconf_strings]
@@ -347,7 +418,9 @@ def _tokenize_for_confidence(llm, messages, full_assistant_content):
     Matches the tokenization approach in llm.generate_one() for consistency,
     including model-specific post-processing.
     """
+    _t0 = time.perf_counter()
     conf_messages = copy.deepcopy(messages)
+    logger.info("deepcopy(messages) in _tokenize_for_confidence took %.4fs", time.perf_counter() - _t0)
     if conf_messages[-1]["role"] == "assistant":
         conf_messages[-1]["content"] = full_assistant_content
     else:
@@ -380,6 +453,9 @@ def dropout_forward(
     assistant_prefill: str = "",
     gen_cache=None,
     base_tokens=None,
+    use_jacknife: bool = False,
+    precomputed_early_cache=None,
+    consume_early_cache: bool = False,
 ):
     """Core forward pass for dropout experiment.
 
@@ -387,6 +463,10 @@ def dropout_forward(
     expensive early forward pass by cropping the generation cache.  For
     suffix calls the overlap between the base and suffix tokenizations
     determines how much of the cache is reusable for the vanilla forward.
+
+    When consume_early_cache is True, the last consumer of early_cache
+    will use it directly instead of deepcopying — the caller asserts that
+    early_cache (or precomputed_early_cache) will not be needed again.
     """
     device = next(llm.model.parameters()).device
 
@@ -423,9 +503,20 @@ def dropout_forward(
 
     nb_early_tokens = early_tokens.shape[1]
 
+    # -- Determine ownership & whether dropout will run -------------------------
+    # early_cache is "owned" (can be consumed destructively by the last user)
+    # when it was freshly created in this call, or the caller explicitly allows it.
+    _owns_early_cache = (precomputed_early_cache is None) or consume_early_cache
+    will_run_dropout = nb_dropout_samples > 0 and len(parsed_output.cot_steps) > 1
+
     # -- Build early_cache (reuse gen_cache or recompute) -----------------------
-    if gen_cache is not None:
+    if precomputed_early_cache is not None:
+        early_cache = precomputed_early_cache
+        gen_cache_len = gen_cache.get_seq_length() if gen_cache is not None else early_cache.get_seq_length()
+    elif gen_cache is not None:
+        _t0 = time.perf_counter()
         early_cache = copy.deepcopy(gen_cache)
+        logger.info("deepcopy(gen_cache) for early_cache took %.4fs", time.perf_counter() - _t0)
         gen_cache_len = early_cache.get_seq_length()
         crop_cache(early_cache, early_late_split)
     else:
@@ -445,7 +536,9 @@ def dropout_forward(
 
         if overlap_len > early_late_split:
             # Reuse more of the cache via overlap — forward only the tail
+            _t0 = time.perf_counter()
             vanilla_cache = copy.deepcopy(gen_cache)
+            logger.info("deepcopy(gen_cache) for vanilla_cache (suffix+overlap) took %.4fs", time.perf_counter() - _t0)
             crop_cache(vanilla_cache, overlap_len)
             remaining_tokens = tokens[:, overlap_len:].to(device)
             logger.info(
@@ -463,11 +556,22 @@ def dropout_forward(
         else:
             # Pathological case: overlap doesn't extend past split
             with torch.no_grad():
-                vanilla_output = llm.model.forward(
-                    input_ids=late_tokens,
-                    past_key_values=copy.deepcopy(early_cache),
-                    output_hidden_states=True,
-                )
+                if _owns_early_cache and not will_run_dropout:
+                    logger.info("consuming early_cache directly for vanilla (suffix, no overlap)")
+                    vanilla_output = llm.model.forward(
+                        input_ids=late_tokens,
+                        past_key_values=early_cache,
+                        output_hidden_states=True,
+                    )
+                else:
+                    _t0 = time.perf_counter()
+                    _early_cache_copy = copy.deepcopy(early_cache)
+                    logger.info("deepcopy(early_cache) for vanilla (suffix, no overlap) took %.4fs", time.perf_counter() - _t0)
+                    vanilla_output = llm.model.forward(
+                        input_ids=late_tokens,
+                        past_key_values=_early_cache_copy,
+                        output_hidden_states=True,
+                    )
     else:
         if gen_cache is not None:
             nb_discarded = gen_cache_len - early_late_split
@@ -481,26 +585,45 @@ def dropout_forward(
                 llm.tokenizer.decode(late_tokens[0, :3].tolist()),
             )
         with torch.no_grad():
-            vanilla_output = llm.model.forward(
-                input_ids=late_tokens,
-                past_key_values=copy.deepcopy(early_cache),
-                output_hidden_states=True,
-            )
+            if _owns_early_cache and not will_run_dropout:
+                logger.info("consuming early_cache directly for vanilla (no suffix)")
+                vanilla_output = llm.model.forward(
+                    input_ids=late_tokens,
+                    past_key_values=early_cache,
+                    output_hidden_states=True,
+                )
+            else:
+                _t0 = time.perf_counter()
+                _early_cache_copy = copy.deepcopy(early_cache)
+                logger.info("deepcopy(early_cache) for vanilla (no suffix) took %.4fs", time.perf_counter() - _t0)
+                vanilla_output = llm.model.forward(
+                    input_ids=late_tokens,
+                    past_key_values=_early_cache_copy,
+                    output_hidden_states=True,
+                )
 
     # -- Dropout forward --------------------------------------------------------
     dropout_output = None
-    if nb_dropout_samples > 0 and len(parsed_output.cot_steps) > 1:
+    if will_run_dropout:
+        if _owns_early_cache:
+            logger.info("consuming early_cache directly for dropout_late_forward")
+            _dropout_cache = early_cache
+        else:
+            _t0 = time.perf_counter()
+            _dropout_cache = copy.deepcopy(early_cache)
+            logger.info("deepcopy(early_cache) for dropout_late_forward took %.4fs", time.perf_counter() - _t0)
         dropout_output = dropout_late_forward(
             llm,
             parsed_output.cot_steps,
             early_tokens[0],
-            copy.deepcopy(early_cache),
+            _dropout_cache,
             late_tokens,
             modify_start_late,
             modify_end_late,
             nb_early_tokens,
             nb_dropout_samples,
             threshold,
+            use_jacknife=use_jacknife,
         )
 
     return late_tokens, vanilla_output, dropout_output, answer_start_late, answer_end_late
@@ -517,6 +640,7 @@ def dropout_late_forward(
     nb_early_tokens,
     nb_dropout_samples,
     threshold,
+    use_jacknife=False,
 ):
     """Batched forward with per-sample dropout attention masks.
 
@@ -537,7 +661,17 @@ def dropout_late_forward(
     late_mask = late_mask.repeat(nb_dropout_samples, 1, 1).unsqueeze(1)
 
     # Randomly select which steps to keep per sample
-    is_step_selected = (np.random.random((nb_dropout_samples, len(steps))) <= threshold)
+    if use_jacknife:
+        # Jackknife: mask exactly floor(k/2) steps, chosen uniformly without replacement
+        k = len(steps)
+        nb_mask = k // 2
+        is_step_selected = np.ones((nb_dropout_samples, k), dtype=bool)
+        for i in range(nb_dropout_samples):
+            masked_indices = np.random.choice(k, size=nb_mask, replace=False)
+            is_step_selected[i, masked_indices] = False
+    else:
+        # Coin-flip: each step independently kept with probability = threshold
+        is_step_selected = (np.random.random((nb_dropout_samples, len(steps))) <= threshold)
 
     # Walk backwards through steps, finding each one's token range and masking.
     # Positions in early_token_ids directly correspond to early cache columns.

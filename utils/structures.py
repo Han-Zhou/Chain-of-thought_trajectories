@@ -45,5 +45,6 @@ class AllConfidenceData:
     """All confidence data for a single question, for both non-dropout and dropout versions."""
     vanilla_confidences: ConfidenceScores
     dropout_confidences: ConfidenceScores
+    jacknife_confidences: ConfidenceScores | None = None
     debug_info: dict = field(default_factory=dict)
 

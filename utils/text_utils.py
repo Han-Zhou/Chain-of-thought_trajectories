@@ -31,7 +31,7 @@ def find_token_indices_from_end(tokenizer, token_ids, string):
     if start==0:
         tokens = [tokenizer.decode(t) for t in token_ids[-10:]]
         all_tokens = tokenizer.decode(token_ids)
-        breakpoint()
+        # breakpoint()
         raise ValueError(f"Cannot find '{string}' in '...{tokens}'")
     end = start+1
     while end<=len(token_ids):
@@ -43,7 +43,7 @@ def find_token_indices_from_end(tokenizer, token_ids, string):
     if end==len(token_ids)+1:
         tokens = [tokenizer.decode(t) for t in token_ids[-10:]]
         all_tokens = tokenizer.decode(token_ids)
-        breakpoint()
+        # breakpoint()
         raise ValueError(f"Cannot find '{string}' in '...{tokens}'")
     return start, end
 
