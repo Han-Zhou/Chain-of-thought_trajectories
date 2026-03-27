@@ -1,6 +1,7 @@
 import re
 import json
 import logging
+import math
 import time
 import numpy as np
 import torch
@@ -66,8 +67,9 @@ def compute_all_confidence_scores(
 
     if experimental_jacknife:
         k = len(parsed_output.cot_steps) - 1  # first step is always kept
+        nb_keep = math.ceil(math.log(k)) if k >= 1 else 0
         debug_info["jacknife_k"] = k
-        debug_info["jacknife_nb_mask"] = k // 2
+        debug_info["jacknife_nb_mask"] = k - nb_keep
 
     # Compute base tokenization (no suffix) once, shared by all methods
     base_content = (assistant_prefill + generated_text).strip()
@@ -662,9 +664,10 @@ def dropout_late_forward(
 
     # Randomly select which steps to keep per sample
     if use_jacknife:
-        # Jackknife: mask exactly floor(k/2) steps, chosen uniformly without replacement
+        # Jackknife: keep ceil(log(k/2)) steps, mask the rest
         k = len(steps)
-        nb_mask = k // 2
+        nb_keep = math.ceil(math.log(k)) if k >= 1 else 0
+        nb_mask = k - nb_keep
         is_step_selected = np.ones((nb_dropout_samples, k), dtype=bool)
         for i in range(nb_dropout_samples):
             masked_indices = np.random.choice(k, size=nb_mask, replace=False)

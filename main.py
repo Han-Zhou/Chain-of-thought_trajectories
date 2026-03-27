@@ -75,6 +75,14 @@ def parse():
         help="Number of samples to process from the dataset. Defaults to all."
     )
     args.add_argument(
+        "--sample_range",
+        type=int,
+        nargs=2,
+        metavar=("START", "END"),
+        default=None,
+        help="Slice [start, end) of the dataset to process. Mutually exclusive with --sample_size."
+    )
+    args.add_argument(
         "--shot_mode",
         type=str,
         default="zero",
@@ -129,11 +137,14 @@ def parse():
         default=False,
         help=(
             "Use jackknife step masking instead of coin-flip dropout. "
-            "Masks exactly floor(k/2) of k CoT steps per sample (uniform random without replacement) "
+            "Keeps ceil(log(k)) of k CoT steps per sample (uniform random without replacement) "
             "rather than flipping an independent coin per step."
         ),
     )
-    return args.parse_args()
+    parsed = args.parse_args()
+    if parsed.sample_size is not None and parsed.sample_range is not None:
+        args.error("--sample_size and --sample_range are mutually exclusive.")
+    return parsed
 
 
 
@@ -305,14 +316,25 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
 
 
 def main(args):
+    t_start = time.time()
     dataset = load_dataset(args.dataset)
     logger.info(f"Loaded {len(dataset)} entries from '{args.dataset}'.")
     logger.info("Sample entry:")
     logger.info(json.dumps(dataset[0], indent=2, default=str))
 
     model_name = MODEL_DICT[args.model]
-    sample_size = len(dataset) if args.sample_size is None else min(args.sample_size, len(dataset))
+    if args.sample_range is not None:
+        start = max(args.sample_range[0], 0)
+        end = min(args.sample_range[1], len(dataset))
+        dataset = dataset[start:end]
+        sample_size = len(dataset)
+    else:
+        start = 0
+        sample_size = len(dataset) if args.sample_size is None else min(args.sample_size, len(dataset))
+        end = start + sample_size
     dataloader = make_dataloader(dataset, n=sample_size)
+
+    logger.info(f"generating {args.dataset} [{start}:{end}]")
 
     trajectories, errors = generate_trajectories(
         model_name, dataloader, args.max_new_tokens,
@@ -327,10 +349,10 @@ def main(args):
     )
 
 
-    out_dir = f"trajectories/{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{sample_size}_type{args.type}_{'conf' if args.confidence else 'vanilla'}"
+    out_dir = f"trajectories/{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{start}_{end}_type{args.type}_{'conf' if args.confidence else 'vanilla'}"
     os.makedirs(out_dir, exist_ok=True)
 
-    out_file = os.path.join(out_dir, f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_trajectories_{sample_size}.json")
+    out_file = os.path.join(out_dir, f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_trajectories_{start}_{end}.json")
     all_debug_info = []
     with open(out_file, "w") as f:
         for i, traj in enumerate(trajectories):
@@ -362,6 +384,9 @@ def main(args):
         with open(errors_file, "w") as f:
             json.dump(errors, f, indent=2)
         logger.warning(f"{len(errors)} errors encountered. Saved to {errors_file}")
+
+    total_time = time.time() - t_start
+    logger.info(f"Total time: {total_time:.2f}s ({total_time/60:.1f}m)")
 
 
 if __name__ == "__main__":
