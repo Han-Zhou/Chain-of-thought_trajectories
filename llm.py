@@ -60,18 +60,12 @@ logger = logging.getLogger(__name__)
 
 def _resolve_attn_implementation(model_name: str) -> str:
     """Return 'flash_attention_2' if model + hardware support it, else 'sdpa'."""
-    # if not torch.cuda.is_available():
-    #     logger.info("CUDA not available, falling back to sdpa")
-    #     return "sdpa"
+    if not torch.cuda.is_available():
+        logger.info("CUDA not available, falling back to sdpa")
+        return "sdpa"
 
-    # config = AutoConfig.from_pretrained(model_name)
-    # model_class = AutoModelForCausalLM._model_mapping[type(config)]
-    # # if not getattr(model_class, "_supports_flash_attn_2", False):
-    # #     logger.info(f"{model_class.__name__} does not support flash_attention_2, falling back to sdpa")
-# #     return "sdpa"
-
-    # logger.info("Using flash_attention_2")
-    # return "flash_attention_2"
+    if "qwen" in model_name.lower():
+        return "flash_attention_2"
     return "sdpa"
 
 
@@ -83,169 +77,16 @@ class LLM():
 
         self._generation_attn_impl = _resolve_attn_implementation(model_name)
 
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
+        logger.info(f"Using attention implementation: {self._generation_attn_impl}")
 
-        # quantization_config = FineGrainedFP8Config(
-        #     modules_to_not_convert=["linear_attn"],
-        # )
-
-        # quantization_config = FineGrainedFP8Config(
-        #     modules_to_not_convert=["gdn"],
-        #     weight_block_size=(128, 128) # Crucial for H100 hardware acceleration
-        # )
-
-        # self.model = AutoModelForCausalLM.from_pretrained(
-        #     model_name,
-        #     device_map="auto",
-        #     torch_dtype=torch.bfloat16,
-        #     attn_implementation="sdpa",
-        # )
-
-
-        # self.model = AutoModelForCausalLM.from_pretrained(
-        #     model_name,
-        #     device_map="auto",
-        #     torch_dtype=torch.bfloat16,
-        #     attn_implementation="sdpa",
-        # )
-
-        # m = self.model
-        # att = dir(m)
-
-
-        # breakpoint()
-
-        # root_config = AutoConfig.from_pretrained(model_name)
-        # raw_quant = getattr(root_config, "quantization_config", None)
-        # # # rescued_quant_config = GPTQConfig(**raw_quant) if raw_quant else None
-
-        # rescued_quant_config = FineGrainedFP8Config(**raw_quant) if raw_quant else None
-
-
-        # 2. Force the quantization config back into the model loader
-        # self.model = Qwen3_5ForCausalLM.from_pretrained(
-        #     model_name,
-        #     # device_map="auto",
-        #     device_map={"": 0},
-        #     # torch_dtype=torch.bfloat16,
-        #     attn_implementation="sdpa",
-        #     # quantization_config=rescued_quant_config,
-        #     # quantization_config=bnb_config,
-        # )
-
-
-        self.model = Qwen3_5ForConditionalGeneration.from_pretrained(
+        self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            # device_map="auto",
-            device_map={"": 0},
-            # torch_dtype=torch.bfloat16,
-            attn_implementation="sdpa",
-            # quantization_config=rescued_quant_config,
-            # quantization_config=bnb_config,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+            attn_implementation=self._generation_attn_impl,
         )
-
-
-
-
-
-
-
-        # m = self.model
-        att = dir(self.model)
-
-
-        # 1. Extract the text configuration
-        text_config = self.model.config.text_config
-
-        # 2. Create an empty text-only skeleton on the "meta" device.
-        # The "meta" device creates the structure without actually allocating RAM/VRAM for weights.
-        with torch.device("meta"):
-            text_model = Qwen3_5ForCausalLM._from_config(text_config)
-
-        # 3. Graft the actual quantized modules from your multimodal model onto the skeleton
-        text_model.model = self.model.model.language_model
-        text_model.lm_head = self.model.lm_head
-
-        # 4. Copy over the configuration files
-        text_model.config = text_config
-        text_model.generation_config = self.model.generation_config
-
-        # (Optional) Ensure the new model points to the correct device
-        # text_model.device = self.model.device
-        
-
-        self.model = text_model
-
-        # # Check if scale tensors survived the graft
-        # for name, param in self.model.named_parameters():
-        #     if "scale" in name:
-        #         logger.info(f"Found scale: {name} {param.shape}")
-        #         break
-        # else:
-        #     logger.warning("No scale tensors found — FP8 descaling is broken")
-
-        # for name, module in self.model.named_modules():
-        #     if "q_proj" in name:
-        #         logger.info(f"{name}: {module.__class__.__name__}")
-        #         # Should print "FP8Linear" or "Float8Linear", NOT "Linear"
-        #         print(f"weight dtype: {module.weight.dtype}") 
-        #         break
-
-        # logger.info(f"Device capability: {torch.cuda.get_device_capability()}")  # needs (9, 0) or higher = H100
-
-        # breakpoint()
-
-
-
-        # print(self.model.config.quantization_config)
-        # print(self.model.dtype)                    # should show torch.float16 or similar
-        # print(self.model.is_quantized)             # True if quantized
-        # print(self.model.config.quantization_config)  # the actual GPTQ params
-
-
-
-
-        # from bitsandbytes.nn import Linear4bit
-        # for name, module in self.model.named_modules():
-        #     if isinstance(module, Linear4bit):
-        #         print(f"{name}: weight dtype={module.weight.dtype}, quant_type={module.weight.quant_type}")
-        #         break
-        # breakpoint()
-
-
-
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-
-        for name, module in self.model.named_modules():
-            if "q_proj" in name and hasattr(module, 'weight'):
-                print(f"weight dtype: {module.weight.dtype}")       # should be float8_e4m3fn
-                if hasattr(module, 'weight_scale_inv'):
-                    print(f"scale shape:  {module.weight_scale_inv.shape}")  # should be [32, 32] for 4096x4096
-                # break
-
-        print("=================================")
-
-          # Check if layers are FP8Linear or plain Linear
-        for name, module in self.model.named_modules():
-            if "q_proj" in name:
-                print(f"type:  {module.__class__.__name__}")
-                print(f"weight dtype: {module.weight.dtype}")
-                if hasattr(module, 'weight_scale_inv'):
-                    print(f"scale shape:  {module.weight_scale_inv.shape}")
-                else:
-                    print("NO weight_scale — block dequant is NOT happening")
-                # break
-
-
-        # breakpoint()
-
 
         self.thinking = thinking
     
@@ -322,11 +163,11 @@ class LLM():
         inputs = self.tokenizer(prompt_text, return_tensors="pt").to(device)
         prompt_len: int = inputs["input_ids"].shape[1]
 
-        # Qwen3.5 has a custom DynamicCache implementation that is required for correct attention behavior.
-        if hasattr(self.model.config, "layer_types") and "linear_attention" in self.model.config.layer_types:
-            cache = Qwen3_5DynamicCache(config=self.model.config)
-        else:
-            cache = DynamicCache()
+        # # Qwen3.5 has a custom DynamicCache implementation that is required for correct attention behavior.
+        # if hasattr(self.model.config, "layer_types") and "linear_attention" in self.model.config.layer_types:
+        #     cache = Qwen3_5DynamicCache(config=self.model.config)
+        # else:
+        #     cache = DynamicCache()
 
         # cache = DynamicCache(config=self.model.config)
 
@@ -337,7 +178,7 @@ class LLM():
         with torch.inference_mode():
             outputs = self.model.generate(
                 **inputs,
-                past_key_values=cache,
+                # past_key_values=cache,
                 use_cache=True,
                 return_dict_in_generate=True,
                 max_new_tokens=max_new_tokens,
