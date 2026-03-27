@@ -4,49 +4,73 @@ from utils.structures import ParsedOutput
 
 
 
-# =============================================================================
-# Section 3 – Parsing (LogiQA)
-# =============================================================================
-
-# Matches: "Final Answer: B" / "final answer: (C)" / "Final Answer: [d]" etc.
-_FINAL_ANSWER_RE = re.compile(
-    r"final\s+answer\s*:?\s*[\(\[]?\s*([A-Da-d])\s*[\)\]]?",
-    re.IGNORECASE,
-)
-
 # Matches "Step 1:", "Step 2:", ... as step delimiters inside the CoT block.
 _STEP_MARKER_RE = re.compile(r"(Step\s+\d+\s*:)", re.IGNORECASE)
+
+
+def _extract_boxed_with_positions(text: str):
+    """Find the last \\boxed{...} in *text* and return (content, boxed_start, content_start, content_end).
+
+    Returns (None, None, None, None) if no valid \\boxed{} is found.
+    """
+    idx = text.rfind("\\boxed")
+    if idx < 0:
+        return None, None, None, None
+
+    # Walk forward to find the opening brace
+    i = idx + len("\\boxed")
+    while i < len(text) and text[i] == " ":
+        i += 1
+    if i >= len(text) or text[i] != "{":
+        return None, None, None, None
+
+    brace_start = i
+    num_open = 0
+    last_close = -1
+    while i < len(text):
+        if text[i] == "{":
+            num_open += 1
+        elif text[i] == "}":
+            num_open -= 1
+            if num_open == 0:
+                content = text[brace_start + 1 : i]
+                return content, idx, brace_start + 1, i
+            last_close = i
+        i += 1
+
+    # Braces never balanced — fall back to content up to the last '}' seen.
+    if last_close > brace_start:
+        content = text[brace_start + 1 : last_close]
+        return content, idx, brace_start + 1, last_close
+
+    return None, None, None, None
 
 
 def parse_output(generated_text: str) -> ParsedOutput:
     """Split a raw generation into structured CoT steps and the final answer.
 
     Strategy:
-      1. Find "Final Answer:" to split the text into a CoT block and an
-         answer segment.  Case- and punctuation-insensitive.
+      1. Find the last \\boxed{...} to split the text into a CoT block and an
+         answer.  Uses brace-matching to handle nested braces.
       2. Within the CoT block, split on "Step N:" markers to get individual
          steps.  If no markers are found, fall back to blank-line splitting,
          then single-line splitting.
-      3. Extract the letter (A-D) from the answer segment with a lenient regex
-         that handles parentheses, brackets, and lowercase letters.
+      3. Extract the content inside \\boxed{...} as the final answer.
     """
     text = generated_text.strip()
 
-    split_pos = text.lower().rfind("final answer:")
-    if split_pos != -1:
-        cot_block = text[:split_pos].strip()
-        answer_segment = text[split_pos:]
+    content, boxed_start, content_start, content_end = _extract_boxed_with_positions(text)
+
+    if content is not None:
+        cot_block = text[:boxed_start].strip()
+        final_answer = content
+        answer_fullstring_start = boxed_start
+        answer_start = content_start
     else:
         cot_block = text
-        answer_segment = ""
-
-    final_answer = ""
-    answer_start = None
-    if answer_segment:
-        m = _FINAL_ANSWER_RE.search(answer_segment)
-        if m:
-            final_answer = m.group(1).upper()
-            answer_start = split_pos + m.start(1)
+        final_answer = ""
+        answer_fullstring_start = None
+        answer_start = None
 
     parts = _STEP_MARKER_RE.split(cot_block)
 
@@ -68,6 +92,6 @@ def parse_output(generated_text: str) -> ParsedOutput:
         cot_steps=steps,
         final_answer=final_answer,
         raw_cot_block=cot_block,
-        answer_fullstring_start=split_pos if split_pos != -1 else None,
+        answer_fullstring_start=answer_fullstring_start,
         answer_start=answer_start,
     )

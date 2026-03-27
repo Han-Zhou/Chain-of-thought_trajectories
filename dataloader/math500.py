@@ -10,6 +10,8 @@ class Math500DataLoader(BaseBenchmarkDataset):
         ds = self._hf("HuggingFaceH4/MATH-500", "test")
         entries = []
         for i, row in enumerate(ds):
+            if i < 2:
+                continue
             entries.append(self._entry(
                 id_=str(row.get("unique_id", i)),
                 question=row["problem"],

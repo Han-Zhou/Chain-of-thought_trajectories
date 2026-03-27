@@ -11,15 +11,6 @@ echo "Starting run ..."
 #     --max_new_tokens 7000 \
 #     --type 1
 
-# python3 main.py \
-#     --dataset logiqa \
-#     --model qwen \
-#     --sample_size 1 \
-#     --shot_mode few \
-#     --thinking \
-#     --max_new_tokens 20000 \
-#     --type 2
-
 python3 main.py \
     --dataset logiqa \
     --model qwen \
@@ -27,11 +18,20 @@ python3 main.py \
     --shot_mode few \
     --thinking \
     --max_new_tokens 20000 \
-    --confidence \
-    --debug \
-    --type 2 \
-    --debug_conf
+    --type 2
 
+# python3 main.py \
+#     --dataset logiqa \
+#     --model qwen \
+#     --sample_size 1 \
+#     --shot_mode few \
+#     --thinking \
+#     --max_new_tokens 20000 \
+#     --confidence \
+#     --type 2 \
+#     --debug \
+#     --debug_conf
 
+    # --debug \
 
 

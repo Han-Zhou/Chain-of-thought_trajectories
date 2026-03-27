@@ -22,19 +22,22 @@ class ParsedOutput:
     """Structured view of a single model generation."""
     cot_steps: list           # individual reasoning steps as strings
     final_answer: str         # MCQ or other strings
-    raw_cot_block: str        # the full CoT text before the Final Answer line
-    answer_fullstring_start: int | None  # char offset in generated_text where "final answer" begins (None if not found)
-    answer_start: int | None # Immediate beginning of the answer after "final answer: "
+    raw_cot_block: str        # the full CoT text before the \boxed{} answer
+    answer_fullstring_start: int | None  # char offset in generated_text where "\boxed{" begins (None if not found)
+    answer_start: int | None # char offset of the first character inside \boxed{...} braces
 
 
 @dataclass
 class ConfidenceScores:
     """All confidence scores computed for a single generation."""
-    answer_probabilities: list[float]
-    answer_entropy: list[float]
-    indirect_ptrue1_probabilities: list[float]
-    indirect_ptrue2_probabilities: list[float]
+    answer_probabilities: list[dict[str, float]]
+    answer_entropy: list[dict[str, float]]
+    indirect_ptrue1_probabilities: list[dict[str, float]]
+    indirect_ptrue2_probabilities: list[dict[str, float]]
     verbconf_probabilities: list[float]
+    verbconf_distribution: list[float] | None = None   # softmaxed probs for scores 0-100 (length 101)
+    verbconf_top_score: int | None = None               # score with highest probability
+    verbconf_top_prob: float | None = None              # probability of that score
 
 
 @dataclass
@@ -42,5 +45,6 @@ class AllConfidenceData:
     """All confidence data for a single question, for both non-dropout and dropout versions."""
     vanilla_confidences: ConfidenceScores
     dropout_confidences: ConfidenceScores
+    jacknife_confidences: ConfidenceScores | None = None
     debug_info: dict = field(default_factory=dict)
 

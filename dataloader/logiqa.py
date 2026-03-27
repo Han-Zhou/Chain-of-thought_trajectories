@@ -4,13 +4,15 @@ Parsing logic adapted from the HuggingFace dataset script by lucasmccabe/logiqa.
 Source: https://github.com/lgw863/LogiQA-dataset
 """
 
+import os
 import re
-import tempfile
 import urllib.request
 
 import datasets as hf_datasets
 
 from dataloader.base import BaseBenchmarkDataset
+
+_CACHE_DIR = "/storage/backup/han/cot/logiqa"
 
 
 _URLS = {
@@ -84,9 +86,17 @@ class LogiQADataLoader(BaseBenchmarkDataset):
 
     def _load_all(self) -> list[dict]:
         url = _URLS[self.split]
-        with tempfile.NamedTemporaryFile(mode="wb", suffix=".txt", delete=False) as tmp:
-            tmp_path = tmp.name
-        urllib.request.urlretrieve(url, tmp_path)
+        filename = os.path.basename(url)  # e.g. "Test.txt"
+        cached_path = os.path.join(_CACHE_DIR, filename)
+
+        if os.path.exists(cached_path):
+            print(f"[logiqa] Loading from local cache: {cached_path}")
+            tmp_path = cached_path
+        else:
+            print(f"[logiqa] Downloading {url} -> {cached_path}")
+            os.makedirs(_CACHE_DIR, exist_ok=True)
+            urllib.request.urlretrieve(url, cached_path)
+            tmp_path = cached_path
 
         rows = [ex for _, ex in _generate_examples(tmp_path)]
         
