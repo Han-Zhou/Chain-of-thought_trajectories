@@ -23,6 +23,8 @@ import time
 import pickle
 
 import torch
+from tqdm.contrib.discord import tqdm as tqdm_discord
+from tqdm import tqdm
 from dotenv import load_dotenv
 from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
 # from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
@@ -37,12 +39,12 @@ from parsing import parse_output
 # from utils.confidence_prev import compute_confidence_metrics
 from confidence import compute_all_confidence_scores
 from llm import LLM
+from eval.registry import evaluate_one
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-#
 
 
 
@@ -120,6 +122,12 @@ def parse():
         help="Whether or not to evaluate confidence on the COTs."
     )
     args.add_argument(
+        "--discord",
+        action="store_true",
+        default=False,
+        help="Send tqdm progress to Discord via TQDM_DISCORD_TOKEN and TQDM_DISCORD_CHANNEL_ID env vars."
+    )
+    args.add_argument(
         "--debug",
         action="store_true",
         default=False,
@@ -150,7 +158,7 @@ def parse():
 
 
 
-def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jacknife=False):
+def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jacknife=False, discord=False):
 
     debug_dir = "debug_cache"
 
@@ -170,10 +178,10 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
         os.makedirs(debug_dir, exist_ok=True)
         entries_to_save = []
 
-    trajectories = []
     errors = []
 
-    for i, entry in enumerate(dataloader):
+    progress = tqdm_discord if discord else tqdm
+    for i, entry in enumerate(progress(dataloader, desc="Generating", unit="sample")):
         logger.info(f"Generating {i}/{len(dataloader)}")
         t0 = time.time()
 
@@ -261,7 +269,15 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
             #   - confidence_score — the computed confidence value for the answer tokens using the specified metric, or None
             #   - past_key_values — the KV cache from generation (a DynamicCache object). This gets popped out and saved as a separate .pt file at write time
             #   (main.py:298) so you can resume/branch generation later without recomputing the prompt
-            trajectories.append({
+            # HLE correctness is determined later via an async LLM judge, not inline.
+            if dataset_name == "hle":
+                eval_result = None
+                correct = None
+            else:
+                eval_result = evaluate_one({"generated_text": full_generated_text, "ground_truth": entry["answer"]}, dataset_name)
+                correct = eval_result["score"] > 0 if eval_result else None
+
+            traj = {
                 "id":                           entry["id"],
                 "question":                     entry["question"],
                 "ground_truth":                 entry["answer"],
@@ -272,13 +288,16 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
                 "prompt_end_position":           gen.prompt_end_position,
                 "generated_end_position":       gen.generated_end_position,
                 "answer_token_start_position":  answer_token_start_position,
-                # "confidence_metric": confidence if confidence else None,
                 "confidence_score": confidence_score,
                 "confidence_method": "coin_flip+jacknife" if experimental_jacknife else "coin_flip",
-                "debug_info": debug_info,
+                "debug_info":                   debug_info if debug_conf else None,
                 "runtime_seconds":              time.time() - t0,
-                "past_key_values":              None,
-            })
+                "correct":                      correct,
+            }
+
+            traj_file = os.path.join(out_dir, f"traj_{i}.json")
+            with open(traj_file, "w") as f:
+                json.dump({"index": i, "question": entry["question"], "trajectory": traj}, f, indent=2)
 
         except Exception as e:
             logger.error(f"Error processing entry {i} (id={entry['id']}): {e}", exc_info=True)
@@ -287,7 +306,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
                 torch.cuda.empty_cache()
                 logger.warning("Cleared CUDA cache after OOM error")
             errors.append({"index": i, "id": entry["id"], "error": str(e)})
-            trajectories.append({
+            traj = {
                 "id":                           entry["id"],
                 "question":                     entry["question"],
                 "ground_truth":                 entry["answer"],
@@ -301,10 +320,12 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
                 "answer_token_start_position":  None,
                 "confidence_score":             None,
                 "confidence_method":           None,
-                "debug_info":                   None,
                 "runtime_seconds":              time.time() - t0,
-                "past_key_values":              None,
-            })
+                "correct":                      None,
+            }
+            traj_file = os.path.join(out_dir, f"traj_{i}.json")
+            with open(traj_file, "w") as f:
+                json.dump({"index": i, "question": entry["question"], "trajectory": traj}, f, indent=2)
 
     if not debug:
         cache_file = os.path.join(debug_dir, f"gen_parsed_type{prompt_type}.pkl")
@@ -312,7 +333,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, dataset_name=N
         with open(cache_file, "wb") as f:
             pickle.dump(entries_to_save, f)
 
-    return trajectories, errors
+    return errors
 
 
 def main(args):
@@ -336,8 +357,12 @@ def main(args):
 
     logger.info(f"generating {args.dataset} [{start}:{end}]")
 
-    trajectories, errors = generate_trajectories(
+    out_dir = f"trajectories/{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{start}_{end}_type{args.type}_{'conf' if args.confidence else 'vanilla'}_{'jacknife' if args.experimental_jacknife else 'coinflip'}_0331"
+    os.makedirs(out_dir, exist_ok=True)
+
+    errors = generate_trajectories(
         model_name, dataloader, args.max_new_tokens,
+        out_dir=out_dir,
         dataset_name=args.dataset,
         shot_mode=args.shot_mode,
         thinking=args.thinking,
@@ -346,38 +371,8 @@ def main(args):
         prompt_type=args.type,
         debug_conf=args.debug_conf,
         experimental_jacknife=args.experimental_jacknife,
+        discord=args.discord,
     )
-
-
-    out_dir = f"trajectories/{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{start}_{end}_type{args.type}_{'conf' if args.confidence else 'vanilla'}"
-    os.makedirs(out_dir, exist_ok=True)
-
-    out_file = os.path.join(out_dir, f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_trajectories_{start}_{end}.json")
-    all_debug_info = []
-    with open(out_file, "w") as f:
-        for i, traj in enumerate(trajectories):
-            # cache = traj.pop("past_key_values")
-            debug_info = traj.pop("debug_info", None)
-            if debug_info is not None:
-                all_debug_info.append({"index": i, "id": traj["id"], **debug_info})
-            # torch.save(cache, os.path.join(out_dir, f"cache_{i}.pt"))
-
-            traj["prompt_end_position"] = traj.pop("prompt_end_position")
-            traj["generated_end_position"] = traj.pop("generated_end_position")
-
-            entry = {
-                "index": i,
-                "question": traj["question"],
-                "trajectory": traj,
-            }
-            json.dump(entry, f, indent=2)
-            f.write("\n")
-
-    if all_debug_info:
-        debug_file = os.path.join(out_dir, "debug_conf.json")
-        with open(debug_file, "w") as f:
-            json.dump(all_debug_info, f, indent=2)
-        logger.info(f"Saved confidence debug info to {debug_file}")
 
     if errors:
         errors_file = os.path.join(out_dir, "errors.json")

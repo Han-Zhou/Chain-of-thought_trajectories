@@ -499,10 +499,22 @@ def _f1_score(prediction, ground_truth):
     return f1
 
 
+_BOOLEAN_ANSWERS = {"yes", "no", "noanswer"}
+
+
 def qa_f1_score(prediction: str, ground_truth: str) -> float:
-    """Token-level F1 between prediction and ground truth after normalization."""
+    """Token-level F1 between prediction and ground truth after normalization.
+
+    Matches the official HotPotQA evaluation: if either side normalizes to a
+    boolean token (yes / no / noanswer), require an exact match — no partial
+    credit.
+    """
     normalized_prediction = _normalize_qa_answer(prediction)
     normalized_ground_truth = _normalize_qa_answer(ground_truth)
+
+    if normalized_prediction in _BOOLEAN_ANSWERS or normalized_ground_truth in _BOOLEAN_ANSWERS:
+        return float(normalized_prediction == normalized_ground_truth)
+
     prediction_tokens = normalized_prediction.split()
     ground_truth_tokens = normalized_ground_truth.split()
     return _f1_score(prediction_tokens, ground_truth_tokens)

@@ -13,6 +13,9 @@ from eval.comparators import (
     math_equal,
     qa_f1_score,
 )
+from eval.bfcl_eval import evaluate_bfcl
+from eval.codeqa_eval import evaluate_codeqa
+from eval.hle_eval import evaluate_hle
 
 
 # (extractor_fn, comparator_fn, metric_name)
@@ -26,7 +29,7 @@ EVAL_REGISTRY = {
     "olympiadbench":    (extract_boxed_or_text, math_equal,            "accuracy"),
 }
 
-UNSUPPORTED = {"bfcl", "codeqa", "cs1qa", "hle"}
+UNSUPPORTED = {"cs1qa"}
 
 
 def evaluate_one(trajectory: dict, dataset_name: str) -> dict | None:
@@ -45,6 +48,18 @@ def evaluate_one(trajectory: dict, dataset_name: str) -> dict | None:
     if dataset_name in UNSUPPORTED:
         warnings.warn(f"Dataset '{dataset_name}' is not supported for evaluation. Skipping.")
         return None
+
+    # BFCL uses its own structured evaluation pipeline
+    if dataset_name == "bfcl":
+        return evaluate_bfcl(trajectory)
+
+    # CodeQA uses its own multi-metric evaluation pipeline
+    if dataset_name == "codeqa":
+        return evaluate_codeqa(trajectory)
+
+    # HLE uses an LLM-as-judge evaluation pipeline
+    if dataset_name == "hle":
+        return evaluate_hle(trajectory)
 
     if dataset_name not in EVAL_REGISTRY:
         warnings.warn(f"Dataset '{dataset_name}' not found in evaluation registry. Skipping.")

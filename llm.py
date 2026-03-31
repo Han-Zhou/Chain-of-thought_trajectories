@@ -65,7 +65,7 @@ def _resolve_attn_implementation(model_name: str) -> str:
         return "sdpa"
 
     if "qwen" in model_name.lower():
-        return "flash_attention_2"
+        return "sdpa"
     return "sdpa"
 
 

@@ -62,11 +62,11 @@ def extract_mcq_letter(generated_text: str) -> str | None:
     if content is None:
         return None
     content = content.strip()
-    # Single letter A-D
-    if len(content) == 1 and content.upper() in "ABCD":
+    # Single letter A-F
+    if len(content) == 1 and content.upper() in "ABCDEF":
         return content.upper()
     # Handle cases like \boxed{(A)} or \boxed{[B]}
-    m = re.match(r"[\(\[]?\s*([A-Da-d])\s*[\)\]]?$", content)
+    m = re.match(r"[\(\[]?\s*([A-Fa-f])\s*[\)\]]?$", content)
     if m:
         return m.group(1).upper()
     return None

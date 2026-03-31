@@ -4,15 +4,26 @@ Usage:
     python evaluate_trajectories.py --trajectory_dir trajectories/qwen_thinking_logiqa_few_1_type1_vanilla
     python evaluate_trajectories.py --trajectory_file <path.json> --dataset logiqa
     python evaluate_trajectories.py --trajectory_dir <dir> --output results.json
+
+For HLE, additional flags are available:
+    python evaluate_trajectories.py --trajectory_dir <hle_dir> --judge-model o3-mini-2025-01-31 --num_workers 100
 """
 
 import argparse
+import asyncio
+import glob as glob_mod
 import json
 import os
-import sys
 import statistics
+import sys
 
 from eval.registry import evaluate_one, EVAL_REGISTRY, UNSUPPORTED
+from eval.hle_eval import (
+    evaluate_hle_batch_async,
+    compute_hle_metrics,
+    load_hle_total_questions,
+    DEFAULT_JUDGE_MODEL,
+)
 
 
 def read_trajectories(file_path: str) -> list[dict]:
@@ -33,6 +44,18 @@ def read_trajectories(file_path: str) -> list[dict]:
         idx = end
 
     return trajectories
+
+
+def read_trajectory_dir(dir_path: str) -> list[dict]:
+    """Read individual traj_N.json files from a directory, sorted by index."""
+    entries = []
+    for fpath in sorted(
+        glob_mod.glob(os.path.join(dir_path, "traj_*.json")),
+        key=lambda p: int(os.path.basename(p).replace("traj_", "").replace(".json", "")),
+    ):
+        with open(fpath, "r") as f:
+            entries.append(json.load(f))
+    return entries
 
 
 def detect_dataset(dir_name: str) -> str | None:
@@ -104,6 +127,50 @@ def evaluate_file(file_path: str, dataset_name: str) -> dict:
     return output
 
 
+def evaluate_hle_dir(
+    dir_path: str,
+    *,
+    judge_model: str = DEFAULT_JUDGE_MODEL,
+    num_workers: int = 100,
+) -> dict:
+    """Run HLE batch evaluation on a directory of traj_N.json files.
+
+    Uses the LLM-as-judge pipeline: reads trajectories, runs async judge
+    calls, then computes aggregate metrics using total HLE dataset size as
+    the denominator (matching upstream partial-run semantics).
+    """
+    entries = read_trajectory_dir(dir_path)
+    if not entries:
+        return {"dataset": "hle", "error": "No trajectory files found"}
+
+    trajectories = []
+    for entry in entries:
+        traj = entry.get("trajectory", entry)
+        traj["_index"] = entry.get("index")
+        trajectories.append(traj)
+
+    print(f"Running HLE judge on {len(trajectories)} trajectories (model={judge_model}, workers={num_workers})...")
+
+    results = asyncio.run(
+        evaluate_hle_batch_async(trajectories, judge_model=judge_model, num_workers=num_workers)
+    )
+
+    # Attach index/id back onto results
+    for traj, result in zip(trajectories, results):
+        result["index"] = traj.get("_index")
+        result["id"] = traj.get("id")
+
+    total_questions = load_hle_total_questions()
+    metrics = compute_hle_metrics(results, total_questions)
+
+    output = {
+        "dataset": "hle",
+        **metrics,
+        "results": results,
+    }
+    return output
+
+
 def print_summary(result: dict):
     """Print a summary of evaluation results to stdout."""
     if "error" in result:
@@ -147,6 +214,37 @@ def print_summary(result: dict):
         print(f"  [{idx}] pred={pred!r:30s} gt={gt!r:30s}  {flag}")
 
 
+def print_hle_summary(result: dict):
+    """Print HLE-specific evaluation summary with judge metrics."""
+    if "error" in result:
+        print(f"Error: {result['error']}")
+        return
+
+    print(f"\n{'=' * 60}")
+    print(f"Dataset:             {result['dataset']}")
+    print(f"Metric:              {result['metric']}")
+    print(f"Total HLE questions: {result['total_questions']}")
+    print(f"Evaluated:           {result['evaluated_count']}")
+    print(f"Judge successes:     {result['judge_successes']}")
+    print(f"Judge failures:      {result['judge_failures']}")
+    print(f"Extraction failures: {result['extraction_failures']}")
+    print(f"Accuracy:            {result['accuracy']}% +/- {result['confidence_interval_95']}%")
+    print(f"Calibration Error:   {result['calibration_error']}")
+    print(f"{'=' * 60}")
+    print(f"Note: Accuracy denominator = total HLE dataset size ({result['total_questions']}), not evaluated count.")
+
+    # Per-entry detail
+    for r in result.get("results", []):
+        idx = r.get("index", "?")
+        pred = r["prediction"]
+        gt = r["ground_truth"]
+        score = r["score"]
+        jr = r.get("judge_response") or {}
+        flag = "FAIL" if r["extraction_failed"] else ("OK" if score == 1.0 else "WRONG")
+        conf = jr.get("confidence", "?")
+        print(f"  [{idx}] pred={pred!r:30s} gt={gt!r:30s} conf={conf}  {flag}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate CoT trajectory files")
     group = parser.add_mutually_exclusive_group(required=True)
@@ -154,14 +252,15 @@ def main():
     group.add_argument("--trajectory_dir", type=str, help="Path to trajectory directory")
     parser.add_argument("--dataset", type=str, help="Dataset name (auto-detected if using --trajectory_dir)")
     parser.add_argument("--output", type=str, help="Path to write JSON results")
+    # HLE-specific arguments
+    parser.add_argument("--judge_model", type=str, default=DEFAULT_JUDGE_MODEL,
+                        help=f"Judge model for HLE evaluation (default: {DEFAULT_JUDGE_MODEL})")
+    parser.add_argument("--num_workers", type=int, default=100,
+                        help="Async concurrency limit for HLE judge calls (default: 100)")
     args = parser.parse_args()
 
     # Resolve file and dataset
     if args.trajectory_dir:
-        file_path = find_trajectory_file(args.trajectory_dir)
-        if file_path is None:
-            print(f"Error: No trajectory JSON file found in {args.trajectory_dir}", file=sys.stderr)
-            sys.exit(1)
         dataset_name = args.dataset or detect_dataset(args.trajectory_dir)
         if dataset_name is None:
             print("Error: Could not auto-detect dataset name. Use --dataset.", file=sys.stderr)
@@ -182,10 +281,39 @@ def main():
         print(f"Unsupported datasets: {', '.join(sorted(UNSUPPORTED))}")
         sys.exit(0)
 
+    # --- HLE-specific batch evaluation path ---
+    if dataset_name == "hle":
+        if not args.trajectory_dir:
+            print("Error: --trajectory_dir is required for HLE evaluation (reads individual traj_N.json files).", file=sys.stderr)
+            sys.exit(1)
+        print(f"Evaluating HLE: {args.trajectory_dir}")
+        print(f"Judge model:    {args.judge_model}")
+        result = evaluate_hle_dir(
+            args.trajectory_dir,
+            judge_model=args.judge_model,
+            num_workers=args.num_workers,
+        )
+        print_hle_summary(result)
+        if output_path:
+            with open(output_path, "w") as f:
+                json.dump(result, f, indent=2, default=str)
+            print(f"\nDetailed results written to: {output_path}")
+        return
+
+    # --- Generic evaluation path ---
     if dataset_name not in EVAL_REGISTRY:
         print(f"Error: Unknown dataset '{dataset_name}'.", file=sys.stderr)
         print(f"Supported: {', '.join(sorted(EVAL_REGISTRY.keys()))}", file=sys.stderr)
         sys.exit(1)
+
+    # For non-HLE, find or use the trajectory file
+    if args.trajectory_dir:
+        file_path = find_trajectory_file(args.trajectory_dir)
+        if file_path is None:
+            print(f"Error: No trajectory JSON file found in {args.trajectory_dir}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        file_path = args.trajectory_file
 
     print(f"Evaluating: {file_path}")
     print(f"Dataset:    {dataset_name}")
