@@ -61,15 +61,15 @@ def compute_all_confidence_scores(
     assistant_prefill: str = "",
     debug_conf: bool = False,
     gen_cache=None,
-    experimental_jacknife: bool = False,
+    experimental_jackknife: bool = False,
 ) -> AllConfidenceData:
     debug_info = {}
 
-    if experimental_jacknife:
+    if experimental_jackknife:
         k = len(parsed_output.cot_steps) - 1  # first step is always kept
-        nb_keep = math.ceil(math.log(k)) if k >= 1 else 0
-        debug_info["jacknife_k"] = k
-        debug_info["jacknife_nb_mask"] = k - nb_keep
+        nb_keep = math.ceil(math.sqrt(k)) if k >= 1 else 0
+        debug_info["jackknife_k"] = k
+        debug_info["jackknife_nb_mask"] = k - nb_keep
 
     # Compute base tokenization (no suffix) once, shared by all methods
     base_content = (assistant_prefill + generated_text).strip()
@@ -80,20 +80,20 @@ def compute_all_confidence_scores(
     if gen_cache is not None:
         full_text = (assistant_prefill + generated_text).strip()
         fullstring_text = full_text[parsed_output.answer_fullstring_start:]
-        fs_start, _ = find_token_indices_from_end(llm.tokenizer, base_tokens[0], fullstring_text)
+        fs_start, _ = find_token_indices_from_end(llm.tokenizer, base_tokens[0], fullstring_text, llm.model_name)
         early_late_split = fs_start - 1
         precomputed_early_cache = copy.deepcopy(gen_cache)
         crop_cache(precomputed_early_cache, early_late_split)
 
     # --- Coin-flip dropout (always computed) ---
-    vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg = \
+    vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks = \
         dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                              gen_cache=gen_cache, base_tokens=base_tokens,
                              precomputed_early_cache=precomputed_early_cache)
     if dbg:
         debug_info["answer_logits"] = dbg
 
-    vanilla_ptrue1, vanilla_ptrue2, dropout_ptrue1, dropout_ptrue2, dbg = \
+    vanilla_ptrue1, vanilla_ptrue2, dropout_ptrue1, dropout_ptrue2, dbg, _ = \
         dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                                gen_cache=gen_cache, base_tokens=base_tokens,
                                precomputed_early_cache=precomputed_early_cache)
@@ -103,43 +103,44 @@ def compute_all_confidence_scores(
     (vanilla_verbconf, dropout_verbconf,
      v_verbconf_dist, v_verbconf_top_score, v_verbconf_top_prob,
      d_verbconf_dist, d_verbconf_top_scores, d_verbconf_top_probs,
-     dbg) = \
+     dbg, _) = \
         dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                            gen_cache=gen_cache, base_tokens=base_tokens,
                            precomputed_early_cache=precomputed_early_cache,
-                           consume_early_cache=not experimental_jacknife)
+                           consume_early_cache=not experimental_jackknife)
     if dbg:
         debug_info["verbconf"] = dbg
 
     # --- Jackknife dropout (only when flag is set) ---
-    jacknife_scores = None
-    if experimental_jacknife:
-        _, _, jk_answer_probs, jk_answer_entropy, dbg = \
+    jackknife_scores = None
+    jk_step_masks = None
+    if experimental_jackknife:
+        _, _, jk_answer_probs, jk_answer_entropy, dbg, jk_step_masks = \
             dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
-                                 gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=True,
+                                 gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
                                  precomputed_early_cache=precomputed_early_cache)
         if dbg:
-            debug_info["jacknife_answer_logits"] = dbg
+            debug_info["jackknife_answer_logits"] = dbg
 
-        _, _, jk_ptrue1, jk_ptrue2, dbg = \
+        _, _, jk_ptrue1, jk_ptrue2, dbg, _ = \
             dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
-                                   gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=True,
+                                   gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
                                    precomputed_early_cache=precomputed_early_cache)
         if dbg:
-            debug_info["jacknife_indirect_logits"] = dbg
+            debug_info["jackknife_indirect_logits"] = dbg
 
         (_, jk_verbconf,
          _, _, _,
          jk_verbconf_dist, jk_verbconf_top_scores, jk_verbconf_top_probs,
-         dbg) = \
+         dbg, _) = \
             dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
-                               gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=True,
+                               gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
                                precomputed_early_cache=precomputed_early_cache,
                                consume_early_cache=True)
         if dbg:
-            debug_info["jacknife_verbconf"] = dbg
+            debug_info["jackknife_verbconf"] = dbg
 
-        jacknife_scores = ConfidenceScores(
+        jackknife_scores = ConfidenceScores(
             answer_probabilities=jk_answer_probs,
             answer_entropy=jk_answer_entropy,
             indirect_ptrue1_probabilities=jk_ptrue1,
@@ -148,6 +149,7 @@ def compute_all_confidence_scores(
             verbconf_distribution=jk_verbconf_dist,
             verbconf_top_score=jk_verbconf_top_scores,
             verbconf_top_prob=jk_verbconf_top_probs,
+            step_masks=jk_step_masks,
         )
 
     return AllConfidenceData(
@@ -170,19 +172,20 @@ def compute_all_confidence_scores(
             verbconf_distribution=d_verbconf_dist,
             verbconf_top_score=d_verbconf_top_scores,
             verbconf_top_prob=d_verbconf_top_probs,
+            step_masks=dropout_step_masks,
         ),
-        jacknife_confidences=jacknife_scores,
+        jackknife_confidences=jackknife_scores,
         debug_info=debug_info,
     )
 
 
-def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jacknife=False, precomputed_early_cache=None, consume_early_cache=False):
+def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False):
     """Logit-based confidence on the answer tokens themselves."""
-    late_tokens, vanilla_out, dropout_out, ans_start, ans_end = \
+    late_tokens, vanilla_out, dropout_out, ans_start, ans_end, dropout_step_masks = \
         dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text="", nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
-                        gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=use_jacknife,
+                        gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
                         precomputed_early_cache=precomputed_early_cache,
                         consume_early_cache=consume_early_cache)
 
@@ -220,10 +223,10 @@ def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropou
     # --- Debug ---
     dbg = _debug_answer_logit_tokens(llm, late_tokens, ans_start, ans_end, v_probs, vanilla_answer_probs) if debug_conf else None
 
-    return vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg
+    return vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks
 
 
-def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jacknife=False, precomputed_early_cache=None, consume_early_cache=False):
+def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False):
     """P(True) and P(Yes) probing after the answer."""
     positive_true_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' True'])
     negative_false_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' False'])
@@ -231,21 +234,21 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
     negative_no_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' No'])
 
     # ptrue1: "True/False:"
-    _, vanilla1, dropout1, _, _ = \
+    _, vanilla1, dropout1, _, _, dropout_step_masks = \
         dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text="\nTrue/False:",
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
-                        gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=use_jacknife,
+                        gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
                         precomputed_early_cache=precomputed_early_cache)
 
     # ptrue2: "Is the answer <X> correct?"
-    _, vanilla2, dropout2, _, _ = \
+    _, vanilla2, dropout2, _, _, _ = \
         dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text=f"\nIs the answer {parsed_output.final_answer} correct?",
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
-                        gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=use_jacknife,
+                        gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
                         precomputed_early_cache=precomputed_early_cache,
                         consume_early_cache=consume_early_cache)
 
@@ -287,7 +290,7 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
     else:
         dbg = None
 
-    return [vanilla_ptrue1], [vanilla_ptrue2], dropout_ptrue1, dropout_ptrue2, dbg
+    return [vanilla_ptrue1], [vanilla_ptrue2], dropout_ptrue1, dropout_ptrue2, dbg, dropout_step_masks
 
 
 def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
@@ -358,7 +361,7 @@ def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
     return joint_logprobs.softmax(-1)
 
 
-def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jacknife=False, precomputed_early_cache=None, consume_early_cache=False):
+def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False):
     """Verbalized confidence (0-100 score)."""
     suffix = (
         "\nPlease respond with a score from 0 to 100 in <confidence> </confidence> tags."
@@ -366,12 +369,12 @@ def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_
         "\n<confidence>"
     )
 
-    _, vanilla_out, dropout_out, _, _ = \
+    _, vanilla_out, dropout_out, _, _, dropout_step_masks = \
         dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text=suffix,
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
-                        gen_cache=gen_cache, base_tokens=base_tokens, use_jacknife=use_jacknife,
+                        gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
                         precomputed_early_cache=precomputed_early_cache,
                         consume_early_cache=consume_early_cache)
 
@@ -411,7 +414,34 @@ def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_
         vanilla_distribution, vanilla_top_score, vanilla_top_prob,
         dropout_distribution, dropout_top_scores, dropout_top_probs,
         dbg,
+        dropout_step_masks,
     )
+
+
+def _extract_thinking_and_content(content: str, model_name: str) -> tuple[str, str]:
+    """Extract thinking and content from GPT model responses with channel tags.
+
+    For GPT models, responses contain channel-tag structure:
+    <|channel|>analysis<|message|>...thinking...<|end|><|start|>assistant<|channel|>final<|message|>...answer...<|return|>
+
+    Returns (thinking, content) tuple. If no channel tags found, returns ("", content).
+    """
+    if "gpt" not in model_name.lower() or "<|channel|>" not in content:
+        return "", content
+
+    # Extract thinking: between <|channel|>analysis<|message|> and <|end|>
+    thinking_match = re.search(r"<\|channel\|>analysis<\|message\|>(.*?)<\|end\|>", content, re.DOTALL)
+    thinking = thinking_match.group(1).strip() if thinking_match else ""
+
+    # Extract final content: between <|channel|>final<|message|> and <|return|>
+    content_match = re.search(r"<\|channel\|>final<\|message\|>(.*?)<\|return\|>", content, re.DOTALL)
+    final_content = content_match.group(1).strip() if content_match else ""
+
+    # If we couldn't extract, fall back to original content
+    if not final_content:
+        return "", content
+
+    return thinking, final_content
 
 
 def _tokenize_for_confidence(llm, messages, full_assistant_content):
@@ -423,10 +453,23 @@ def _tokenize_for_confidence(llm, messages, full_assistant_content):
     _t0 = time.perf_counter()
     conf_messages = copy.deepcopy(messages)
     logger.info("deepcopy(messages) in _tokenize_for_confidence took %.4fs", time.perf_counter() - _t0)
+
+    # Extract thinking and content for GPT models with channel tags
+    thinking, content = _extract_thinking_and_content(full_assistant_content, llm.model_name)
+
     if conf_messages[-1]["role"] == "assistant":
-        conf_messages[-1]["content"] = full_assistant_content
+        if thinking:
+            conf_messages[-1]["thinking"] = thinking
+            conf_messages[-1]["content"] = content
+        else:
+            conf_messages[-1]["content"] = full_assistant_content
     else:
-        conf_messages.append({"role": "assistant", "content": full_assistant_content})
+        msg = {"role": "assistant", "content": content if thinking else full_assistant_content}
+        if thinking:
+            msg["thinking"] = thinking
+        conf_messages.append(msg)
+
+    # breakpoint()
 
     prompt_text = llm.tokenizer.apply_chat_template(
         conf_messages,
@@ -435,9 +478,13 @@ def _tokenize_for_confidence(llm, messages, full_assistant_content):
         continue_final_message=True,
     )
 
+    # breakpoint()
+
     # Apply same post-processing as generate_one()
     if "qwen" in llm.model_name.lower():
         prompt_text = re.sub(r"<think>\s*</think>\s*", "", prompt_text)
+
+    # breakpoint()
 
     tokens = llm.tokenizer(prompt_text, return_tensors="pt")["input_ids"]
     return tokens
@@ -455,7 +502,7 @@ def dropout_forward(
     assistant_prefill: str = "",
     gen_cache=None,
     base_tokens=None,
-    use_jacknife: bool = False,
+    use_jackknife: bool = False,
     precomputed_early_cache=None,
     consume_early_cache: bool = False,
 ):
@@ -486,7 +533,7 @@ def dropout_forward(
     # -- Locate answer region ---------------------------------------------------
     full_text = (assistant_prefill + generated_text).strip()
     fullstring_text = full_text[parsed_output.answer_fullstring_start:]
-    fs_start, _ = find_token_indices_from_end(llm.tokenizer, tokens[0], fullstring_text)
+    fs_start, _ = find_token_indices_from_end(llm.tokenizer, tokens[0], fullstring_text, llm.model_name)
 
     early_late_split = fs_start - 1
 
@@ -494,7 +541,7 @@ def dropout_forward(
     late_tokens = tokens[:, early_late_split:].to(device)
 
     answer_start_late, answer_end_late = find_token_indices_from_end(
-        llm.tokenizer, late_tokens[0], parsed_output.final_answer)
+        llm.tokenizer, late_tokens[0], parsed_output.final_answer, llm.model_name)
 
     if use_fullstring:
         modify_start_late = 1
@@ -606,6 +653,7 @@ def dropout_forward(
 
     # -- Dropout forward --------------------------------------------------------
     dropout_output = None
+    dropout_step_masks = None
     if will_run_dropout:
         if _owns_early_cache:
             logger.info("consuming early_cache directly for dropout_late_forward")
@@ -614,7 +662,7 @@ def dropout_forward(
             _t0 = time.perf_counter()
             _dropout_cache = copy.deepcopy(early_cache)
             logger.info("deepcopy(early_cache) for dropout_late_forward took %.4fs", time.perf_counter() - _t0)
-        dropout_output = dropout_late_forward(
+        dropout_output, dropout_step_masks = dropout_late_forward(
             llm,
             parsed_output.cot_steps,
             early_tokens[0],
@@ -625,10 +673,10 @@ def dropout_forward(
             nb_early_tokens,
             nb_dropout_samples,
             threshold,
-            use_jacknife=use_jacknife,
+            use_jackknife=use_jackknife,
         )
 
-    return late_tokens, vanilla_output, dropout_output, answer_start_late, answer_end_late
+    return late_tokens, vanilla_output, dropout_output, answer_start_late, answer_end_late, dropout_step_masks
 
 
 def dropout_late_forward(
@@ -642,7 +690,7 @@ def dropout_late_forward(
     nb_early_tokens,
     nb_dropout_samples,
     threshold,
-    use_jacknife=False,
+    use_jackknife=False,
 ):
     """Batched forward with per-sample dropout attention masks.
 
@@ -663,7 +711,7 @@ def dropout_late_forward(
     late_mask = late_mask.repeat(nb_dropout_samples, 1, 1).unsqueeze(1)
 
     # Randomly select which steps to keep per sample
-    if use_jacknife:
+    if use_jackknife:
         # Jackknife: keep ceil(log(k/2)) steps, mask the rest
         k = len(steps)
         nb_keep = math.ceil(math.log(k)) if k >= 1 else 0
@@ -682,7 +730,7 @@ def dropout_late_forward(
     for step_id, step in reversed(list(enumerate(steps))):
         try:
             step_start, step_end = find_token_indices_from_end(
-                llm.tokenizer, remaining_ids, step)
+                llm.tokenizer, remaining_ids, step, llm.model_name)
         except ValueError:
             break
 
@@ -707,7 +755,10 @@ def dropout_late_forward(
         )
         late_output['input_ids'] = late_tokens_batch
 
-    return late_output
+    # Convert is_step_selected to binary masks (1 = kept, 0 = masked)
+    step_masks = (1 - is_step_selected.astype(int)).tolist()
+
+    return late_output, step_masks
 
 
 # ---------------------------------------------------------------------------
