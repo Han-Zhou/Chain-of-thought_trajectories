@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 def _jackknife_nb_keep(k: int) -> int:
     """Number of optional CoT steps to keep under jackknife dropout."""
-    return math.ceil(math.log(k)) if k >= 1 else 0
+    return math.ceil(math.sqrt(k)) if k >= 1 else 0
 
 
 def crop_cache(cache, max_length):
@@ -68,24 +68,42 @@ def compute_all_confidence_scores(
     gen_cache=None,
     experimental_jackknife: bool = False,
 ) -> AllConfidenceData:
+
+
+    # breakpoint()
+
     debug_info = {}
-
-
     if experimental_jackknife:
         k = len(parsed_output.cot_steps) - 1  # first step is always kept
         nb_keep = _jackknife_nb_keep(k)
         debug_info["jackknife_k"] = k
         debug_info["jackknife_nb_mask"] = k - nb_keep
 
+    # Truncate generated_text to only include CoT steps (before the answer sentence)
+    full_text = (assistant_prefill + generated_text).strip()
+    if parsed_output.answer_sentence_start is not None:
+        # Truncate at the answer sentence boundary (excludes transition text like "Therefore...")
+        cot_end_offset = parsed_output.answer_sentence_start - len(assistant_prefill)
+        if cot_end_offset > 0:
+            cot_only_text = generated_text[:cot_end_offset].strip()
+        else:
+            # Answer is in the prefill, use empty string
+            cot_only_text = ""
+    else:
+        # No answer found, use full text
+        cot_only_text = generated_text
+
+    logger.info("compute_all_confidence_scores: truncated generated_text from %d to %d chars",
+                len(generated_text), len(cot_only_text))
+
+    # breakpoint()
+
     # Compute base tokenization (no suffix) once, shared by all methods
-    base_content = (assistant_prefill + generated_text).strip()
+    base_content = (assistant_prefill + cot_only_text).strip()
     base_tokens = _tokenize_for_confidence(llm, messages, base_content)
 
-    # Pre-compute early_cache once — avoids redundant forward passes / deepcopy+crop
-    full_text = (assistant_prefill + generated_text).strip()
-    fullstring_text = full_text[parsed_output.answer_fullstring_start:]
-    fs_start, _ = find_token_indices_from_end(llm.tokenizer, base_tokens[0], fullstring_text, llm.model_name)
-    early_late_split = fs_start - 1
+    # Early/late split is now simply at the end of base_tokens (CoT only)
+    early_late_split = base_tokens.shape[1]
 
     if gen_cache is not None:
         precomputed_early_cache = copy.deepcopy(gen_cache)
@@ -101,14 +119,14 @@ def compute_all_confidence_scores(
 
     # --- Coin-flip dropout (always computed) ---
     vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks = \
-        dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+        dropout_answerlogits(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                              gen_cache=gen_cache, base_tokens=base_tokens,
                              precomputed_early_cache=precomputed_early_cache)
     if dbg:
         debug_info["answer_logits"] = dbg
 
     vanilla_ptrue1, vanilla_ptrue2, dropout_ptrue1, dropout_ptrue2, dbg, _ = \
-        dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+        dropout_indirectlogits(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                                gen_cache=gen_cache, base_tokens=base_tokens,
                                precomputed_early_cache=precomputed_early_cache)
     if dbg:
@@ -118,7 +136,7 @@ def compute_all_confidence_scores(
      v_verbconf_dist, v_verbconf_top_score, v_verbconf_top_prob,
      d_verbconf_dist, d_verbconf_top_scores, d_verbconf_top_probs,
      dbg, _) = \
-        dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+        dropout_verbalconf(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                            gen_cache=gen_cache, base_tokens=base_tokens,
                            precomputed_early_cache=precomputed_early_cache,
                            consume_early_cache=not experimental_jackknife)
@@ -130,14 +148,14 @@ def compute_all_confidence_scores(
     jk_step_masks = None
     if experimental_jackknife:
         _, _, jk_answer_probs, jk_answer_entropy, dbg, jk_step_masks = \
-            dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+            dropout_answerlogits(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                                  gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
                                  precomputed_early_cache=precomputed_early_cache)
         if dbg:
             debug_info["jackknife_answer_logits"] = dbg
 
         _, _, jk_ptrue1, jk_ptrue2, dbg, _ = \
-            dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+            dropout_indirectlogits(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                                    gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
                                    precomputed_early_cache=precomputed_early_cache)
         if dbg:
@@ -147,7 +165,7 @@ def compute_all_confidence_scores(
          _, _, _,
          jk_verbconf_dist, jk_verbconf_top_scores, jk_verbconf_top_probs,
          dbg, _) = \
-            dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+            dropout_verbalconf(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                                gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
                                precomputed_early_cache=precomputed_early_cache,
                                consume_early_cache=True)
@@ -195,9 +213,12 @@ def compute_all_confidence_scores(
 
 def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False):
     """Logit-based confidence on the answer tokens themselves."""
+    suffix_text = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
+    logger.info("dropout_answerlogits: generated_text='%s', suffix='%s'", generated_text[:100], suffix_text)
+
     late_tokens, vanilla_out, dropout_out, ans_start, ans_end, dropout_step_masks = \
         dropout_forward(llm, messages, generated_text, parsed_output,
-                        suffix_text="", nb_dropout_samples=nb_dropout_samples,
+                        suffix_text=suffix_text, nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
                         gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
                         precomputed_early_cache=precomputed_early_cache,
@@ -242,24 +263,30 @@ def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropou
 
 def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False):
     """P(True) and P(Yes) probing after the answer."""
+    logger.info("dropout_indirectlogits: generated_text='%s'", generated_text[:100])
+
     positive_true_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' True'])
     negative_false_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' False'])
     positive_yes_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' Yes'])
     negative_no_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' No'])
 
     # ptrue1: "True/False:"
+    ptrue1_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}.\nTrue/False:"
+    logger.info("dropout_indirectlogits ptrue1: suffix='%s'", ptrue1_suffix)
     _, vanilla1, dropout1, _, _, dropout_step_masks = \
         dropout_forward(llm, messages, generated_text, parsed_output,
-                        suffix_text="\nTrue/False:",
+                        suffix_text=ptrue1_suffix,
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
                         gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
                         precomputed_early_cache=precomputed_early_cache)
 
-    # ptrue2: "Is the answer <X> correct?"
+    # ptrue2: "Is the answer \boxed{<X>}?"
+    ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"
+    logger.info("dropout_indirectlogits ptrue2: suffix='%s'", ptrue2_suffix)
     _, vanilla2, dropout2, _, _, _ = \
         dropout_forward(llm, messages, generated_text, parsed_output,
-                        suffix_text=f"\nIs the answer {parsed_output.final_answer} correct?",
+                        suffix_text=ptrue2_suffix,
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
                         gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
@@ -378,10 +405,12 @@ def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
 def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False):
     """Verbalized confidence (0-100 score)."""
     suffix = (
+        f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
         "\nPlease respond with a score from 0 to 100 in <confidence> </confidence> tags."
         "\nHow confident are you in your previous answer?"
         "\n<confidence>"
     )
+    logger.info("dropout_verbalconf: generated_text='%s', suffix='%s'", generated_text[:100], suffix)
 
     _, vanilla_out, dropout_out, _, _, dropout_step_masks = \
         dropout_forward(llm, messages, generated_text, parsed_output,
@@ -541,25 +570,36 @@ def dropout_forward(
     if suffix_text:
         full_content = (assistant_prefill + generated_text + suffix_text).strip()
         tokens = _tokenize_for_confidence(llm, messages, full_content)
+        logger.info("dropout_forward: full_content (with suffix) = '%s'", full_content)
     else:
         tokens = base_tokens
+        full_content = (assistant_prefill + generated_text).strip()
+        logger.info("dropout_forward: full_content (no suffix) = '%s'", full_content)
 
     # -- Locate answer region ---------------------------------------------------
-    full_text = (assistant_prefill + generated_text).strip()
-    fullstring_text = full_text[parsed_output.answer_fullstring_start:]
-    fs_start, _ = find_token_indices_from_end(llm.tokenizer, tokens[0], fullstring_text, llm.model_name)
-
-    early_late_split = fs_start - 1
+    # Since generated_text now ends before \boxed{}, the split is at the end of base_tokens
+    early_late_split = base_tokens.shape[1]
 
     early_tokens = tokens[:, :early_late_split].to(device)
     late_tokens = tokens[:, early_late_split:].to(device)
 
+    # Find \boxed{answer} in late tokens first, then find answer within that region
+    boxed_string = f"\\boxed{{{parsed_output.final_answer}}}"
+    boxed_start, boxed_end = find_token_indices_from_end(
+        llm.tokenizer, late_tokens[0], boxed_string, llm.model_name)
+
+    # Then find the answer within the boxed region
     answer_start_late, answer_end_late = find_token_indices_from_end(
-        llm.tokenizer, late_tokens[0], parsed_output.final_answer, llm.model_name)
+        llm.tokenizer, late_tokens[0, boxed_start:boxed_end],
+        parsed_output.final_answer, llm.model_name)
+
+    # Adjust offsets to be relative to late_tokens
+    answer_start_late += boxed_start
+    answer_end_late += boxed_start
 
     if use_fullstring:
-        modify_start_late = 1
-        modify_end_late = len(late_tokens[0])
+        modify_start_late = boxed_start
+        modify_end_late = boxed_end
     else:
         modify_start_late = answer_start_late
         modify_end_late = answer_end_late

@@ -280,7 +280,7 @@ Defined in `utils/structures.py:31-42`:
 | `verbconf_distribution` | `list[float] \| None` | Full 0-100 distribution (length 101) |
 | `verbconf_top_score` | `int \| None` | Most likely confidence score (0-100) |
 | `verbconf_top_prob` | `float \| None` | Probability of top score |
-| `step_masks` | `list[list[int]] \| None` | Binary list per sample indicating masked steps |
+| `step_masks` | `list[list[int]] \| None` | Binary list per sample where `1 = kept`, `0 = masked` |
 
 ### AllConfidenceData
 
@@ -308,7 +308,7 @@ class AllConfidenceData:
   "dropout_confidences": {
     "answer_probabilities": [[...], [...], ...],  # 10 samples
     "verbconf_probabilities": [0.71, 0.79, 0.68, ...],  # 10 samples
-    "step_masks": [[1, 0, 1, 0], [0, 1, 1, 0], ...]  # which steps kept per sample
+    "step_masks": [[1, 0, 1, 0], [0, 1, 1, 0], ...]  # 1 = kept, 0 = masked
   },
   "debug_info": {
     "answer_logits": {...},
@@ -438,7 +438,7 @@ confidence_data = compute_all_confidence_scores(
 vanilla_verbconf = confidence_data.vanilla_confidences.verbconf_probabilities  # [0.82]
 dropout_verbconfs = confidence_data.dropout_confidences.verbconf_probabilities  # [0.71, 0.79, ...]
 vanilla_ptrue = confidence_data.vanilla_confidences.indirect_ptrue1_probabilities  # [{"True": 0.87, ...}]
-step_masks = confidence_data.dropout_confidences.step_masks  # [[1, 0, 1], [0, 1, 0], ...]
+step_masks = confidence_data.dropout_confidences.step_masks  # [[1, 0, 1], [0, 1, 0], ...] where 1 = kept
 ```
 
 ---

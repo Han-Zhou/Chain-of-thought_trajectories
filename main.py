@@ -140,7 +140,7 @@ def parse():
         help="Save detailed confidence debug info to debug_conf.json in the output directory."
     )
     args.add_argument(
-        "--experimental_jacknife",
+        "--experimental_jackknife",
         action="store_true",
         default=False,
         help=(
@@ -148,6 +148,18 @@ def parse():
             "Keeps ceil(log(k)) of k CoT steps per sample (uniform random without replacement) "
             "rather than flipping an independent coin per step."
         ),
+    )
+    args.add_argument(
+        "--nb_dropout_samples",
+        type=int,
+        default=3,
+        help="Number of dropout samples for confidence scoring."
+    )
+    args.add_argument(
+        "--tag",
+        type=str,
+        default=None,
+        help="Optional prefix for the output directory name."
     )
     parsed = args.parse_args()
     if parsed.sample_size is not None and parsed.sample_range is not None:
@@ -158,7 +170,7 @@ def parse():
 
 
 
-def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jacknife=False, discord=False):
+def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=False, discord=False, nb_dropout_samples=3):
 
     debug_dir = "debug_cache"
 
@@ -226,20 +238,20 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                 answer_token_start_position = None
 
             if confidence and parsed.final_answer:
-                llm.set_attn_implementation("sdpa")
+                llm.switch_attn_implementation("confidence")
                 confidence_score: AllConfidenceData = compute_all_confidence_scores(
                     llm,
                     messages,
                     gen.generated_text,
                     parsed,
-                    nb_dropout_samples=3,
+                    nb_dropout_samples=nb_dropout_samples,
                     use_fullstring=False,   # whether to apply dropout to the entire "\boxed{...}" string or just the answer tokens
                     assistant_prefill=assistant_prefill,
                     debug_conf=debug_conf,
                     gen_cache=gen.past_key_values,
-                    experimental_jacknife=experimental_jacknife,
+                    experimental_jackknife=experimental_jackknife,
                 )
-                llm.set_attn_implementation(llm._generation_attn_impl)
+                llm.switch_attn_implementation("cot")
                 debug_info = confidence_score.debug_info if debug_conf else None
                 confidence_score = asdict(confidence_score)
                 confidence_score.pop("debug_info", None)
@@ -289,7 +301,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                 "generated_end_position":       gen.generated_end_position,
                 "answer_token_start_position":  answer_token_start_position,
                 "confidence_score": confidence_score,
-                "confidence_method": "coin_flip+jacknife" if experimental_jacknife else "coin_flip",
+                "confidence_method": "coin_flip+jackknife" if experimental_jackknife else "coin_flip",
                 "debug_info":                   debug_info if debug_conf else None,
                 "runtime_seconds":              time.time() - t0,
                 "correct":                      correct,
@@ -357,7 +369,10 @@ def main(args):
 
     logger.info(f"generating {args.dataset} [{start}:{end}]")
 
-    out_dir = f"trajectories/{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{start}_{end}_type{args.type}_{'conf' if args.confidence else 'vanilla'}_{'jacknife' if args.experimental_jacknife else 'coinflip'}_0331"
+    dir_name = f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{start}_{end}_type{args.type}_{'conf' if args.confidence else 'vanilla'}_{'jackknife' if args.experimental_jackknife else 'coinflip'}_0331"
+    if args.tag:
+        dir_name = f"{args.tag}_{dir_name}"
+    out_dir = f"trajectories/{dir_name}"
     os.makedirs(out_dir, exist_ok=True)
 
     errors = generate_trajectories(
@@ -370,8 +385,9 @@ def main(args):
         debug=args.debug,
         prompt_type=args.type,
         debug_conf=args.debug_conf,
-        experimental_jacknife=args.experimental_jacknife,
+        experimental_jackknife=args.experimental_jackknife,
         discord=args.discord,
+        nb_dropout_samples=args.nb_dropout_samples,
     )
 
     if errors:
