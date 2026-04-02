@@ -28,6 +28,55 @@ def load_few_shot_prompt_from_registry(dataset: str) -> dict[str, str]:
     return FEW_SHOT_PROMPT_REGISTRY[key]
 
 
+def _resolve_thinking_tokens(model_name: str, thinking: bool) -> tuple[str, str]:
+    thinking_token_open, thinking_token_close = THINKING_TOKENS["none"]
+    if thinking:
+        try:
+            thinking_token_open, thinking_token_close = THINKING_TOKENS[model_name]
+        except KeyError:
+            raise ValueError(f'"{model_name}" does not support thinking yet')
+    return thinking_token_open, thinking_token_close
+
+
+def _materialize_few_shot_messages(
+    dataset: str,
+    model_name: str,
+    thinking: bool,
+    prompt_type: int,
+) -> list[dict[str, str]]:
+    few_shot_messages_raw = load_few_shot_prompt_from_registry(dataset)
+    thinking_token_open, thinking_token_close = _resolve_thinking_tokens(model_name, thinking)
+    use_thinking_field = thinking and "gpt" in model_name.lower()
+
+    few_shot_messages = []
+    for message in few_shot_messages_raw:
+        if message["role"] == "assistant":
+            if prompt_type == 2:
+                content = (message["content"]
+                    .replace("{thinking_token_open}", "")
+                    .replace("{thinking_token_close}", ""))
+            else:
+                content = (message["content"]
+                    .replace("{thinking_token_open}", thinking_token_open)
+                    .replace("{thinking_token_close}", thinking_token_close))
+            if use_thinking_field:
+                sep = "\\boxed{"
+                idx = content.find(sep)
+                if idx != -1:
+                    few_shot_messages.append({
+                        "role": "assistant",
+                        "thinking": content[:idx].strip(),
+                        "content": content[idx:].strip(),
+                    })
+                else:
+                    few_shot_messages.append({"role": "assistant", "content": content})
+            else:
+                few_shot_messages.append({"role": "assistant", "content": content})
+        else:
+            few_shot_messages.append(message)
+
+    return few_shot_messages
+
 
 
 def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, thinking: bool, prompt_type: int = 1) -> list[dict[str, str]]:
@@ -42,12 +91,7 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
             f"Options:\n{choices_text}"
         )
 
-        thinking_token_open, thinking_token_close = THINKING_TOKENS["none"]
-        if thinking:
-            try:
-                thinking_token_open, thinking_token_close = THINKING_TOKENS[model_name]
-            except KeyError:
-                raise ValueError(f'"{model_name}" does not support thinking yet')
+        thinking_token_open, _ = _resolve_thinking_tokens(model_name, thinking)
 
         if prompt_type == 1:
             # Type 1: assistant prefill with thinking tokens + "Step 1:"
@@ -70,43 +114,38 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
             ]
 
         if few_shot:
-            few_shot_messages_raw = load_few_shot_prompt_from_registry(dataset)
-
-            use_thinking_field = thinking and "gpt" in model_name.lower()
-
-            few_shot_messages = []
-            for message in few_shot_messages_raw:
-                if message["role"] == "assistant":
-                    if prompt_type == 2:
-                        # Type 2: steps outside thinking blocks — strip thinking tokens
-                        content = message["content"].format(
-                            thinking_token_open="",
-                            thinking_token_close="",
-                        )
-                    else:
-                        content = message["content"].format(
-                            thinking_token_open=thinking_token_open,
-                            thinking_token_close=thinking_token_close,
-                        )
-                    if use_thinking_field:
-                        sep = "\nFinal Answer:"
-                        idx = content.find(sep)
-                        if idx != -1:
-                            few_shot_messages.append({
-                                "role": "assistant",
-                                "thinking": content[:idx].strip(),
-                                "content": content[idx + 1:].strip(),
-                            })
-                        else:
-                            few_shot_messages.append({"role": "assistant", "content": content})
-                    else:
-                        few_shot_messages.append({"role": "assistant", "content": content})
-                else:
-                    few_shot_messages.append(message)
-
+            few_shot_messages = _materialize_few_shot_messages(dataset, model_name, thinking, prompt_type)
             messages = messages[0:1] + few_shot_messages + messages[1:]
 
-            # breakpoint()
+        return messages
+
+    elif dataset == "hle":
+        system_prompt, user_template, assistant_start = load_prompt_from_registry(dataset)
+
+        user_prompt = user_template.format(question=entry["question"])
+        if entry.get("choices"):
+            choices_text = "\n".join(entry["choices"])
+            user_prompt += f"\n\nAnswer Choices:\n{choices_text}"
+
+        thinking_token_open, _ = _resolve_thinking_tokens(model_name, thinking)
+
+        if prompt_type == 1:
+            assistant_start = assistant_start.format(thinking_token_open=thinking_token_open)
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+                {"role": "assistant", "content": assistant_start},
+            ]
+        else:
+            user_prompt += "\n\nLet's think step-by-step."
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+
+        if few_shot:
+            few_shot_messages = _materialize_few_shot_messages(dataset, model_name, thinking, prompt_type)
+            messages = messages[0:1] + few_shot_messages + messages[1:]
 
         return messages
 

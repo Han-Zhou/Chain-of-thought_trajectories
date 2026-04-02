@@ -14,8 +14,8 @@ SYSTEM = (
     "For every problem you receive, think carefully and reason step-by-step "
     "before giving your final answer. "
     "Label each reasoning step as 'Step 1:', 'Step 2:', etc. "
-    "After all steps, write your final answer on a new line starting with "
-    "'Final Answer:'."
+    "After all steps, write your final answer on a new line in "
+    "\\boxed{your answer} format. You must double-escape all LaTeX backslashes. For example, output \\boxed instead of \boxed."
     "Keep your reasoning concise, and be brief in each step."
 )
 
@@ -53,7 +53,7 @@ Step 3: Determine the correct argument values from the request.
 Step 4: Verify the chosen call satisfies all constraints in the function \
 schema.
 
-Final Answer: <function call(s) in the required format>
+\\boxed{function call(s) in the required format}
 """
 
 BFCL = """\
@@ -71,44 +71,28 @@ Here is a list of functions in json format that you can invoke.
 
 # --- BigBench Movie Recommendation -----------------------------------------
 BIGBENCH_MOVIE = """\
-You are a movie recommendation expert.
-
-Question:
 {question}
 
-Think carefully about the question and the options provided. Reason \
+Think carefully about the movies listed and the options provided. Reason \
 step-by-step before choosing the best answer.
 
-Step 1: Understand what the question is asking.
-Step 2: Analyze each candidate answer against the question criteria.
-Step 3: Eliminate implausible options with justification.
-Step 4: Select the best answer.
-
-Final Answer: <your answer>
+\\boxed{your answer}
 """
 
 # --- BigBench Causal Judgement ----------------------------------------------
 BIGBENCH_CAUSAL = """\
-You are an expert in causal reasoning.
-
-Question:
 {question}
 
 Reason through the causal relationships step-by-step before answering.
 
-Step 1: Identify the events or entities involved.
-Step 2: Determine the cause-and-effect relationships described.
-Step 3: Apply causal reasoning principles (counterfactual, mechanism, etc.).
-Step 4: Reach a conclusion based on your causal analysis.
-
-Final Answer: <Yes / No / your conclusion>
+\\boxed{Yes or No}
 """
 
 # --- LogiQA ----------------------------------------------------------------
 LOGIQIA = """\
 You are an expert in logical reasoning.
 
-Reason step-by-step through the logical relationships before selecting an answer. 'Final Answer:' must be followed by exactly one letter: A, B, C, or D.
+Reason step-by-step through the logical relationships before selecting an answer. Put your answer in \\boxed{} with exactly one letter: A, B, C, or D.
 """
 
 LOGIQIA_experimental_system = """\
@@ -123,14 +107,12 @@ Question:
 Options:
 {options}
 
-Reason step-by-step through the logical relationships before selecting an answer. 'Final Answer:' must be followed by exactly one letter: A, B, C, or D.
+Reason step-by-step through the logical relationships before selecting an answer. Put your answer in \\boxed{} with exactly one letter: A, B, C, or D.
 """
 
 # --- CodeQA ----------------------------------------------------------------
 # Extra fields: {code}  — the code snippet being asked about.
 CODEQA = """\
-You are an expert software engineer and code analyst.
-
 Code snippet:
 ```
 {code}
@@ -141,12 +123,7 @@ Question:
 
 Analyze the code step-by-step and answer the question accurately.
 
-Step 1: Understand the overall purpose of the code.
-Step 2: Trace through the relevant logic or data flow.
-Step 3: Identify any edge cases or important behavior related to the question.
-Step 4: Formulate a precise answer based on your analysis.
-
-Final Answer: <your answer>
+\\boxed{your answer}
 """
 
 # --- CS1QA -----------------------------------------------------------------
@@ -164,15 +141,13 @@ Step 2: Recall the relevant rules or definitions.
 Step 3: Apply those rules to the specific scenario in the question.
 Step 4: Arrive at the correct answer and explain it clearly.
 
-Final Answer: <your answer>
+\\boxed{your answer}
 """
 
 # --- HotPotQA --------------------------------------------------------------
 # Extra fields: {context}  — the supporting passages.
 HOTPOTQA = """\
-You are an expert at multi-hop question answering.
-
-Supporting passages:
+Context:
 {context}
 
 Question:
@@ -180,86 +155,45 @@ Question:
 
 Answer the question by reasoning across the passages step-by-step.
 
-Step 1: Identify the key entities and relationships in the question.
-Step 2: Locate relevant information in the supporting passages.
-Step 3: Connect information across passages to bridge reasoning hops.
-Step 4: Synthesize the evidence to form a precise answer.
-
-Final Answer: <your answer>
+\\boxed{your answer}
 """
 
 # --- College Math Test -----------------------------------------------------
 COLLEGE_MATH = """\
-You are an expert mathematician.
-
-Problem:
-{question}
+Question: {question}
 
 Solve the problem step-by-step, showing all work clearly.
 
-Step 1: Identify the mathematical domain and key concepts involved.
-Step 2: Write down any relevant formulas, theorems, or definitions.
-Step 3: Set up the solution approach.
-Step 4: Execute the computation or proof, showing each sub-step.
-Step 5: Verify the result (check edge cases, units, plausibility).
-
-Final Answer: <exact answer>
+\\boxed{exact answer}
 """
 
 # --- OlympiadBench ---------------------------------------------------------
 OLYMPIADBENCH = """\
-You are an expert at mathematical olympiad problems.
-
-Problem:
-{question}
+Question: {question}
 
 Approach the problem rigorously and creatively, step-by-step.
 
-Step 1: Carefully read and restate the problem in your own words.
-Step 2: Identify the key constraints and what needs to be proven or found.
-Step 3: Explore relevant strategies (e.g., invariants, constructions, \
-induction, algebra, combinatorics).
-Step 4: Develop and execute the chosen strategy in detail.
-Step 5: Verify the solution satisfies all given conditions.
-
-Final Answer: <exact answer or proof conclusion>
+\\boxed{exact answer or proof conclusion}
 """
 
 # --- Math500 ---------------------------------------------------------------
 MATH500 = """\
-You are an expert mathematician.
-
-Problem:
-{question}
+Question: {question}
 
 Solve step-by-step, showing all reasoning clearly.
 
-Step 1: Identify the problem type and relevant mathematical concepts.
-Step 2: Recall applicable formulas or theorems.
-Step 3: Set up the solution, defining variables and relationships.
-Step 4: Carry out the computation or derivation step-by-step.
-Step 5: State and verify the final answer.
-
-Final Answer: <exact answer in simplified form>
+\\boxed{exact answer in simplified form}
 """
 
 # --- HLE (Humanity's Last Exam) --------------------------------------------
 HLE = """\
-You are a world-class expert across all academic disciplines.
-
 Question:
 {question}
 
 This is a highly challenging question that may require deep, multi-domain \
 reasoning. Think carefully and systematically.
 
-Step 1: Determine the domain(s) relevant to this question.
-Step 2: Recall and state the key facts, principles, or theories involved.
-Step 3: Reason through the question carefully, considering all angles.
-Step 4: Evaluate potential answers critically.
-Step 5: Select or construct the most accurate and well-supported answer.
-
-Final Answer: <your answer>
+\\boxed{your answer}
 """
 
 # ---------------------------------------------------------------------------
