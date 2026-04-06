@@ -66,6 +66,8 @@ def _resolve_attn_implementation(model_name: str) -> str:
 
     if "qwen" in model_name.lower():
         return "sdpa"
+    if "gpt" in model_name.lower():
+        return "flash_attention_3"
     return "sdpa"
 
 
@@ -91,9 +93,23 @@ class LLM():
         self.thinking = thinking
     
 
-    def set_attn_implementation(self, impl: str):
-        """Switch attention implementation using transformers' built-in API."""
-        self.model.set_attn_implementation(impl)
+    def switch_attn_implementation(self, mode: str):
+        """Switch attention implementation using transformers' built-in API.
+            mode can be 'confidence' or 'cot'
+        """
+        if mode == "confidence":
+            if 'qwen' in self.model_name.lower():
+                self.model.set_attn_implementation("sdpa")
+            elif 'gpt' in self.model_name.lower():
+                self.model.set_attn_implementation("eager")
+            else:
+                self.model.set_attn_implementation("sdpa")
+        elif mode == "cot":
+            self.model.set_attn_implementation(self._generation_attn_impl)
+        else:
+            raise ValueError(f"Unknown mode {mode} for attention implementation switch.")
+
+
 
     def generate_one(
         self,
@@ -156,7 +172,7 @@ class LLM():
             if last_idx != -1:
                 prompt_text = prompt_text[:last_idx] + "<|channel|>analysis" + prompt_text[last_idx + len(target):]
 
-        # logger.info(prompt_text)
+        logger.info(prompt_text)
 
         # breakpoint()
             
