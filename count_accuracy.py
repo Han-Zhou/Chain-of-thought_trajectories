@@ -2,9 +2,14 @@ import os
 import json
 import sys
 
+# folders = [
+#     "trajectories/qwen_thinking_logiqa_few_0_300_type2_conf_0330_jackknife",
+#     "trajectories/qwen_thinking_logiqa_few_300_651_type2_conf_0330_jackknife",
+# ]
+
 folders = [
-    "trajectories/qwen_thinking_logiqa_few_0_300_type2_conf_0330_jacknife",
-    "trajectories/qwen_thinking_logiqa_few_300_651_type2_conf_0330_jacknife",
+    "trajectories/llama_regular_logiqa_zero_0_300_type2_conf_jackknife_0331",
+    "trajectories/llama_regular_logiqa_zero_300_651_type2_conf_jackknife_0331",
 ]
 
 def count_accuracies(folder_paths):
