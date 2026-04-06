@@ -56,12 +56,18 @@ def parse():
     args.add_argument(
         "--dataset",
         type=str,
-        required=True,
+        default=None,
         help=(
             "Dataset to process. One of: bfcl, bigbench_movie, "
             "bigbench_causal, logiqa, codeqa, cs1qa, hotpotqa, "
             "college_math, olympiadbench, math500, hle."
         )
+    )
+    args.add_argument(
+        "--pickle_path",
+        type=str,
+        default=None,
+        help="Path to a pickle file containing pre-generated entries. Mutually exclusive with --dataset."
     )
     args.add_argument(
         "--model",
@@ -164,6 +170,10 @@ def parse():
     parsed = args.parse_args()
     if parsed.sample_size is not None and parsed.sample_range is not None:
         args.error("--sample_size and --sample_range are mutually exclusive.")
+    if parsed.dataset is None and parsed.pickle_path is None:
+        args.error("--dataset is required when not using --pickle_path.")
+    if parsed.pickle_path is not None and parsed.dataset is None:
+        args.error("--dataset is required when using --pickle_path (needed for evaluation).")
     return parsed
 
 
@@ -348,10 +358,30 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
     return errors
 
 
+def load_pickle_data(pickle_path: str) -> list[dict]:
+    """Load pre-generated entries from a pickle file.
+
+    Ensures each entry has 'id', 'question', and 'answer' keys
+    so it can be consumed by generate_trajectories().
+    """
+    with open(pickle_path, "rb") as f:
+        data = pickle.load(f)
+    for i, entry in enumerate(data):
+        if "id" not in entry:
+            entry["id"] = str(i)
+    return data
+
+
 def main(args):
     t_start = time.time()
-    dataset = load_dataset(args.dataset)
-    logger.info(f"Loaded {len(dataset)} entries from '{args.dataset}'.")
+
+    if args.pickle_path:
+        dataset = load_pickle_data(args.pickle_path)
+        logger.info(f"Loaded {len(dataset)} entries from pickle '{args.pickle_path}'.")
+    else:
+        dataset = load_dataset(args.dataset)
+        logger.info(f"Loaded {len(dataset)} entries from '{args.dataset}'.")
+
     logger.info("Sample entry:")
     logger.info(json.dumps(dataset[0], indent=2, default=str))
 
@@ -369,7 +399,7 @@ def main(args):
 
     logger.info(f"generating {args.dataset} [{start}:{end}]")
 
-    dir_name = f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{start}_{end}_type{args.type}_{'conf' if args.confidence else 'vanilla'}_{'jackknife' if args.experimental_jackknife else 'coinflip'}_0331"
+    dir_name = f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{start}_{end}_type{args.type}_{'conf' if args.confidence else 'vanilla'}_{'jackknife' if args.experimental_jackknife else 'coinflip'}"
     if args.tag:
         dir_name = f"{args.tag}_{dir_name}"
     out_dir = f"trajectories/{dir_name}"
