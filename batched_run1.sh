@@ -7,16 +7,16 @@ echo "Starting batched run 1..."
 # few-shot, type 2
 python3 main.py \
     --dataset logiqa \
-    --model qwen \
-    --shot_mode few \
-    --thinking \
+    --model llama \
+    --shot_mode zero \
     --max_new_tokens 20000 \
     --type 2 \
     --debug_conf \
     --confidence \
     --sample_range 0 300 \
     --discord \
-    --experimental_jacknife
+    --nb_dropout_samples 10 \
+    --experimental_jackknife
 
 # # few-shot, no-thinking
 # python3 main.py \

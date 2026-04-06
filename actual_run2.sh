@@ -2,36 +2,16 @@
 
 echo "Starting run ..."
 
-# python3 main.py \
-#     --dataset logiqa \
-#     --model qwen \
-#     --sample_size 1 \
-#     --shot_mode few \
-#     --thinking \
-#     --max_new_tokens 7000 \
-#     --type 1
-
-# python3 main.py \
-#     --dataset logiqa \
-#     --model qwen-fp8 \
-#     --sample_size 1 \
-#     --shot_mode few \
-#     --thinking \
-#     --max_new_tokens 20000 \
-#     --type 2
-
-python3 main.py \
-    --dataset logiqa \
-    --model qwen-fp8 \
-    --sample_size 1 \
-    --shot_mode few \
-    --thinking \
-    --max_new_tokens 20000 \
+python3 main_debug.py \
+    --dataset bigbench_movie \
+    --pickle_path /storage/backup/han/backup_workspace/cot-eval/llama_8b_31_bigbench_movie_recommendation.pkl \
+    --model llama \
+    --shot_mode zero \
     --confidence \
-    --type 2 \
-    --debug \
-    --debug_conf
-
-    # --debug \
+    --debug_conf \
+    --tag debug-temp-0402-llama \
+    --nb_dropout_samples 10 \
+    --experimental_jackknife \
+    --sample_size 1
 
 
