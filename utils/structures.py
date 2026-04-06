@@ -25,6 +25,7 @@ class ParsedOutput:
     raw_cot_block: str        # the full CoT text before the \boxed{} answer
     answer_fullstring_start: int | None  # char offset in generated_text where "\boxed{" begins (None if not found)
     answer_start: int | None # char offset of the first character inside \boxed{...} braces
+    answer_sentence_start: int | None  # char offset where the sentence containing \boxed{} begins (after CoT steps)
 
 
 @dataclass
@@ -38,6 +39,7 @@ class ConfidenceScores:
     verbconf_distribution: list[float] | None = None   # softmaxed probs for scores 0-100 (length 101)
     verbconf_top_score: int | None = None               # score with highest probability
     verbconf_top_prob: float | None = None              # probability of that score
+    step_masks: list[list[int]] | None = None           # binary list per sample: 1 = kept, 0 = masked
 
 
 @dataclass
@@ -45,6 +47,5 @@ class AllConfidenceData:
     """All confidence data for a single question, for both non-dropout and dropout versions."""
     vanilla_confidences: ConfidenceScores
     dropout_confidences: ConfidenceScores
-    jacknife_confidences: ConfidenceScores | None = None
+    jackknife_confidences: ConfidenceScores | None = None
     debug_info: dict = field(default_factory=dict)
-

@@ -12,7 +12,11 @@ def shorten_string(string):
     return shortened_string
 
 
-def find_token_indices_from_end(tokenizer, token_ids, string):
+def find_token_indices_from_end(tokenizer, token_ids, string, model_name=None):
+    # Strip <|return|> for GPT-OSS models since they don't generate it
+    if model_name and "gpt" in model_name.lower():
+        string = string.replace("<|return|>", "")
+
     prev_string = string
     string = tokenizer.encode(string, add_special_tokens=False)
     string = "".join(tokenizer.convert_ids_to_tokens(string))
