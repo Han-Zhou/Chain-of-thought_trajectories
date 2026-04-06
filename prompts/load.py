@@ -59,31 +59,80 @@ def _materialize_few_shot_messages(
                 content = (message["content"]
                     .replace("{thinking_token_open}", thinking_token_open)
                     .replace("{thinking_token_close}", thinking_token_close))
-            if use_thinking_field:
-                sep = "\\boxed{"
-                idx = content.find(sep)
-                if idx != -1:
-                    few_shot_messages.append({
-                        "role": "assistant",
-                        "thinking": content[:idx].strip(),
-                        "content": content[idx:].strip(),
-                    })
-                else:
-                    few_shot_messages.append({"role": "assistant", "content": content})
-            else:
-                few_shot_messages.append({"role": "assistant", "content": content})
+            # if use_thinking_field:
+            #     sep = "\\boxed{"
+            #     idx = content.find(sep)
+            #     if idx != -1:
+            #         few_shot_messages.append({
+            #             "role": "assistant",
+            #             "thinking": content[:idx].strip(),
+            #             "content": content[idx:].strip(),
+            #         })
+            #     else:
+            #         few_shot_messages.append({"role": "assistant", "content": content})
+            # else:
+            few_shot_messages.append({"role": "assistant", "content": content})
         else:
             few_shot_messages.append(message)
-
+    
     return few_shot_messages
 
 
 
-def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, thinking: bool, prompt_type: int = 1) -> list[dict[str, str]]:
-    if dataset == "logiqa":
-        # For LogiQA, we want to use the system prompt as the reasoning prompt and the original prompt as the specific prompt.
-        system_reasoning_prompt, system_specific_prompt, assistant_start = load_prompt_from_registry(dataset)
+def _build_messages(
+    system_prompt: str,
+    user_prompt: str,
+    assistant_start: str,
+    model_name: str,
+    thinking: bool,
+    prompt_type: int,
+    few_shot: bool,
+    few_shot_key: str,
+) -> list[dict[str, str]]:
+    """Common message assembly: thinking tokens, prompt_type branching, few-shot insertion."""
+    thinking_token_open, _ = _resolve_thinking_tokens(model_name, thinking)
 
+    if prompt_type == 1:
+        assistant_start = assistant_start.format(thinking_token_open=thinking_token_open)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": assistant_start},
+        ]
+    else:
+        user_prompt += "\n\nLet's think step-by-step."
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    if few_shot:
+        few_shot_messages = _materialize_few_shot_messages(few_shot_key, model_name, thinking, prompt_type)
+        messages = messages[0:1] + few_shot_messages + messages[1:]
+
+    return messages
+
+
+_SUPPORTED_MESSAGE_DATASETS = {
+    "logiqa", "hle",
+    "cs1qa_type", "cs1qa_span", "cs1qa_answer",
+    "college_math", "bigbench_causal", "bigbench_movie",
+    "hotpotqa", "math500", "olympiadbench",
+}
+
+
+def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, thinking: bool, prompt_type: int = 1) -> list[dict[str, str]]:
+    if dataset not in _SUPPORTED_MESSAGE_DATASETS:
+        raise NotImplementedError(f"Message loading not implemented for dataset '{dataset}'.")
+
+    # college_math uses a different registry key than its dataset name
+    registry_key = "college_math_test" if dataset == "college_math" else dataset
+    prompt_parts = load_prompt_from_registry(registry_key)
+
+    if dataset == "logiqa":
+        # Registry returns (reasoning_prompt, specific_prompt, assistant_start) for logiqa
+        reasoning_prompt, specific_prompt, assistant_start = prompt_parts
+        system_prompt = reasoning_prompt + "\n\n" + specific_prompt
         choices_text = "\n".join(entry["choices"])
         user_prompt = (
             f"Context:\n{entry['context']}\n\n"
@@ -91,64 +140,26 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
             f"Options:\n{choices_text}"
         )
 
-        thinking_token_open, _ = _resolve_thinking_tokens(model_name, thinking)
+    elif dataset in ("cs1qa_type", "cs1qa_span", "cs1qa_answer"):
+        system_prompt, user_template, assistant_start = prompt_parts
+        code = entry.get("context") or entry.get("code") or ""
+        user_prompt = user_template.format(question=entry["question"], code=code)
 
-        if prompt_type == 1:
-            # Type 1: assistant prefill with thinking tokens + "Step 1:"
-            assistant_start = assistant_start.format(
-                thinking_token_open=thinking_token_open,
-            )
-
-            messages = [
-                {"role": "system", "content": system_reasoning_prompt + "\n\n" + system_specific_prompt},
-                {"role": "user", "content": user_prompt},
-                {"role": "assistant", "content": assistant_start}
-            ]
-        else:
-            # Type 2: "Let's think step-by-step." appended to user prompt, no assistant prefill
-            user_prompt += "\n\nLet's think step-by-step."
-
-            messages = [
-                {"role": "system", "content": system_reasoning_prompt + "\n\n" + system_specific_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-
-        if few_shot:
-            few_shot_messages = _materialize_few_shot_messages(dataset, model_name, thinking, prompt_type)
-            messages = messages[0:1] + few_shot_messages + messages[1:]
-
-        return messages
-
-    elif dataset == "hle":
-        system_prompt, user_template, assistant_start = load_prompt_from_registry(dataset)
-
+    else:
+        # Default path: covers hle, college_math, hotpotqa, bigbench_causal,
+        # bigbench_movie, math500, olympiadbench, and any future simple datasets.
+        system_prompt, user_template, assistant_start = prompt_parts
         user_prompt = user_template.format(question=entry["question"])
-        if entry.get("choices"):
+
+        if dataset in ("college_math", "hotpotqa") and entry.get("context"):
+            user_prompt = f"Context:\n{entry['context']}\n\n{user_prompt}"
+
+        if dataset == "hle" and entry.get("choices"):
             choices_text = "\n".join(entry["choices"])
             user_prompt += f"\n\nAnswer Choices:\n{choices_text}"
 
-        thinking_token_open, _ = _resolve_thinking_tokens(model_name, thinking)
-
-        if prompt_type == 1:
-            assistant_start = assistant_start.format(thinking_token_open=thinking_token_open)
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-                {"role": "assistant", "content": assistant_start},
-            ]
-        else:
-            user_prompt += "\n\nLet's think step-by-step."
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
-
-        if few_shot:
-            few_shot_messages = _materialize_few_shot_messages(dataset, model_name, thinking, prompt_type)
-            messages = messages[0:1] + few_shot_messages + messages[1:]
-
-        return messages
-
-    else:
-        raise NotImplementedError(f"Message loading not implemented for dataset '{dataset}'.")
+    return _build_messages(
+        system_prompt, user_prompt, assistant_start,
+        model_name, thinking, prompt_type, few_shot, registry_key,
+    )
 

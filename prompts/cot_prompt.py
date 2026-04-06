@@ -76,7 +76,7 @@ BIGBENCH_MOVIE = """\
 Think carefully about the movies listed and the options provided. Reason \
 step-by-step before choosing the best answer.
 
-\\boxed{your answer}
+\\boxed{{your answer}}
 """
 
 # --- BigBench Causal Judgement ----------------------------------------------
@@ -85,7 +85,7 @@ BIGBENCH_CAUSAL = """\
 
 Reason through the causal relationships step-by-step before answering.
 
-\\boxed{Yes or No}
+\\boxed{{Yes or No}}
 """
 
 # --- LogiQA ----------------------------------------------------------------
@@ -144,18 +144,72 @@ Step 4: Arrive at the correct answer and explain it clearly.
 \\boxed{your answer}
 """
 
-# --- HotPotQA --------------------------------------------------------------
-# Extra fields: {context}  — the supporting passages.
-HOTPOTQA = """\
-Context:
-{context}
+# --- CS1QA Type Classification ---------------------------------------------
+# Extra fields: {code}  — the code snippet the question is about.
+CS1QA_TYPE = """\
+You are an expert at classifying introductory programming questions.
+
+Code:
+```
+{code}
+```
 
 Question:
 {question}
 
-Answer the question by reasoning across the passages step-by-step.
+Classify this question into exactly one of the following types:
+code_understanding, logical, error, usage, algorithm, task, comparison, \
+reasoning, code_explain, variable, guiding
 
-\\boxed{your answer}
+Reason step-by-step about what the question is asking, then output the \
+type label in \\boxed{type_label}.
+"""
+
+# --- CS1QA Span Prediction -------------------------------------------------
+# Extra fields: {code}  — the code snippet with line numbers prepended.
+CS1QA_SPAN = """\
+You are an expert at identifying relevant code for programming questions.
+
+Code (with line numbers):
+```
+{code}
+```
+
+Question:
+{question}
+
+Identify which lines of code are most relevant to answering this question. \
+Reason step-by-step, then output the line range as \\boxed{startLine-endLine} \
+(e.g. \\boxed{5-12}).
+"""
+
+# --- CS1QA Answer Generation -----------------------------------------------
+# Extra fields: {code}  — the code snippet the question is about.
+CS1QA_ANSWER = """\
+You are an expert computer science instructor helping a student with an \
+introductory programming question.
+
+Code:
+```
+{code}
+```
+
+Question:
+{question}
+
+Analyze the code step-by-step and answer the question clearly and concisely.
+
+\\boxed{{your answer}}
+"""
+
+# --- HotPotQA --------------------------------------------------------------
+HOTPOTQA = """\
+Question:
+{question}
+
+Answer the question by reasoning step-by-step.
+
+\\boxed{{your answer}}
 """
 
 # --- College Math Test -----------------------------------------------------
@@ -164,7 +218,7 @@ Question: {question}
 
 Solve the problem step-by-step, showing all work clearly.
 
-\\boxed{exact answer}
+\\boxed{{exact answer}}
 """
 
 # --- OlympiadBench ---------------------------------------------------------
@@ -173,7 +227,7 @@ Question: {question}
 
 Approach the problem rigorously and creatively, step-by-step.
 
-\\boxed{exact answer or proof conclusion}
+\\boxed{{exact answer or proof conclusion}}
 """
 
 # --- Math500 ---------------------------------------------------------------
@@ -182,7 +236,7 @@ Question: {question}
 
 Solve step-by-step, showing all reasoning clearly.
 
-\\boxed{exact answer in simplified form}
+\\boxed{{exact answer in simplified form}}
 """
 
 # --- HLE (Humanity's Last Exam) --------------------------------------------
@@ -208,6 +262,9 @@ PROMPT_REGISTRY: dict[str, tuple[str, str, str]] = {
     "logiqa":               (SYSTEM, LOGIQIA, ASSISTANT_START),
     "codeqa":               (SYSTEM, CODEQA, ASSISTANT_START),
     "cs1qa":                (SYSTEM, CS1QA, ASSISTANT_START),
+    "cs1qa_type":           (SYSTEM, CS1QA_TYPE, ASSISTANT_START),
+    "cs1qa_span":           (SYSTEM, CS1QA_SPAN, ASSISTANT_START),
+    "cs1qa_answer":         (SYSTEM, CS1QA_ANSWER, ASSISTANT_START),
     "hotpotqa":             (SYSTEM, HOTPOTQA, ASSISTANT_START),
     "college_math_test":    (SYSTEM, COLLEGE_MATH, ASSISTANT_START),
     "olympiadbench":        (SYSTEM, OLYMPIADBENCH, ASSISTANT_START),
