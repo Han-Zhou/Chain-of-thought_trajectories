@@ -13,7 +13,7 @@ from dataloader.bfcl import BFCLDataLoader
 from dataloader.bigbench import BigBenchMovieDataLoader, BigBenchCausalDataLoader
 from dataloader.logiqa import LogiQADataLoader
 from dataloader.codeqa import CodeQADataLoader
-from dataloader.cs1qa import CS1QADataLoader
+from dataloader.cs1qa import CS1QADataLoader, CS1QATypeDataLoader, CS1QASpanDataLoader, CS1QAAnswerDataLoader
 from dataloader.hotpotqa import HotPotQADataLoader
 from dataloader.college_math import CollegeMathDataLoader
 from dataloader.olympiadbench import OlympiadBenchDataLoader
@@ -27,6 +27,9 @@ _REGISTRY: dict[str, type[BaseBenchmarkDataset]] = {
     "logiqa":          LogiQADataLoader,
     "codeqa":          CodeQADataLoader,
     "cs1qa":           CS1QADataLoader,
+    "cs1qa_type":      CS1QATypeDataLoader,
+    "cs1qa_span":      CS1QASpanDataLoader,
+    "cs1qa_answer":    CS1QAAnswerDataLoader,
     "hotpotqa":        HotPotQADataLoader,
     "college_math":    CollegeMathDataLoader,
     "olympiadbench":   OlympiadBenchDataLoader,
@@ -77,6 +80,9 @@ __all__ = [
     "LogiQADataLoader",
     "CodeQADataLoader",
     "CS1QADataLoader",
+    "CS1QATypeDataLoader",
+    "CS1QASpanDataLoader",
+    "CS1QAAnswerDataLoader",
     "HotPotQADataLoader",
     "CollegeMathDataLoader",
     "OlympiadBenchDataLoader",

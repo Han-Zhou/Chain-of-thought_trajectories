@@ -7,7 +7,7 @@ class OlympiadBenchDataLoader(BaseBenchmarkDataset):
     """English math Olympiad problems (Hothan/OlympiadBench), OE_TO_maths_en_COMP split."""
 
     def _load_all(self) -> list[dict]:
-        ds = self._hf("Hothan/OlympiadBench", "OE_TO_maths_en_COMP")
+        ds = self._hf("Hothan/OlympiadBench", "train", name="OE_TO_maths_en_COMP")
         entries = []
         for i, row in enumerate(ds):
             if i < 3:
