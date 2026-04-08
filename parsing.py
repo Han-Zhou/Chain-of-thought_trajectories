@@ -46,7 +46,7 @@ def _extract_boxed_with_positions(text: str):
     return None, None, None, None
 
 
-def parse_output(generated_text: str) -> ParsedOutput:
+def parse_output(generated_text: str, extra_box_suffix: str | None = None) -> ParsedOutput:
     """Split a raw generation into structured CoT steps and the final answer.
 
     Strategy:
@@ -108,6 +108,16 @@ def parse_output(generated_text: str) -> ParsedOutput:
         answer_fullstring_start = None
         answer_start = None
         answer_sentence_start = None
+
+    # When extra_box_suffix is provided, the suffix text (e.g. "\nTherefore the answer is ")
+    # was appended after phase 1 generation and is included in cot_block. Strip it before
+    # splitting into steps so it doesn't leak into the last step.
+    if extra_box_suffix is not None:
+        # The suffix without the \boxed{ part is what appears in cot_block
+        suffix_text = extra_box_suffix.replace("\\boxed{", "").strip()
+        suffix_idx = cot_block.rfind(suffix_text)
+        if suffix_idx >= 0:
+            cot_block = cot_block[:suffix_idx].strip()
 
     parts = _STEP_MARKER_RE.split(cot_block)
 
