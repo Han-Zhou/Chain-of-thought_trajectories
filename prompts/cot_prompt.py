@@ -20,6 +20,17 @@ SYSTEM = (
 )
 
 
+SYSTEM_WITHOUT_BOXED = (
+    "You are an expert reasoning assistant. "
+    "For every problem you receive, think carefully and reason step-by-step "
+    "before giving your final answer. "
+    "Label each reasoning step as 'Step 1:', 'Step 2:', etc. "
+    "Keep your reasoning concise, and be brief in each step."
+)
+
+
+
+
 ASSISTANT_START = """{thinking_token_open}Let's think step-by-step.\nStep 1: """
 # ASSISTANT_START = """<think>\nLet's think step-by-step.\nStep 1: """
 # ASSISTANT_START = ""
@@ -78,6 +89,15 @@ step-by-step before choosing the best answer.
 
 \\boxed{{your answer}}
 """
+
+BIGBENCH_MOVIE_WITHOUT_BOXED = """\
+{question}
+
+Think carefully about the movies listed and the options provided. Reason \
+step-by-step before choosing the best answer.
+"""
+
+
 
 # --- BigBench Causal Judgement ----------------------------------------------
 BIGBENCH_CAUSAL = """\
@@ -270,4 +290,5 @@ PROMPT_REGISTRY: dict[str, tuple[str, str, str]] = {
     "olympiadbench":        (SYSTEM, OLYMPIADBENCH, ASSISTANT_START),
     "math500":              (SYSTEM, MATH500, ASSISTANT_START),
     "hle":                  (SYSTEM, HLE, ASSISTANT_START),
+    "bigbench_movie_nobox": (SYSTEM_WITHOUT_BOXED, BIGBENCH_MOVIE_WITHOUT_BOXED, ASSISTANT_START),
 }

@@ -118,15 +118,18 @@ _SUPPORTED_MESSAGE_DATASETS = {
     "cs1qa_type", "cs1qa_span", "cs1qa_answer",
     "college_math", "bigbench_causal", "bigbench_movie",
     "hotpotqa", "math500", "olympiadbench",
+    "bigbench_movie_nobox",
 }
 
 
-def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, thinking: bool, prompt_type: int = 1) -> list[dict[str, str]]:
+def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, thinking: bool, prompt_type: int = 1, experimental_extra_box: bool = False) -> list[dict[str, str]]:
     if dataset not in _SUPPORTED_MESSAGE_DATASETS:
         raise NotImplementedError(f"Message loading not implemented for dataset '{dataset}'.")
 
     # college_math uses a different registry key than its dataset name
     registry_key = "college_math_test" if dataset == "college_math" else dataset
+    if experimental_extra_box:
+        registry_key = "bigbench_movie_nobox"
     prompt_parts = load_prompt_from_registry(registry_key)
 
     if dataset == "logiqa":

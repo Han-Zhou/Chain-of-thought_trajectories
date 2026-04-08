@@ -93,10 +93,10 @@ BIGBENCH_MOVIE = [
         "content": (
             "Find a movie similar to Batman, The Mask, The Fugitive, Pretty Woman:\n"
             "Options:\n"
-            "A. Maelstrom\n"
-            "B. The Lion King\n"
-            "C. Lamerica\n"
-            "D. The Front Page"
+            "(A) Maelstrom\n"
+            "(B) The Lion King\n"
+            "(C) Lamerica\n"
+            "(D) The Front Page"
         ),
     },
     {
@@ -113,7 +113,7 @@ BIGBENCH_MOVIE = [
             "Step 6: The Lion King (1994) is a massive mainstream Hollywood blockbuster from the same era,"
             " fitting perfectly with the pattern of widely popular, commercially successful early-90s films.\n"
             "Step 7: The Lion King is the best match.{thinking_token_close}\n"
-            "\\boxed{B}"
+            "\\boxed{(B)}"
         ),
     },
     {
@@ -121,10 +121,10 @@ BIGBENCH_MOVIE = [
         "content": (
             "Find a movie similar to The Sixth Sense, The Matrix, Forrest Gump, The Shawshank Redemption:\n"
             "Options:\n"
-            "A. Terminator 2 Judgment Day\n"
-            "B. The Sheltering Sky\n"
-            "C. Street Fighter II The Animated Movie\n"
-            "D. The Boy Who Could Fly"
+            "(A) Terminator 2 Judgment Day\n"
+            "(B) The Sheltering Sky\n"
+            "(C) Street Fighter II The Animated Movie\n"
+            "(D) The Boy Who Could Fly"
         ),
     },
     {
@@ -140,7 +140,7 @@ BIGBENCH_MOVIE = [
             "Step 6: Terminator 2: Judgment Day (1991) is a hugely popular, critically acclaimed,"
             " culturally iconic blockbuster from the same era — a perfect match.\n"
             "Step 7: Terminator 2 Judgment Day is the best match.{thinking_token_close}\n"
-            "\\boxed{A}"
+            "\\boxed{(A)}"
         ),
     },
 ]
