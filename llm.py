@@ -118,6 +118,7 @@ class LLM():
         temperature: float = 0.0,
         output_scores: bool = False,
         has_assistant_prefill: bool = True,
+        stop_strings: list[str] | None = None,
     ) -> GenerationResult:
         """Run one forward pass through model.generate() with a DynamicCache.
 
@@ -191,6 +192,13 @@ class LLM():
         #     _StopAfterBoxedAnswer(self.tokenizer, prompt_len),
         # ])
 
+        if stop_strings:
+            stop_criteria = StoppingCriteriaList([
+                StopStringCriteria(tokenizer=self.tokenizer, stop_strings=stop_strings),
+            ])
+        else:
+            stop_criteria = None
+
         with torch.inference_mode():
             outputs = self.model.generate(
                 **inputs,
@@ -202,7 +210,7 @@ class LLM():
                 temperature=temperature if temperature > 0.0 else None,
                 pad_token_id=self.tokenizer.eos_token_id,
                 output_scores=output_scores,
-                # stopping_criteria=stop_criteria,
+                stopping_criteria=stop_criteria,
             )
 
         total_len: int = outputs.sequences.shape[1]
