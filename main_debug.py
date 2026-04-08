@@ -281,7 +281,14 @@ def score_trajectories(model_name, pickle_data, out_dir, confidence=False, debug
                 # Evaluate correctness
                 if dataset_name:
                     eval_result = evaluate_one({"generated_text": full_generated_text, "ground_truth": entry["answer"]}, dataset_name)
-                    correct = eval_result["score"] > 0 if eval_result else None
+                    if eval_result:
+                        # For hotpotqa, score is a dict with 'em' and 'f1'
+                        if isinstance(eval_result["score"], dict):
+                            correct = eval_result["score"]
+                        else:
+                            correct = eval_result["score"] == 1.0
+                    else:
+                        correct = None
                 else:
                     correct = None
 

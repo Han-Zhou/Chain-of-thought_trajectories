@@ -22,6 +22,8 @@ import json
 import time
 import pickle
 
+import copy
+
 import torch
 from tqdm.contrib.discord import tqdm as tqdm_discord
 from tqdm import tqdm
@@ -46,11 +48,6 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-
-
-
-
-
 def parse():
     args = argparse.ArgumentParser()
     args.add_argument(
@@ -67,7 +64,7 @@ def parse():
         "--pickle_path",
         type=str,
         default=None,
-        help="Path to a pickle file containing pre-generated entries. Mutually exclusive with --dataset."
+        help="Path to a pickle file containing pre-generated entries. --dataset is still required for prompt/eval routing."
     )
     args.add_argument(
         "--model",
@@ -162,6 +159,16 @@ def parse():
         help="Number of dropout samples for confidence scoring."
     )
     args.add_argument(
+        "--experimental_extra_box",
+        action="store_true",
+        default=False,
+        help=(
+            "Two-phase generation: generate without \\boxed instruction, then "
+            "append '\\nTherefore the answer is \\boxed{' and generate the answer "
+            "with stop string '}'. Only supported for bigbench_movie."
+        ),
+    )
+    args.add_argument(
         "--tag",
         type=str,
         default=None,
@@ -180,7 +187,37 @@ def parse():
 
 
 
-def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=False, discord=False, nb_dropout_samples=3):
+def generate_continuation(llm, messages, max_new_tokens, suffix="\nTherefore the answer is \\boxed{", stop_strings=["}"]):
+    """Two-phase generation: free generation, then forced continuation with suffix.
+
+    Returns (gen, assistant_prefill, full_generated_text) matching the
+    contract of the normal generation path so downstream code is unchanged.
+    """
+    has_assistant_prefill = messages[-1]["role"] == "assistant"
+    gen1 = llm.generate_one(messages, max_new_tokens=max_new_tokens, has_assistant_prefill=has_assistant_prefill)
+    assistant_prefill = messages[-1]["content"] if has_assistant_prefill else ""
+    phase1_text = assistant_prefill + gen1.generated_text
+
+    # Strip end-of-text tokens before appending the suffix
+    for special_tok in llm.tokenizer.all_special_tokens:
+        if phase1_text.endswith(special_tok):
+            phase1_text = phase1_text[:-len(special_tok)]
+            break
+
+    phase2_messages = copy.deepcopy(messages)
+    if phase2_messages[-1]["role"] == "assistant":
+        phase2_messages[-1]["content"] = phase1_text + suffix
+    else:
+        phase2_messages.append({"role": "assistant", "content": phase1_text + suffix})
+    
+    gen2 = llm.generate_one(phase2_messages, max_new_tokens=200, stop_strings=stop_strings, has_assistant_prefill=True)
+
+    full_generated_text = phase1_text + suffix + gen2.generated_text
+    gen2.generated_text = gen1.generated_text + suffix + gen2.generated_text
+    return gen2, assistant_prefill, full_generated_text
+
+
+def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=False, discord=False, nb_dropout_samples=3, experimental_extra_box=False):
 
     debug_dir = "debug_cache"
 
@@ -211,11 +248,14 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
             if debug:
                 gen, parsed, assistant_prefill, full_generated_text, messages = cached_entries[i]
             else:
-                messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type)
-                has_assistant_prefill = messages[-1]["role"] == "assistant"
-                gen: GenerationResult = llm.generate_one(messages, max_new_tokens=max_new_tokens, output_scores=False, has_assistant_prefill=has_assistant_prefill)
-                assistant_prefill = messages[-1]["content"] if messages[-1]["role"] == "assistant" else ""
-                full_generated_text = assistant_prefill + gen.generated_text
+                messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type, experimental_extra_box=experimental_extra_box)
+                if experimental_extra_box:
+                    gen, assistant_prefill, full_generated_text = generate_continuation(llm, messages, max_new_tokens)
+                else:
+                    has_assistant_prefill = messages[-1]["role"] == "assistant"
+                    gen: GenerationResult = llm.generate_one(messages, max_new_tokens=max_new_tokens, output_scores=False, has_assistant_prefill=has_assistant_prefill)
+                    assistant_prefill = messages[-1]["content"] if messages[-1]["role"] == "assistant" else ""
+                    full_generated_text = assistant_prefill + gen.generated_text
 
                 # For type 2 the model generates freely and may wrap reasoning in
                 # <think>...</think>.  We parse only the text *after* the think block
@@ -229,7 +269,8 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                 else:
                     think_block_len = 0
                     text_for_parsing = full_generated_text
-                parsed: ParsedOutput = parse_output(text_for_parsing)
+                extra_box_suffix = "\nTherefore the answer is \\boxed{" if experimental_extra_box else None
+                parsed: ParsedOutput = parse_output(text_for_parsing, extra_box_suffix=extra_box_suffix)
                 # Shift character offsets back to full_generated_text coordinates
                 if think_block_len > 0:
                     if parsed.answer_fullstring_start is not None:
@@ -297,7 +338,15 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                 correct = None
             else:
                 eval_result = evaluate_one({"generated_text": full_generated_text, "ground_truth": entry["answer"]}, dataset_name)
-                correct = eval_result["score"] > 0 if eval_result else None
+                if eval_result:
+                    # For hotpotqa, score is a dict with 'em' and 'f1'
+                    if isinstance(eval_result["score"], dict):
+                        correct = eval_result["score"]
+                    else:
+                        # For other datasets, score is a float/bool
+                        correct = eval_result["score"] == 1.0
+                else:
+                    correct = None
 
             traj = {
                 "id":                           entry["id"],
@@ -418,6 +467,7 @@ def main(args):
         experimental_jackknife=args.experimental_jackknife,
         discord=args.discord,
         nb_dropout_samples=args.nb_dropout_samples,
+        experimental_extra_box=args.experimental_extra_box,
     )
 
     if errors:
