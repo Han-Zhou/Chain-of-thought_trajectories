@@ -120,7 +120,7 @@ def compute_all_confidence_scores(
     if dbg:
         debug_info["answer_logits"] = dbg
 
-    vanilla_ptrue1, vanilla_ptrue2, dropout_ptrue1, dropout_ptrue2, dbg, _ = \
+    vanilla_ptrue1, vanilla_ptrue2, vanilla_ptrue3, dropout_ptrue1, dropout_ptrue2, dropout_ptrue3, dbg, _ = \
         dropout_indirectlogits(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                                gen_cache=gen_cache, base_tokens=base_tokens,
                                precomputed_early_cache=precomputed_early_cache)
@@ -149,7 +149,7 @@ def compute_all_confidence_scores(
         if dbg:
             debug_info["jackknife_answer_logits"] = dbg
 
-        _, _, jk_ptrue1, jk_ptrue2, dbg, _ = \
+        _, _, _, jk_ptrue1, jk_ptrue2, jk_ptrue3, dbg, _ = \
             dropout_indirectlogits(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                                    gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
                                    precomputed_early_cache=precomputed_early_cache)
@@ -172,6 +172,7 @@ def compute_all_confidence_scores(
             answer_entropy=jk_answer_entropy,
             indirect_ptrue1_probabilities=jk_ptrue1,
             indirect_ptrue2_probabilities=jk_ptrue2,
+            indirect_ptrue3_probabilities=jk_ptrue3,
             verbconf_probabilities=jk_verbconf,
             verbconf_distribution=jk_verbconf_dist,
             verbconf_top_score=jk_verbconf_top_scores,
@@ -185,6 +186,7 @@ def compute_all_confidence_scores(
             answer_entropy=vanilla_answer_entropy,
             indirect_ptrue1_probabilities=vanilla_ptrue1,
             indirect_ptrue2_probabilities=vanilla_ptrue2,
+            indirect_ptrue3_probabilities=vanilla_ptrue3,
             verbconf_probabilities=vanilla_verbconf,
             verbconf_distribution=v_verbconf_dist,
             verbconf_top_score=v_verbconf_top_score,
@@ -195,6 +197,7 @@ def compute_all_confidence_scores(
             answer_entropy=dropout_answer_entropy,
             indirect_ptrue1_probabilities=dropout_ptrue1,
             indirect_ptrue2_probabilities=dropout_ptrue2,
+            indirect_ptrue3_probabilities=dropout_ptrue3,
             verbconf_probabilities=dropout_verbconf,
             verbconf_distribution=d_verbconf_dist,
             verbconf_top_score=d_verbconf_top_scores,
@@ -300,6 +303,14 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
     v_softmax2 = torch.softmax(torch.stack([v_pos2.float(), v_neg2.float()]), dim=0)
     vanilla_ptrue2 = {"Yes": v_softmax2[0].item(), "No": v_softmax2[1].item()}
 
+    # Vanilla ptrue3 (Yes/No only — no synonyms)
+    yes_only_id = llm.tokenizer.encode(' Yes', add_special_tokens=False)
+    no_only_id = llm.tokenizer.encode(' No', add_special_tokens=False)
+    v_pos3 = vanilla2.logits[0, -1, yes_only_id[0]]
+    v_neg3 = vanilla2.logits[0, -1, no_only_id[0]]
+    v_softmax3 = torch.softmax(torch.stack([v_pos3.float(), v_neg3.float()]), dim=0)
+    vanilla_ptrue3 = {"Yes": v_softmax3[0].item(), "No": v_softmax3[1].item()}
+
     # Dropout
     if dropout1 is not None:
         d_pos1 = dropout1.logits[:, -1, positive_true_ids].sum(-1)
@@ -313,20 +324,29 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
         d_softmax2 = torch.softmax(torch.stack([d_pos2.float(), d_neg2.float()], dim=-1), dim=-1)
         dropout_ptrue2 = [{"Yes": d_softmax2[s, 0].item(), "No": d_softmax2[s, 1].item()}
                            for s in range(d_softmax2.shape[0])]
+
+        # Dropout ptrue3 (Yes/No only — no synonyms)
+        d_pos3 = dropout2.logits[:, -1, yes_only_id[0]]
+        d_neg3 = dropout2.logits[:, -1, no_only_id[0]]
+        d_softmax3 = torch.softmax(torch.stack([d_pos3.float(), d_neg3.float()], dim=-1), dim=-1)
+        dropout_ptrue3 = [{"Yes": d_softmax3[s, 0].item(), "No": d_softmax3[s, 1].item()}
+                           for s in range(d_softmax3.shape[0])]
     else:
         dropout_ptrue1 = []
         dropout_ptrue2 = []
+        dropout_ptrue3 = []
 
     # --- Debug ---
     if debug_conf:
         dbg = {
             "ptrue1_true_false": _debug_indirect_logit_tokens(llm, vanilla1, positive_true_ids, negative_false_ids, "True/False"),
             "ptrue2_yes_no": _debug_indirect_logit_tokens(llm, vanilla2, positive_yes_ids, negative_no_ids, "Yes/No"),
+            "ptrue3_yes_no_only": _debug_indirect_logit_tokens(llm, vanilla2, [yes_only_id[0]], [no_only_id[0]], "Yes/No (no synonyms)"),
         }
     else:
         dbg = None
 
-    return [vanilla_ptrue1], [vanilla_ptrue2], dropout_ptrue1, dropout_ptrue2, dbg, dropout_step_masks
+    return [vanilla_ptrue1], [vanilla_ptrue2], [vanilla_ptrue3], dropout_ptrue1, dropout_ptrue2, dropout_ptrue3, dbg, dropout_step_masks
 
 
 def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):

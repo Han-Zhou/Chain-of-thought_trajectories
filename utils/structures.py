@@ -35,6 +35,7 @@ class ConfidenceScores:
     answer_entropy: list[dict[str, float]]
     indirect_ptrue1_probabilities: list[dict[str, float]]
     indirect_ptrue2_probabilities: list[dict[str, float]]
+    indirect_ptrue3_probabilities: list[dict[str, float]]
     verbconf_probabilities: list[float]
     verbconf_distribution: list[float] | None = None   # softmaxed probs for scores 0-100 (length 101)
     verbconf_top_score: int | None = None               # score with highest probability
