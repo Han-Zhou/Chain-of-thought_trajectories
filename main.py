@@ -31,7 +31,12 @@ from dotenv import load_dotenv
 from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
 # from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
 
-from utils.enum import MODEL_DICT, LETTERS
+from utils.enum import MODEL_DICT
+from utils.model_utils import (
+    clean_phase1_generated_text,
+    is_llama_model_name,
+    phase1_stop_strings_for_model,
+)
 from dataclasses import asdict
 from utils.structures import GenerationResult, ParsedOutput, AllConfidenceData, ConfidenceScores
 from prompts.load import load_messages
@@ -39,7 +44,7 @@ from prompts.cot_prompt import SYSTEM as _SYSTEM_BASE
 from dataloader import load_dataset, make_dataloader
 from parsing import parse_output
 # from utils.confidence_prev import compute_confidence_metrics
-from confidence import compute_all_confidence_scores
+from confidence import compute_all_confidence_scores, ConfidenceAlignmentError
 from llm import LLM
 from eval.registry import evaluate_one
 
@@ -144,12 +149,17 @@ def parse():
     )
     args.add_argument(
         "--experimental_jackknife",
-        action="store_true",
-        default=False,
+        nargs="?",
+        const="default",
+        default=None,
+        choices=["default", "true"],
         help=(
-            "Use jackknife step masking instead of coin-flip dropout. "
-            "Keeps ceil(log(k)) of k CoT steps per sample (uniform random without replacement) "
-            "rather than flipping an independent coin per step."
+            "Jackknife step masking mode. "
+            "Omit for coin-flip only. "
+            "'--experimental_jackknife' or '--experimental_jackknife default': "
+            "current mask-based jackknife. "
+            "'--experimental_jackknife true': prompt-reconstruction jackknife "
+            "(fresh forward passes, no cache reuse or attention-mask edits)."
         ),
     )
     args.add_argument(
@@ -159,6 +169,12 @@ def parse():
         help="Number of dropout samples for confidence scoring."
     )
     args.add_argument(
+        "--experimental_grid",
+        action="store_true",
+        default=False,
+        help="Enable grid-based jackknife sampling (requires --experimental_jackknife)."
+    )
+    args.add_argument(
         "--experimental_extra_box",
         action="store_true",
         default=False,
@@ -166,6 +182,15 @@ def parse():
             "Two-phase generation: generate without \\boxed instruction, then "
             "append '\\nTherefore the answer is \\boxed{' and generate the answer "
             "with stop string '}'. Only supported for bigbench_movie."
+        ),
+    )
+    args.add_argument(
+        "--experimental_modification",
+        type=str,
+        default=None,
+        help=(
+            "Confidence-only prompt modification mode. Supported values: "
+            "'no-cots' and 'gibberish'."
         ),
     )
     args.add_argument(
@@ -187,42 +212,54 @@ def parse():
 
 
 
-def generate_continuation(llm, messages, max_new_tokens, suffix="\nTherefore the answer is \\boxed{", stop_strings=["}"]):
+def generate_continuation(llm, messages, max_new_tokens, suffix="\nTherefore the answer is \\boxed{", stop_strings=None):
     """Two-phase generation: free generation, then forced continuation with suffix.
 
     Returns (gen, assistant_prefill, full_generated_text) matching the
     contract of the normal generation path so downstream code is unchanged.
     """
+    if stop_strings is None:
+        stop_strings = ["}"]
+
     has_assistant_prefill = messages[-1]["role"] == "assistant"
-    gen1 = llm.generate_one(messages, max_new_tokens=max_new_tokens, has_assistant_prefill=has_assistant_prefill)
+
+    phase1_stop = phase1_stop_strings_for_model(llm.model_name, llm.thinking)
+    gen1 = llm.generate_one(
+        messages,
+        max_new_tokens=max_new_tokens,
+        has_assistant_prefill=has_assistant_prefill,
+        stop_strings=phase1_stop,
+    )
     assistant_prefill = messages[-1]["content"] if has_assistant_prefill else ""
+    gen1.generated_text = clean_phase1_generated_text(llm.model_name, gen1.generated_text, phase1_stop)
     phase1_text = assistant_prefill + gen1.generated_text
 
     # Strip end-of-text tokens before appending the suffix
     for special_tok in llm.tokenizer.all_special_tokens:
         if phase1_text.endswith(special_tok):
             phase1_text = phase1_text[:-len(special_tok)]
+            gen1.generated_text = gen1.generated_text[:-len(special_tok)]
             break
+    gen1.generated_text = clean_phase1_generated_text(llm.model_name, gen1.generated_text, phase1_stop)
+    phase1_text = assistant_prefill + gen1.generated_text
 
-    phase2_messages = copy.deepcopy(messages)
-    if phase2_messages[-1]["role"] == "assistant":
-        phase2_messages[-1]["content"] = phase1_text + suffix
-    else:
-        phase2_messages.append({"role": "assistant", "content": phase1_text + suffix})
-    
-    gen2 = llm.generate_one(phase2_messages, max_new_tokens=200, stop_strings=stop_strings, has_assistant_prefill=True)
+    # Phase 2: use raw generation to avoid re-applying chat template
+    # (which would reformat the completed think block and break continue_final_message)
+    phase2_prompt = gen1.prompt_text + gen1.generated_text + suffix
+    gen2 = llm.generate_raw(phase2_prompt, max_new_tokens=200, stop_strings=stop_strings)
 
     full_generated_text = phase1_text + suffix + gen2.generated_text
     gen2.generated_text = gen1.generated_text + suffix + gen2.generated_text
     return gen2, assistant_prefill, full_generated_text
 
 
-def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=False, discord=False, nb_dropout_samples=3, experimental_extra_box=False):
+def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=None, discord=False, nb_dropout_samples=3, experimental_extra_box=False, experimental_modification=None, experimental_grid=False):
 
     debug_dir = "debug_cache"
 
     llm = LLM(model_name, thinking)
     tokenizer = llm.tokenizer
+    is_llama = is_llama_model_name(model_name)
 
     if debug:
         # Load pre-saved generation results instead of running the model
@@ -253,30 +290,80 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                     gen, assistant_prefill, full_generated_text = generate_continuation(llm, messages, max_new_tokens)
                 else:
                     has_assistant_prefill = messages[-1]["role"] == "assistant"
+                    
+                    # breakpoint()
+
                     gen: GenerationResult = llm.generate_one(messages, max_new_tokens=max_new_tokens, output_scores=False, has_assistant_prefill=has_assistant_prefill)
                     assistant_prefill = messages[-1]["content"] if messages[-1]["role"] == "assistant" else ""
                     full_generated_text = assistant_prefill + gen.generated_text
 
                 # For type 2 the model generates freely and may wrap reasoning in
-                # <think>...</think>.  We parse only the text *after* the think block
-                # so that CoT steps are extracted from the visible output.
-                # We then shift the character offsets back so they are relative to
-                # full_generated_text (which confidence.py indexes into).
+                # <think>...</think>.  CoT steps are extracted from *inside* the
+                # think block, while the answer is extracted from the text *after*
+                # </think>.  We then shift all character offsets back so they are
+                # relative to full_generated_text (which confidence.py indexes into).
                 if prompt_type == 2:
-                    think_match = re.search(r"</think>\s*", full_generated_text)
-                    think_block_len = think_match.end() if think_match else 0
-                    text_for_parsing = full_generated_text[think_block_len:]
+                    think_match = re.search(r"<think>(.*?)</think>(.*)", full_generated_text, re.DOTALL)
+                    if think_match:
+                        # Parse CoT steps from inside <think>...</think>
+                        think_content = think_match.group(1).strip()
+                        parsed_cot: ParsedOutput = parse_output(
+                            think_content,
+                            extra_box_suffix=None,
+                            llama_answer_cleanup=is_llama,
+                        )
+
+                        # Parse answer from text after </think>
+                        post_think_content = think_match.group(2).strip()
+                        post_think_group_start = think_match.start(2)  # where group(2) starts in full_generated_text
+
+                        # Adjust for whitespace stripping
+                        # think_match.group(2) includes leading whitespace, but we stripped it
+                        # So we need to find where the stripped content actually starts
+                        post_think_actual_start = full_generated_text.find(post_think_content, post_think_group_start)
+                        if post_think_actual_start == -1:
+                            # Fallback if we can't find it (shouldn't happen)
+                            post_think_actual_start = post_think_group_start
+
+                        extra_box_suffix = "\nTherefore the answer is \\boxed{" if experimental_extra_box else None
+                        parsed_answer: ParsedOutput = parse_output(
+                            post_think_content,
+                            extra_box_suffix=extra_box_suffix,
+                            llama_answer_cleanup=is_llama,
+                        )
+
+                        # Merge: take CoT steps from think block, answer from post-think
+                        parsed = ParsedOutput(
+                            cot_steps=parsed_cot.cot_steps,
+                            final_answer=parsed_answer.final_answer,
+                            raw_cot_block=parsed_cot.raw_cot_block,
+                            answer_fullstring_start=None,
+                            answer_start=None,
+                            answer_sentence_start=None,
+                        )
+
+                        # Shift answer offsets to full_generated_text coordinates
+                        if parsed_answer.answer_fullstring_start is not None:
+                            parsed.answer_fullstring_start = post_think_actual_start + parsed_answer.answer_fullstring_start
+                        if parsed_answer.answer_start is not None:
+                            parsed.answer_start = post_think_actual_start + parsed_answer.answer_start
+                        if parsed_answer.answer_sentence_start is not None:
+                            parsed.answer_sentence_start = post_think_actual_start + parsed_answer.answer_sentence_start
+                    else:
+                        # Fallback: no think block found, parse everything normally
+                        extra_box_suffix = "\nTherefore the answer is \\boxed{" if experimental_extra_box else None
+                        parsed: ParsedOutput = parse_output(
+                            full_generated_text,
+                            extra_box_suffix=extra_box_suffix,
+                            llama_answer_cleanup=is_llama,
+                        )
                 else:
-                    think_block_len = 0
-                    text_for_parsing = full_generated_text
-                extra_box_suffix = "\nTherefore the answer is \\boxed{" if experimental_extra_box else None
-                parsed: ParsedOutput = parse_output(text_for_parsing, extra_box_suffix=extra_box_suffix)
-                # Shift character offsets back to full_generated_text coordinates
-                if think_block_len > 0:
-                    if parsed.answer_fullstring_start is not None:
-                        parsed.answer_fullstring_start += think_block_len
-                    if parsed.answer_start is not None:
-                        parsed.answer_start += think_block_len
+                    extra_box_suffix = "\nTherefore the answer is \\boxed{" if experimental_extra_box else None
+                    parsed: ParsedOutput = parse_output(
+                        full_generated_text,
+                        extra_box_suffix=extra_box_suffix,
+                        llama_answer_cleanup=is_llama,
+                    )
                 entries_to_save.append((gen, parsed, assistant_prefill, full_generated_text, messages))
 
             if parsed.answer_fullstring_start is not None:
@@ -288,24 +375,44 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
             else:
                 answer_token_start_position = None
 
+            confidence_error = None
             if confidence and parsed.final_answer:
                 llm.switch_attn_implementation("confidence")
-                confidence_score: AllConfidenceData = compute_all_confidence_scores(
-                    llm,
-                    messages,
-                    gen.generated_text,
-                    parsed,
-                    nb_dropout_samples=nb_dropout_samples,
-                    use_fullstring=False,   # whether to apply dropout to the entire "\boxed{...}" string or just the answer tokens
-                    assistant_prefill=assistant_prefill,
-                    debug_conf=debug_conf,
-                    gen_cache=gen.past_key_values,
-                    experimental_jackknife=experimental_jackknife,
-                )
-                llm.switch_attn_implementation("cot")
-                debug_info = confidence_score.debug_info if debug_conf else None
-                confidence_score = asdict(confidence_score)
-                confidence_score.pop("debug_info", None)
+                try:
+                    try:
+                        confidence_score_obj: AllConfidenceData = compute_all_confidence_scores(
+                            llm,
+                            messages,
+                            gen.generated_text,
+                            parsed,
+                            nb_dropout_samples=nb_dropout_samples,
+                            use_fullstring=False,   # whether to apply dropout to the entire "\boxed{...}" string or just the answer tokens
+                            assistant_prefill=assistant_prefill,
+                            debug_conf=debug_conf,
+                            gen_cache=gen.past_key_values,
+                            experimental_jackknife=experimental_jackknife,
+                            experimental_modification=experimental_modification,
+                            experimental_grid=experimental_grid,
+                        )
+                    except ConfidenceAlignmentError as exc:
+                        confidence_error = str(exc)
+                        logger.warning(
+                            "Confidence scoring skipped for entry %s due to step-alignment failure: %s",
+                            entry["id"],
+                            exc,
+                        )
+                        confidence_score = None
+                        debug_info = {"confidence_error": confidence_error} if debug_conf else None
+                    else:
+                        debug_info = confidence_score_obj.debug_info if debug_conf else None
+                        if debug_info is not None and confidence_error is not None:
+                            debug_info = copy.deepcopy(debug_info)
+                            debug_info["confidence_error"] = confidence_error
+                        confidence_score = asdict(confidence_score_obj)
+                        confidence_score.pop("debug_info", None)
+                finally:
+                    # Always reset to "cot" mode, even if compute_all_confidence_scores throws
+                    llm.switch_attn_implementation("cot")
             else:
                 confidence_score = None
                 debug_info = None
@@ -337,7 +444,12 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                 eval_result = None
                 correct = None
             else:
-                eval_result = evaluate_one({"generated_text": full_generated_text, "ground_truth": entry["answer"]}, dataset_name)
+                eval_result = evaluate_one({
+                    "generated_text": full_generated_text,
+                    "ground_truth": entry["answer"],
+                    "prediction": parsed.final_answer,
+                }, dataset_name)
+
                 if eval_result:
                     # For hotpotqa, score is a dict with 'em' and 'f1'
                     if isinstance(eval_result["score"], dict):
@@ -352,6 +464,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                 "id":                           entry["id"],
                 "question":                     entry["question"],
                 "ground_truth":                 entry["answer"],
+                "prompt":                       gen.prompt_text,
                 "cot_steps":                    parsed.cot_steps,
                 "final_answer":                 parsed.final_answer,
                 "raw_cot_block":                parsed.raw_cot_block,
@@ -360,7 +473,9 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                 "generated_end_position":       gen.generated_end_position,
                 "answer_token_start_position":  answer_token_start_position,
                 "confidence_score": confidence_score,
-                "confidence_method": "coin_flip+jackknife" if experimental_jackknife else "coin_flip",
+                "confidence_method": {None: "coin_flip", "default": f"jackknife{'_grid' if experimental_grid else ''}_default", "true": f"coin_flip+jackknife{'_grid' if experimental_grid else ''}_true"}[experimental_jackknife] if confidence_score else None,
+                "confidence_modification": experimental_modification if confidence_score else None,
+                "confidence_error":            confidence_error,
                 "debug_info":                   debug_info if debug_conf else None,
                 "runtime_seconds":              time.time() - t0,
                 "correct":                      correct,
@@ -381,6 +496,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                 "id":                           entry["id"],
                 "question":                     entry["question"],
                 "ground_truth":                 entry["answer"],
+                "prompt":                       None,
                 "error":                        str(e),
                 "cot_steps":                    None,
                 "final_answer":                 None,
@@ -391,6 +507,8 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                 "answer_token_start_position":  None,
                 "confidence_score":             None,
                 "confidence_method":           None,
+                "confidence_modification":     None,
+                "confidence_error":            None,
                 "runtime_seconds":              time.time() - t0,
                 "correct":                      None,
             }
@@ -424,6 +542,10 @@ def load_pickle_data(pickle_path: str) -> list[dict]:
 def main(args):
     t_start = time.time()
 
+    # Validate experimental_grid requires experimental_jackknife
+    if args.experimental_grid and args.experimental_jackknife is None:
+        raise ValueError("--experimental_grid requires --experimental_jackknife to be set")
+
     if args.pickle_path:
         dataset = load_pickle_data(args.pickle_path)
         logger.info(f"Loaded {len(dataset)} entries from pickle '{args.pickle_path}'.")
@@ -448,7 +570,12 @@ def main(args):
 
     logger.info(f"generating {args.dataset} [{start}:{end}]")
 
-    dir_name = f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{start}_{end}_type{args.type}_{'conf' if args.confidence else 'vanilla'}_{'jackknife' if args.experimental_jackknife else 'coinflip'}"
+    if args.experimental_grid:
+        _jk_suffix = {None: "coinflip", "default": "jackknife_grid_default", "true": "jackknife_grid_true"}[args.experimental_jackknife]
+    else:
+        _jk_suffix = {None: "coinflip", "default": "jackknife_default", "true": "jackknife_true"}[args.experimental_jackknife]
+    mod_suffix = args.experimental_modification or "none"
+    dir_name = f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{start}_{end}_type{args.type}_{'conf' if args.confidence else 'vanilla'}_{_jk_suffix}_mod-{mod_suffix}"
     if args.tag:
         dir_name = f"{args.tag}_{dir_name}"
     out_dir = f"trajectories/{dir_name}"
@@ -468,6 +595,8 @@ def main(args):
         discord=args.discord,
         nb_dropout_samples=args.nb_dropout_samples,
         experimental_extra_box=args.experimental_extra_box,
+        experimental_modification=args.experimental_modification,
+        experimental_grid=args.experimental_grid,
     )
 
     if errors:

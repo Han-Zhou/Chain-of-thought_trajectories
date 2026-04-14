@@ -236,6 +236,57 @@ class LLM():
             generated_ids=generated_ids_tensor,
         )
 
+    def generate_raw(
+        self,
+        prompt_text: str,
+        max_new_tokens: int,
+        temperature: float = 0.0,
+        output_scores: bool = False,
+        stop_strings: list[str] | None = None,
+    ) -> GenerationResult:
+        """Generate from an already-formatted prompt string, bypassing apply_chat_template."""
+
+        device = next(self.model.parameters()).device
+        inputs = self.tokenizer(prompt_text, return_tensors="pt").to(device)
+        prompt_len: int = inputs["input_ids"].shape[1]
+
+        if stop_strings:
+            stop_criteria = StoppingCriteriaList([
+                StopStringCriteria(tokenizer=self.tokenizer, stop_strings=stop_strings),
+            ])
+        else:
+            stop_criteria = None
+
+        with torch.inference_mode():
+            outputs = self.model.generate(
+                **inputs,
+                use_cache=True,
+                return_dict_in_generate=True,
+                max_new_tokens=max_new_tokens,
+                do_sample=(temperature > 0.0),
+                temperature=temperature if temperature > 0.0 else None,
+                pad_token_id=self.tokenizer.eos_token_id,
+                output_scores=output_scores,
+                stopping_criteria=stop_criteria,
+            )
+
+        total_len: int = outputs.sequences.shape[1]
+        generated_ids = outputs.sequences[0, prompt_len:]
+        generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
+        generated_ids_tensor = outputs.sequences[0, prompt_len:].cpu()
+        prompt_tail_ids = outputs.sequences[0, max(0, prompt_len - 10):prompt_len].cpu()
+
+        return GenerationResult(
+            prompt_text=prompt_text,
+            generated_text=generated_text,
+            prompt_end_position=prompt_len,
+            generated_end_position=total_len,
+            past_key_values=outputs.past_key_values,
+            prompt_tail_ids=prompt_tail_ids,
+            scores=outputs.scores if output_scores else None,
+            generated_ids=generated_ids_tensor,
+        )
+
 
 # class EosListStoppingCriteria(StoppingCriteria):
 #     def __init__(self, eos_sequence = []):
