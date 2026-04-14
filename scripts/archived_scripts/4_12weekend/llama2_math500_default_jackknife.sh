@@ -2,19 +2,18 @@
 
 PICKLE_DIR="pickles"
 
-echo "Running qwen type 2 on bigbench_movie..."
+echo "Running llama on math500 (default jackknife)..."
 
 python3 main.py \
-    --pickle_path $PICKLE_DIR/bigbench_movie.pkl \
-    --dataset bigbench_movie \
-    --model qwen \
+    --pickle_path $PICKLE_DIR/math500.pkl \
+    --dataset math500 \
+    --model llama \
     --shot_mode zero \
-    --max_new_tokens 20000 \
+    --max_new_tokens 5000 \
     --type 2 \
     --confidence \
-    --thinking \
     --debug_conf \
-    --tag 408-qwen-boxed-type2 \
+    --tag 413_llama-math500-defaultJK-type2 \
     --nb_dropout_samples 10 \
     --experimental_jackknife \
     --experimental_extra_box \
