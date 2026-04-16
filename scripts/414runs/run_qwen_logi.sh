@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH --job-name=conf-llama1
+#SBATCH --job-name=run-qwen-logiqa
 #SBATCH --qos=high
 #SBATCH --partition=compute
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --time=4-8:00:00
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=24
@@ -19,7 +19,7 @@ notify_discord() {
     "$DISCORD_WEBHOOK" > /dev/null 2>&1
 }
 
-trap 'notify_discord "❌ **llama1** failed on $(hostname) (Job $SLURM_JOB_ID) at line $LINENO with exit code $?"' ERR
+trap 'notify_discord "❌ **qwen_type1** failed on $(hostname) (Job $SLURM_JOB_ID) at line $LINENO with exit code $?"' ERR
 
 set -euo pipefail
 
@@ -27,6 +27,6 @@ module load cuda/12.4
 module load conda
 conda activate cot
 
-./scripts/llama1.sh
+./scripts/414runs/qwen_logi.sh
 
-notify_discord "✅ **llama1** completed successfully (Job $SLURM_JOB_ID)"
+notify_discord "✅ **qwen_type1** completed successfully (Job $SLURM_JOB_ID)"

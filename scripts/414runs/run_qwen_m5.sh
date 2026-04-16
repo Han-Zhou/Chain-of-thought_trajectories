@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=conf-qwen1
+#SBATCH --job-name=run-qwen-m5
 #SBATCH --qos=high
 #SBATCH --partition=compute
 #SBATCH --nodes=1
@@ -27,6 +27,6 @@ module load cuda/12.4
 module load conda
 conda activate cot
 
-./scripts/qwen_type1.sh
+./scripts/414runs/qwen_m5.sh
 
 notify_discord "✅ **qwen_type1** completed successfully (Job $SLURM_JOB_ID)"
