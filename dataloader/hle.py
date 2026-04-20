@@ -26,7 +26,7 @@ class HLEDataLoader(BaseBenchmarkDataset):
         ds = hf_load("cais/hle", split="test", token=token)
         entries = []
         for i, row in enumerate(ds):
-            if row.get("image") is not None:
+            if row.get("image"):
                 continue
             choices = None
             if row.get("answer_type") == "multiple_choice":

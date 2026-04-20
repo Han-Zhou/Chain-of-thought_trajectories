@@ -12,3 +12,8 @@ MODEL_DICT = MappingProxyType({
 
 LETTERS = "ABCD"
 
+MCQ_DATASETS = frozenset({
+    "bigbench_movie",
+    "bigbench_causal", "logiqa", "hle",
+})
+

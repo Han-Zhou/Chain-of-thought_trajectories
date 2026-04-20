@@ -63,7 +63,7 @@ def resolve_ast_by_type(value):
     elif isinstance(value, ast.Tuple):
         output = tuple(resolve_ast_by_type(v) for v in value.elts)
     elif isinstance(value, ast.Lambda):
-        output = eval(ast.unparse(value.body[0].value))
+        output = ast.unparse(value)
     elif isinstance(value, ast.Ellipsis):
         output = "..."
     elif isinstance(value, ast.Subscript):
@@ -631,6 +631,8 @@ def evaluate_bfcl(trajectory: dict) -> dict:
     ground_truth = trajectory.get("ground_truth", [])
     func_description = trajectory.get("func_description", [])
     test_category = trajectory.get("test_category", "simple_python")
+
+    # breakpoint()
 
     # Try to parse model output
     decoded = None

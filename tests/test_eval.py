@@ -168,8 +168,19 @@ class TestEvaluateOne:
     def test_hotpotqa(self):
         traj = {"generated_text": "Reasoning\n\\boxed{Delhi}", "ground_truth": "Delhi"}
         result = evaluate_one(traj, "hotpotqa")
-        assert result["score"] == 1.0
-        assert result["metric"] == "f1"
+        assert isinstance(result["score"], dict)
+        assert "em" in result["score"]
+        assert "f1" in result["score"]
+        assert result["score"]["em"] is True
+        assert result["score"]["f1"] == 1.0
+        assert result["metric"] == "em+f1"
+
+    def test_hotpotqa_partial(self):
+        traj = {"generated_text": "Reasoning\n\\boxed{University of Oxford}", "ground_truth": "University of Oxford, England"}
+        result = evaluate_one(traj, "hotpotqa")
+        assert isinstance(result["score"], dict)
+        assert result["score"]["em"] is False
+        assert 0 < result["score"]["f1"] < 1.0
 
     def test_math500_plain(self):
         traj = {"generated_text": "reasoning\n\\boxed{42}", "ground_truth": "42"}
@@ -182,7 +193,7 @@ class TestEvaluateOne:
         assert set(EVAL_REGISTRY.keys()) == expected
 
     def test_unsupported_set(self):
-        assert UNSUPPORTED == {"cs1qa"}
+        assert UNSUPPORTED == set()
 
 
 # ===================================================================

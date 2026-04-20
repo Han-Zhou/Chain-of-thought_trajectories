@@ -4,6 +4,7 @@ Maps each supported dataset to its (extractor, comparator, metric_name) tuple
 and provides `evaluate_one()` for single-trajectory evaluation.
 """
 
+import re
 import warnings
 
 from eval.extractors import extract_mcq_letter, extract_text_answer, extract_boxed_or_text
@@ -16,6 +17,7 @@ from eval.comparators import (
 from eval.bfcl_eval import evaluate_bfcl
 from eval.codeqa_eval import evaluate_codeqa
 from eval.hle_eval import evaluate_hle
+from eval.cs1qa_eval import evaluate_cs1qa_type, evaluate_cs1qa_span, evaluate_cs1qa_answer
 
 
 # (extractor_fn, comparator_fn, metric_name)
@@ -24,12 +26,22 @@ EVAL_REGISTRY = {
     "college_math":     (extract_boxed_or_text, math_equal,            "accuracy"),
     "bigbench_causal":  (extract_text_answer,   exact_match,           "accuracy"),
     "bigbench_movie":   (extract_mcq_letter,    exact_match,           "accuracy"),
-    "hotpotqa":         (extract_text_answer,   qa_f1_score,           "f1"),
+    "hotpotqa":         (extract_text_answer,   qa_f1_score,           "em+f1"),
     "math500":          (extract_boxed_or_text, math_equal,            "accuracy"),
     "olympiadbench":    (extract_boxed_or_text, math_equal,            "accuracy"),
 }
 
-UNSUPPORTED = {"cs1qa"}
+UNSUPPORTED: set[str] = set()
+
+
+def evaluate_hotpotqa_dual(prediction: str, reference: str) -> dict:
+    """Evaluate HotpotQA with both exact match and F1 score.
+
+    Returns a dict with 'em' (bool) and 'f1' (float) keys.
+    """
+    em = normalized_text_match(prediction, reference)
+    f1 = qa_f1_score(prediction, reference)
+    return {"em": em, "f1": f1}
 
 
 def evaluate_one(trajectory: dict, dataset_name: str) -> dict | None:
@@ -61,6 +73,14 @@ def evaluate_one(trajectory: dict, dataset_name: str) -> dict | None:
     if dataset_name == "hle":
         return evaluate_hle(trajectory)
 
+    # CS1QA subtasks
+    if dataset_name == "cs1qa_type":
+        return evaluate_cs1qa_type(trajectory)
+    if dataset_name == "cs1qa_span":
+        return evaluate_cs1qa_span(trajectory)
+    if dataset_name == "cs1qa_answer":
+        return evaluate_cs1qa_answer(trajectory)
+
     if dataset_name not in EVAL_REGISTRY:
         warnings.warn(f"Dataset '{dataset_name}' not found in evaluation registry. Skipping.")
         return None
@@ -70,8 +90,16 @@ def evaluate_one(trajectory: dict, dataset_name: str) -> dict | None:
     generated_text = trajectory.get("generated_text", "")
     ground_truth = trajectory.get("ground_truth", "")
 
-    # Extract prediction from model output
-    prediction = extractor(generated_text)
+    # Normalize MCQ ground truth: strip surrounding parens/brackets so "(C)" -> "C"
+    # to match the extractor output format
+    if extractor is extract_mcq_letter:
+        gt_stripped = str(ground_truth).strip()
+        m = re.match(r"[\(\[]?\s*([A-Fa-f])\s*[\)\]]?$", gt_stripped)
+        if m:
+            ground_truth = m.group(1).upper()
+
+    # prediction = trajectory.get("prediction") or extractor(generated_text)
+    prediction = trajectory.get("prediction")
 
     if prediction is None:
         return {
@@ -80,6 +108,17 @@ def evaluate_one(trajectory: dict, dataset_name: str) -> dict | None:
             "score": 0.0,
             "metric": metric,
             "extraction_failed": True,
+        }
+
+    # Special case: HotpotQA with both EM and F1
+    if dataset_name == "hotpotqa":
+        dual_result = evaluate_hotpotqa_dual(prediction, str(ground_truth))
+        return {
+            "prediction": prediction,
+            "ground_truth": ground_truth,
+            "score": dual_result,  # dict with 'em' and 'f1'
+            "metric": metric,
+            "extraction_failed": False,
         }
 
     # Special case: OlympiadBench multi-answer (ground_truth joined by "; ")

@@ -12,21 +12,26 @@ from dataloader import load_dataset
 
 # Datasets supported by the eval registry (from i28_eval-changes.md)
 DATASETS = [
-    "logiqa",
-    "college_math",
-    "bigbench_causal",
-    "bigbench_movie",
-    "hotpotqa",
-    "math500",
-    "olympiadbench",
+    # "logiqa",
+    # "college_math",
+    # "bigbench_causal",
+    # "bigbench_movie",
+    # "hotpotqa",
+    # "math500",
+    # "olympiadbench",
+    # "bfcl",
+    "hle",
 ]
 
 MAX_SIZE = 1000
-SUBSET_SIZE = 500
+SUBSET_SIZE = 1000
 SEED = 42
 
 
 def dump_dataset(name: str, out_dir: str):
+
+    out_dir = "/storage/backup/han/cot/pickles"
+
     dataset = load_dataset(name)
     entries = [dataset[i] for i in range(len(dataset))]
     total = len(entries)

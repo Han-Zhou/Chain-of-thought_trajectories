@@ -1,7 +1,15 @@
 
 import pathlib
 import json
-from prompts.cot_prompt import PROMPT_REGISTRY
+from prompts.cot_prompt import (
+    PROMPT_REGISTRY,
+    DATASET_ANSWER_FORMAT,
+    SYSTEM,
+    SYSTEM_WITHOUT_BOXED,
+    SYSTEM_COT_ONLY,
+    SYSTEM_QWEN_THINKING,
+)
+from utils.model_utils import is_llama_model_name
 from prompts.few_shot_prompt import FEW_SHOT_PROMPT_REGISTRY, THINKING_TOKENS
 
 # Canonical dataset names supported by the registry.
@@ -114,11 +122,10 @@ def _build_messages(
 
 
 _SUPPORTED_MESSAGE_DATASETS = {
-    "logiqa", "hle",
+    "logiqa", "hle", "bfcl",
     "cs1qa_type", "cs1qa_span", "cs1qa_answer",
     "college_math", "bigbench_causal", "bigbench_movie",
     "hotpotqa", "math500", "olympiadbench",
-    "bigbench_movie_nobox",
 }
 
 
@@ -126,10 +133,10 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
     if dataset not in _SUPPORTED_MESSAGE_DATASETS:
         raise NotImplementedError(f"Message loading not implemented for dataset '{dataset}'.")
 
+    is_llama = is_llama_model_name(model_name)
+
     # college_math uses a different registry key than its dataset name
     registry_key = "college_math_test" if dataset == "college_math" else dataset
-    if experimental_extra_box:
-        registry_key = "bigbench_movie_nobox"
     prompt_parts = load_prompt_from_registry(registry_key)
 
     if dataset == "logiqa":
@@ -148,6 +155,12 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
         code = entry.get("context") or entry.get("code") or ""
         user_prompt = user_template.format(question=entry["question"], code=code)
 
+    elif dataset == "bfcl":
+        # breakpoint()
+        system_prompt, user_template, assistant_start = prompt_parts
+        functions_str = json.dumps(entry['metadata']['functions'], indent=2)
+        user_prompt = user_template.format(question=entry["question"], functions=functions_str)
+
     else:
         # Default path: covers hle, college_math, hotpotqa, bigbench_causal,
         # bigbench_movie, math500, olympiadbench, and any future simple datasets.
@@ -161,8 +174,24 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
             choices_text = "\n".join(entry["choices"])
             user_prompt += f"\n\nAnswer Choices:\n{choices_text}"
 
+    # Swap system prompt to remove \boxed instruction for extra-box mode
+    if experimental_extra_box:
+        system_prompt = system_prompt.replace(SYSTEM, SYSTEM_WITHOUT_BOXED)
+
+    # Swap system prompt for Qwen + thinking
+    if thinking and "qwen" in model_name.lower():
+        system_prompt = system_prompt.replace(SYSTEM, SYSTEM_QWEN_THINKING)
+
+    # Append dataset-specific answer-format instruction
+    answer_format = DATASET_ANSWER_FORMAT.get(registry_key)
+    if answer_format:
+        system_prompt += "\n\n" + answer_format
+
+    # Append COT-only instruction for extra-box mode
+    if experimental_extra_box:
+        system_prompt += "\n\n" + SYSTEM_COT_ONLY
+
     return _build_messages(
         system_prompt, user_prompt, assistant_start,
         model_name, thinking, prompt_type, few_shot, registry_key,
     )
-

@@ -11,19 +11,28 @@ using 'Step i:' markers, then emit a clearly delimited final answer.
 
 SYSTEM = (
     "You are an expert reasoning assistant. "
-    "For every problem you receive, think carefully and reason step-by-step "
-    "before giving your final answer. "
+    "For every problem you receive, think carefully and reason step-by-step. "
     "Label each reasoning step as 'Step 1:', 'Step 2:', etc. "
     "After all steps, write your final answer on a new line in "
     "\\boxed{your answer} format. You must double-escape all LaTeX backslashes. For example, output \\boxed instead of \boxed."
     "Keep your reasoning concise, and be brief in each step."
 )
 
+SYSTEM_QWEN_THINKING = (
+    "You are an expert reasoning assistant. "
+    "For every problem you receive, think carefully and reason step-by-step between <think> and </think>. "
+    "Label each reasoning step between <think> and </think> as 'Step 1:', 'Step 2:', etc. "
+    "After all steps, write your final answer on a new line in "
+    "\\boxed{your answer} format. You must double-escape all LaTeX backslashes. For example, output \\boxed instead of \boxed."
+    "Keep your reasoning concise, and be brief in each step."
+)
+
+
+
 
 SYSTEM_WITHOUT_BOXED = (
     "You are an expert reasoning assistant. "
-    "For every problem you receive, think carefully and reason step-by-step "
-    "before giving your final answer. "
+    "For every problem you receive, think carefully and reason step-by-step. "
     "Label each reasoning step as 'Step 1:', 'Step 2:', etc. "
     "Keep your reasoning concise, and be brief in each step."
 )
@@ -34,6 +43,39 @@ SYSTEM_WITHOUT_BOXED = (
 ASSISTANT_START = """{thinking_token_open}Let's think step-by-step.\nStep 1: """
 # ASSISTANT_START = """<think>\nLet's think step-by-step.\nStep 1: """
 # ASSISTANT_START = ""
+
+
+
+SYSTEM_MCQ = (
+    "When you output the final answer, output ONLY the single letter corresponding to the correct answer. Do not include periods, explanations, or any other text."
+)
+
+SYSTEM_COT_ONLY = (
+    "During your reasoning, do NOT reveal, hint at, or restate the final answer. "
+    "Do not write lines like 'Answer:', 'Final answer:', any answer strings, or any concluding sentence. "
+    "Stop immediately after your last numbered reasoning step."
+)
+
+SYSTEM_BFCL = (
+    "When you output the final answer, output ONLY the function call(s) in the format "
+    "[func_name(param=value, ...)] with no other text."
+)
+
+SYSTEM_MATH = (
+    "When you output the final answer, output ONLY the exact numerical or symbolic answer. "
+    "Do not include units or explanations."
+)
+
+SYSTEM_BINARY = (
+    "When you output the final answer, output ONLY 'Yes' or 'No'. "
+    "Do not include periods, explanations, or any other text."
+)
+
+SYSTEM_OTHER = (
+    "When you output the final answer, output ONLY the answer as a short string. "
+    "Do not include explanations or any other text."
+)
+
 
 
 # ---------------------------------------------------------------------------
@@ -78,19 +120,13 @@ At each turn, you should try your best to complete the tasks requested by the us
 
 Here is a list of functions in json format that you can invoke.
 {functions}
+
+Question:
+{question}
 """
 
 # --- BigBench Movie Recommendation -----------------------------------------
 BIGBENCH_MOVIE = """\
-{question}
-
-Think carefully about the movies listed and the options provided. Reason \
-step-by-step before choosing the best answer.
-
-\\boxed{{your answer}}
-"""
-
-BIGBENCH_MOVIE_WITHOUT_BOXED = """\
 {question}
 
 Think carefully about the movies listed and the options provided. Reason \
@@ -104,15 +140,13 @@ BIGBENCH_CAUSAL = """\
 {question}
 
 Reason through the causal relationships step-by-step before answering.
-
-\\boxed{{Yes or No}}
 """
 
 # --- LogiQA ----------------------------------------------------------------
 LOGIQIA = """\
 You are an expert in logical reasoning.
 
-Reason step-by-step through the logical relationships before selecting an answer. Put your answer in \\boxed{} with exactly one letter: A, B, C, or D.
+Reason step-by-step through the logical relationships before selecting an answer.
 """
 
 LOGIQIA_experimental_system = """\
@@ -127,7 +161,7 @@ Question:
 Options:
 {options}
 
-Reason step-by-step through the logical relationships before selecting an answer. Put your answer in \\boxed{} with exactly one letter: A, B, C, or D.
+Reason step-by-step through the logical relationships before selecting an answer.
 """
 
 # --- CodeQA ----------------------------------------------------------------
@@ -142,8 +176,6 @@ Question:
 {question}
 
 Analyze the code step-by-step and answer the question accurately.
-
-\\boxed{your answer}
 """
 
 # --- CS1QA -----------------------------------------------------------------
@@ -161,7 +193,6 @@ Step 2: Recall the relevant rules or definitions.
 Step 3: Apply those rules to the specific scenario in the question.
 Step 4: Arrive at the correct answer and explain it clearly.
 
-\\boxed{your answer}
 """
 
 # --- CS1QA Type Classification ---------------------------------------------
@@ -228,8 +259,6 @@ Question:
 {question}
 
 Answer the question by reasoning step-by-step.
-
-\\boxed{{your answer}}
 """
 
 # --- College Math Test -----------------------------------------------------
@@ -237,8 +266,6 @@ COLLEGE_MATH = """\
 Question: {question}
 
 Solve the problem step-by-step, showing all work clearly.
-
-\\boxed{{exact answer}}
 """
 
 # --- OlympiadBench ---------------------------------------------------------
@@ -246,8 +273,6 @@ OLYMPIADBENCH = """\
 Question: {question}
 
 Approach the problem rigorously and creatively, step-by-step.
-
-\\boxed{{exact answer or proof conclusion}}
 """
 
 # --- Math500 ---------------------------------------------------------------
@@ -255,8 +280,6 @@ MATH500 = """\
 Question: {question}
 
 Solve step-by-step, showing all reasoning clearly.
-
-\\boxed{{exact answer in simplified form}}
 """
 
 # --- HLE (Humanity's Last Exam) --------------------------------------------
@@ -266,8 +289,6 @@ Question:
 
 This is a highly challenging question that may require deep, multi-domain \
 reasoning. Think carefully and systematically.
-
-\\boxed{your answer}
 """
 
 # ---------------------------------------------------------------------------
@@ -290,5 +311,16 @@ PROMPT_REGISTRY: dict[str, tuple[str, str, str]] = {
     "olympiadbench":        (SYSTEM, OLYMPIADBENCH, ASSISTANT_START),
     "math500":              (SYSTEM, MATH500, ASSISTANT_START),
     "hle":                  (SYSTEM, HLE, ASSISTANT_START),
-    "bigbench_movie_nobox": (SYSTEM_WITHOUT_BOXED, BIGBENCH_MOVIE_WITHOUT_BOXED, ASSISTANT_START),
+}
+
+DATASET_ANSWER_FORMAT: dict[str, str] = {
+    "bfcl":              SYSTEM_BFCL,
+    "bigbench_movie":    SYSTEM_MCQ,
+    "bigbench_causal":   SYSTEM_BINARY,
+    "logiqa":            SYSTEM_MCQ,
+    "college_math":      SYSTEM_MATH,
+    "college_math_test": SYSTEM_MATH,
+    "math500":           SYSTEM_MATH,
+    "olympiadbench":     SYSTEM_MATH,
+    "hotpotqa":          SYSTEM_OTHER,
 }

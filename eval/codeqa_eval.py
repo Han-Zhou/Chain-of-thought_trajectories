@@ -1,15 +1,19 @@
-"""CodeQA evaluation: 6 metrics (EM, BLEU-4, ROUGE-L, Precision, Recall, F1).
+"""CodeQA evaluation: 7 metrics (EM, BLEU-4, ROUGE-L, METEOR, Precision, Recall, F1).
 
 Ported from codeqa/codeBERT/code/eval/ and run.py.
 - BLEU: Google's smoothed BLEU (average of per-sentence scores)
 - ROUGE-L: LCS-based F-score with beta=1.2
+- METEOR: Java subprocess wrapper around meteor-1.5.jar
 - Token-level: Precision, Recall, F1 via Counter intersection
 - EM: exact match after normalization
 """
 
 import collections
 import math
+import statistics
 from collections import Counter
+
+from eval.meteor import compute_meteor_score
 
 
 def normalize_answer(s: str) -> str:
@@ -195,21 +199,23 @@ def evaluate_codeqa(trajectory: dict) -> dict:
     Returns:
         dict with prediction, ground_truth, score (F1 0-1), metric, scores dict, extraction_failed
     """
-    generated_text = trajectory.get("generated_text", "")
+    generated_text = str(trajectory.get("generated_text", "") or "")
     ground_truth = trajectory.get("ground_truth", "")
 
     # Handle ground_truth as str or list
     ground_truths = ground_truth if isinstance(ground_truth, list) else [ground_truth]
+    ground_truths = [str(gt) for gt in ground_truths]
 
     # Prediction is the full normalized text (no extraction)
     prediction = normalize_answer(generated_text)
+    normalized_ground_truths = [normalize_answer(gt) for gt in ground_truths]
 
     # Compute best scores across all ground truths
     em, precision, recall, f1 = _best_score(prediction, ground_truths)
 
     # BLEU: average of per-sentence smoothed BLEU
     # Normalize all ground truths and split into tokens
-    gt_token_lists = [normalize_answer(gt).split() for gt in ground_truths]
+    gt_token_lists = [gt.split() for gt in normalized_ground_truths]
     pred_tokens = prediction.split()
     bleu = _compute_bleu_sentence(gt_token_lists, pred_tokens, max_order=4, smooth=True)
 
@@ -217,15 +223,15 @@ def evaluate_codeqa(trajectory: dict) -> dict:
     # Find which reference gave best F1
     best_gt_idx = 0
     best_f1_check = 0.0
-    for i, gt in enumerate(ground_truths):
-        norm_gt = normalize_answer(gt)
-        _, _, f1_check = _f1_score(prediction.split(), norm_gt.split())
+    for i, norm_gt in enumerate(normalized_ground_truths):
+        _, _, f1_check = _f1_score(pred_tokens, norm_gt.split())
         if f1_check > best_f1_check:
             best_f1_check = f1_check
             best_gt_idx = i
 
-    best_ref_tokens = normalize_answer(ground_truths[best_gt_idx]).split()
+    best_ref_tokens = normalized_ground_truths[best_gt_idx].split()
     rouge_l = _rouge_l_sentence(pred_tokens, best_ref_tokens, beta=1.2)
+    meteor = compute_meteor_score(prediction, normalized_ground_truths)
 
     return {
         "prediction": prediction,
@@ -236,9 +242,24 @@ def evaluate_codeqa(trajectory: dict) -> dict:
             "em":        round(em * 100, 4),
             "bleu":      round(bleu * 100, 4),
             "rouge_l":   round(rouge_l * 100, 4),
+            "meteor":    round(meteor * 100, 4),
             "precision": round(precision * 100, 4),
             "recall":    round(recall * 100, 4),
             "f1":        round(f1 * 100, 4),
         },
         "extraction_failed": False,
     }
+
+
+def compute_codeqa_metrics(results: list[dict]) -> dict:
+    """Compute aggregate CodeQA metrics from per-trajectory scores."""
+    metric_names = ("em", "bleu", "rouge_l", "meteor", "precision", "recall", "f1")
+    metrics = {}
+    for metric_name in metric_names:
+        values = [
+            scores[metric_name]
+            for result in results
+            if (scores := result.get("scores")) and scores.get(metric_name) is not None
+        ]
+        metrics[f"{metric_name}_mean"] = round(float(statistics.mean(values)), 4) if values else None
+    return metrics

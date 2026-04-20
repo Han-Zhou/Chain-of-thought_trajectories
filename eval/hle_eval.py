@@ -6,6 +6,7 @@ and adapted to this repo's per-trajectory / batch-evaluation interfaces.
 
 import asyncio
 import math
+import os
 from typing import Literal
 
 import numpy as np
@@ -20,6 +21,8 @@ JUDGE_MAX_COMPLETION_TOKENS = 4096
 CALIBRATION_BETA = 100
 CI_Z_SCORE = 1.96
 
+
+# The exact prompt as in the original repo
 JUDGE_PROMPT = """Judge whether the following [response] to [question] is correct or not based on the precise and unambiguous [correct_answer] below.
 
 [question]: {question}
@@ -47,8 +50,16 @@ class ExtractedAnswer(BaseModel):
     strict: Literal[True]
 
 
-def _get_client() -> AsyncOpenAI:
-    return AsyncOpenAI(timeout=300.0, max_retries=1)
+def _get_client(
+    base_url: str | None = None,
+    api_key: str | None = None,
+) -> AsyncOpenAI:
+    return AsyncOpenAI(
+        base_url=base_url or os.environ.get("OPENAI_BASE_URL"),
+        api_key=api_key or os.environ.get("OPENAI_API_KEY", ""),
+        timeout=300.0,
+        max_retries=1,
+    )
 
 
 async def _judge_response(
@@ -76,12 +87,18 @@ async def _judge_response(
         return None
 
     content = completion.choices[0].message.parsed
+    usage = completion.usage
     return {
         "correct_answer": correct_answer,
         "model_answer": content.extracted_final_answer,
         "reasoning": content.reasoning,
         "correct": content.correct,
         "confidence": content.confidence,
+        "usage": {
+            "prompt_tokens": usage.prompt_tokens if usage else 0,
+            "completion_tokens": usage.completion_tokens if usage else 0,
+            "total_tokens": usage.total_tokens if usage else 0,
+        },
     }
 
 
@@ -200,6 +217,9 @@ def compute_hle_metrics(results: list[dict], total_questions: int) -> dict:
     confidence = []
     extraction_failures = 0
     judge_failures = 0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_tokens = 0
 
     for result in results:
         if result.get("extraction_failed"):
@@ -210,6 +230,10 @@ def compute_hle_metrics(results: list[dict], total_questions: int) -> dict:
             continue
         correct.append(judge_response["correct"] == "yes")
         confidence.append(judge_response["confidence"] / 100)
+        usage = judge_response.get("usage", {})
+        total_prompt_tokens += usage.get("prompt_tokens", 0)
+        total_completion_tokens += usage.get("completion_tokens", 0)
+        total_tokens += usage.get("total_tokens", 0)
 
     correct_arr = np.array(correct, dtype=float)
     confidence_arr = np.array(confidence, dtype=float)
@@ -228,6 +252,9 @@ def compute_hle_metrics(results: list[dict], total_questions: int) -> dict:
         "accuracy": accuracy,
         "confidence_interval_95": ci,
         "calibration_error": calibration_error,
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_completion_tokens": total_completion_tokens,
+        "total_tokens": total_tokens,
     }
 
 

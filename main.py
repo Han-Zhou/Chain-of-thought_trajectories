@@ -106,6 +106,18 @@ def parse():
         help="Maximum number of new tokens to generate for each prompt."
     )
     args.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for generation. 0.0 = greedy decoding.",
+    )
+    args.add_argument(
+        "--nb_cot_samples",
+        type=int,
+        default=1,
+        help="Number of CoT samples per datapoint. Requires temperature > 0 for diversity.",
+    )
+    args.add_argument(
         "--thinking",
         action="store_true",
         default=False,
@@ -181,7 +193,7 @@ def parse():
         help=(
             "Two-phase generation: generate without \\boxed instruction, then "
             "append '\\nTherefore the answer is \\boxed{' and generate the answer "
-            "with stop string '}'. Only supported for bigbench_movie."
+            "with stop string '}'. Supported for all datasets except cs1qa, codeqa, and hle."
         ),
     )
     args.add_argument(
@@ -191,6 +203,16 @@ def parse():
         help=(
             "Confidence-only prompt modification mode. Supported values: "
             "'no-cots' and 'gibberish'."
+        ),
+    )
+    args.add_argument(
+        "--save_cots",
+        action="store_true",
+        default=False,
+        help=(
+            "Save complete generation trajectory and all inputs needed for "
+            "compute_all_confidence_scores as a per-sample pickle file "
+            "(cot_{i}.pkl). Allows deferred confidence scoring without re-running generation."
         ),
     )
     args.add_argument(
@@ -212,7 +234,7 @@ def parse():
 
 
 
-def generate_continuation(llm, messages, max_new_tokens, suffix="\nTherefore the answer is \\boxed{", stop_strings=None):
+def generate_continuation(llm, messages, max_new_tokens, temperature=0.0, suffix="\nTherefore the answer is \\boxed{", stop_strings=None):
     """Two-phase generation: free generation, then forced continuation with suffix.
 
     Returns (gen, assistant_prefill, full_generated_text) matching the
@@ -227,6 +249,7 @@ def generate_continuation(llm, messages, max_new_tokens, suffix="\nTherefore the
     gen1 = llm.generate_one(
         messages,
         max_new_tokens=max_new_tokens,
+        temperature=temperature,
         has_assistant_prefill=has_assistant_prefill,
         stop_strings=phase1_stop,
     )
@@ -243,17 +266,30 @@ def generate_continuation(llm, messages, max_new_tokens, suffix="\nTherefore the
     gen1.generated_text = clean_phase1_generated_text(llm.model_name, gen1.generated_text, phase1_stop)
     phase1_text = assistant_prefill + gen1.generated_text
 
-    # Phase 2: use raw generation to avoid re-applying chat template
+    # Phase 2: generate without stop string, then trim to matching brace
     # (which would reformat the completed think block and break continue_final_message)
     phase2_prompt = gen1.prompt_text + gen1.generated_text + suffix
-    gen2 = llm.generate_raw(phase2_prompt, max_new_tokens=200, stop_strings=stop_strings)
+    gen2 = llm.generate_raw(phase2_prompt, max_new_tokens=200, temperature=temperature, stop_strings=[])
 
-    full_generated_text = phase1_text + suffix + gen2.generated_text
-    gen2.generated_text = gen1.generated_text + suffix + gen2.generated_text
+    # Find matching closing brace to handle answers containing "}"
+    # Start at depth=1 since suffix already opened the \boxed{ brace
+    depth = 1
+    answer_text = gen2.generated_text
+    for i, char in enumerate(gen2.generated_text):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                answer_text = gen2.generated_text[:i + 1]
+                break
+
+    full_generated_text = phase1_text + suffix + answer_text
+    gen2.generated_text = gen1.generated_text + suffix + answer_text
     return gen2, assistant_prefill, full_generated_text
 
 
-def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=None, discord=False, nb_dropout_samples=3, experimental_extra_box=False, experimental_modification=None, experimental_grid=False):
+def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=None, discord=False, nb_dropout_samples=3, experimental_extra_box=False, experimental_modification=None, experimental_grid=False, tag=None, cot_dir=None, temperature=0.0, nb_cot_samples=1):
 
     debug_dir = "debug_cache"
 
@@ -277,217 +313,280 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
     errors = []
 
     progress = tqdm_discord if discord else tqdm
-    for i, entry in enumerate(progress(dataloader, desc="Generating", unit="sample")):
+    desc = f"Generating [{tag}]" if tag else "Generating"
+    for i, entry in enumerate(progress(dataloader, desc=desc, unit="sample")):
         logger.info(f"Generating {i}/{len(dataloader)}")
         t0 = time.time()
 
         try:
             if debug:
                 gen, parsed, assistant_prefill, full_generated_text, messages = cached_entries[i]
+                nb_samples_for_entry = 1
             else:
                 messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type, experimental_extra_box=experimental_extra_box)
-                if experimental_extra_box:
-                    gen, assistant_prefill, full_generated_text = generate_continuation(llm, messages, max_new_tokens)
-                else:
-                    has_assistant_prefill = messages[-1]["role"] == "assistant"
-                    
-                    # breakpoint()
+                nb_samples_for_entry = nb_cot_samples
 
-                    gen: GenerationResult = llm.generate_one(messages, max_new_tokens=max_new_tokens, output_scores=False, has_assistant_prefill=has_assistant_prefill)
-                    assistant_prefill = messages[-1]["content"] if messages[-1]["role"] == "assistant" else ""
-                    full_generated_text = assistant_prefill + gen.generated_text
+            for sample_idx in range(nb_samples_for_entry):
+              try:
+                t_sample = time.time()
 
-                # For type 2 the model generates freely and may wrap reasoning in
-                # <think>...</think>.  CoT steps are extracted from *inside* the
-                # think block, while the answer is extracted from the text *after*
-                # </think>.  We then shift all character offsets back so they are
-                # relative to full_generated_text (which confidence.py indexes into).
-                if prompt_type == 2:
-                    think_match = re.search(r"<think>(.*?)</think>(.*)", full_generated_text, re.DOTALL)
-                    if think_match:
-                        # Parse CoT steps from inside <think>...</think>
-                        think_content = think_match.group(1).strip()
-                        parsed_cot: ParsedOutput = parse_output(
-                            think_content,
-                            extra_box_suffix=None,
-                            llama_answer_cleanup=is_llama,
-                        )
-
-                        # Parse answer from text after </think>
-                        post_think_content = think_match.group(2).strip()
-                        post_think_group_start = think_match.start(2)  # where group(2) starts in full_generated_text
-
-                        # Adjust for whitespace stripping
-                        # think_match.group(2) includes leading whitespace, but we stripped it
-                        # So we need to find where the stripped content actually starts
-                        post_think_actual_start = full_generated_text.find(post_think_content, post_think_group_start)
-                        if post_think_actual_start == -1:
-                            # Fallback if we can't find it (shouldn't happen)
-                            post_think_actual_start = post_think_group_start
-
-                        extra_box_suffix = "\nTherefore the answer is \\boxed{" if experimental_extra_box else None
-                        parsed_answer: ParsedOutput = parse_output(
-                            post_think_content,
-                            extra_box_suffix=extra_box_suffix,
-                            llama_answer_cleanup=is_llama,
-                        )
-
-                        # Merge: take CoT steps from think block, answer from post-think
-                        parsed = ParsedOutput(
-                            cot_steps=parsed_cot.cot_steps,
-                            final_answer=parsed_answer.final_answer,
-                            raw_cot_block=parsed_cot.raw_cot_block,
-                            answer_fullstring_start=None,
-                            answer_start=None,
-                            answer_sentence_start=None,
-                        )
-
-                        # Shift answer offsets to full_generated_text coordinates
-                        if parsed_answer.answer_fullstring_start is not None:
-                            parsed.answer_fullstring_start = post_think_actual_start + parsed_answer.answer_fullstring_start
-                        if parsed_answer.answer_start is not None:
-                            parsed.answer_start = post_think_actual_start + parsed_answer.answer_start
-                        if parsed_answer.answer_sentence_start is not None:
-                            parsed.answer_sentence_start = post_think_actual_start + parsed_answer.answer_sentence_start
+                if not debug:
+                    if experimental_extra_box:
+                        gen, assistant_prefill, full_generated_text = generate_continuation(llm, messages, max_new_tokens, temperature=temperature)
                     else:
-                        # Fallback: no think block found, parse everything normally
+                        has_assistant_prefill = messages[-1]["role"] == "assistant"
+
+                        gen: GenerationResult = llm.generate_one(messages, max_new_tokens=max_new_tokens, temperature=temperature, output_scores=False, has_assistant_prefill=has_assistant_prefill)
+                        assistant_prefill = messages[-1]["content"] if messages[-1]["role"] == "assistant" else ""
+                        full_generated_text = assistant_prefill + gen.generated_text
+
+                    # For type 2 the model generates freely and may wrap reasoning in
+                    # <think>...</think>.  CoT steps are extracted from *inside* the
+                    # think block, while the answer is extracted from the text *after*
+                    # </think>.  We then shift all character offsets back so they are
+                    # relative to full_generated_text (which confidence.py indexes into).
+                    if prompt_type == 2:
+                        think_match = re.search(r"<think>(.*?)</think>(.*)", full_generated_text, re.DOTALL)
+                        if think_match:
+                            # Parse CoT steps from inside <think>...</think>
+                            think_content = think_match.group(1).strip()
+                            parsed_cot: ParsedOutput = parse_output(
+                                think_content,
+                                extra_box_suffix=None,
+                                llama_answer_cleanup=is_llama,
+                            )
+
+                            # Parse answer from text after </think>
+                            post_think_content = think_match.group(2).strip()
+                            post_think_group_start = think_match.start(2)  # where group(2) starts in full_generated_text
+
+                            # Adjust for whitespace stripping
+                            # think_match.group(2) includes leading whitespace, but we stripped it
+                            # So we need to find where the stripped content actually starts
+                            post_think_actual_start = full_generated_text.find(post_think_content, post_think_group_start)
+                            if post_think_actual_start == -1:
+                                # Fallback if we can't find it (shouldn't happen)
+                                post_think_actual_start = post_think_group_start
+
+                            extra_box_suffix = "\nTherefore the answer is \\boxed{" if experimental_extra_box else None
+                            parsed_answer: ParsedOutput = parse_output(
+                                post_think_content,
+                                extra_box_suffix=extra_box_suffix,
+                                llama_answer_cleanup=is_llama,
+                            )
+
+                            # Merge: take CoT steps from think block, answer from post-think
+                            parsed = ParsedOutput(
+                                cot_steps=parsed_cot.cot_steps,
+                                final_answer=parsed_answer.final_answer,
+                                raw_cot_block=parsed_cot.raw_cot_block,
+                                answer_fullstring_start=None,
+                                answer_start=None,
+                                answer_sentence_start=None,
+                            )
+
+                            # Shift answer offsets to full_generated_text coordinates
+                            if parsed_answer.answer_fullstring_start is not None:
+                                parsed.answer_fullstring_start = post_think_actual_start + parsed_answer.answer_fullstring_start
+                            if parsed_answer.answer_start is not None:
+                                parsed.answer_start = post_think_actual_start + parsed_answer.answer_start
+                            if parsed_answer.answer_sentence_start is not None:
+                                parsed.answer_sentence_start = post_think_actual_start + parsed_answer.answer_sentence_start
+                        else:
+                            # Fallback: no think block found, parse everything normally
+                            extra_box_suffix = "\nTherefore the answer is \\boxed{" if experimental_extra_box else None
+                            parsed: ParsedOutput = parse_output(
+                                full_generated_text,
+                                extra_box_suffix=extra_box_suffix,
+                                llama_answer_cleanup=is_llama,
+                            )
+                    else:
                         extra_box_suffix = "\nTherefore the answer is \\boxed{" if experimental_extra_box else None
                         parsed: ParsedOutput = parse_output(
                             full_generated_text,
                             extra_box_suffix=extra_box_suffix,
                             llama_answer_cleanup=is_llama,
                         )
+                    entries_to_save.append((gen, parsed, assistant_prefill, full_generated_text, messages))
+
+                if parsed.answer_fullstring_start is not None:
+                    # answer_fullstring_start is an offset into full_generated_text (prefill + new tokens).
+                    # Token positions only count newly generated tokens, so strip the prefill chars first.
+                    generated_prefix = full_generated_text[len(assistant_prefill):parsed.answer_fullstring_start]
+                    prefix_ids = tokenizer(generated_prefix, add_special_tokens=False)["input_ids"]
+                    answer_token_start_position = gen.prompt_end_position + len(prefix_ids)
                 else:
-                    extra_box_suffix = "\nTherefore the answer is \\boxed{" if experimental_extra_box else None
-                    parsed: ParsedOutput = parse_output(
-                        full_generated_text,
-                        extra_box_suffix=extra_box_suffix,
-                        llama_answer_cleanup=is_llama,
-                    )
-                entries_to_save.append((gen, parsed, assistant_prefill, full_generated_text, messages))
+                    answer_token_start_position = None
 
-            if parsed.answer_fullstring_start is not None:
-                # answer_fullstring_start is an offset into full_generated_text (prefill + new tokens).
-                # Token positions only count newly generated tokens, so strip the prefill chars first.
-                generated_prefix = full_generated_text[len(assistant_prefill):parsed.answer_fullstring_start]
-                prefix_ids = tokenizer(generated_prefix, add_special_tokens=False)["input_ids"]
-                answer_token_start_position = gen.prompt_end_position + len(prefix_ids)
-            else:
-                answer_token_start_position = None
-
-            confidence_error = None
-            if confidence and parsed.final_answer:
-                llm.switch_attn_implementation("confidence")
-                try:
+                confidence_error = None
+                if confidence and parsed.final_answer:
+                    llm.switch_attn_implementation("confidence")
                     try:
-                        confidence_score_obj: AllConfidenceData = compute_all_confidence_scores(
-                            llm,
-                            messages,
-                            gen.generated_text,
-                            parsed,
-                            nb_dropout_samples=nb_dropout_samples,
-                            use_fullstring=False,   # whether to apply dropout to the entire "\boxed{...}" string or just the answer tokens
-                            assistant_prefill=assistant_prefill,
-                            debug_conf=debug_conf,
-                            gen_cache=gen.past_key_values,
-                            experimental_jackknife=experimental_jackknife,
-                            experimental_modification=experimental_modification,
-                            experimental_grid=experimental_grid,
-                        )
-                    except ConfidenceAlignmentError as exc:
-                        confidence_error = str(exc)
-                        logger.warning(
-                            "Confidence scoring skipped for entry %s due to step-alignment failure: %s",
-                            entry["id"],
-                            exc,
-                        )
-                        confidence_score = None
-                        debug_info = {"confidence_error": confidence_error} if debug_conf else None
-                    else:
-                        debug_info = confidence_score_obj.debug_info if debug_conf else None
-                        if debug_info is not None and confidence_error is not None:
-                            debug_info = copy.deepcopy(debug_info)
-                            debug_info["confidence_error"] = confidence_error
-                        confidence_score = asdict(confidence_score_obj)
-                        confidence_score.pop("debug_info", None)
-                finally:
-                    # Always reset to "cot" mode, even if compute_all_confidence_scores throws
-                    llm.switch_attn_implementation("cot")
-            else:
-                confidence_score = None
-                debug_info = None
-
-            # Free KV cache — only needed for confidence scoring above.
-            # Prevents N caches from accumulating in the trajectories list.
-            del gen.past_key_values
-            gen.past_key_values = None
-            torch.cuda.empty_cache()
-
-            #  - id — the unique identifier from the dataset entry (e.g., a BFCL question ID)
-            #   - question — the raw question text from the dataset
-            #   - ground_truth — the expected correct answer from the dataset, used for evaluation
-            #   - cot_steps — the parsed chain-of-thought steps (e.g., "Step 1: ...", "Step 2: ...") extracted from the model's output by parse_output()
-            #   - raw_cot_block — the full unparsed reasoning block as a single string (everything before "\boxed{}")
-            #   - final_answer — the model's extracted final answer (the content inside "\boxed{...}")
-            #   - generated_text — the complete raw output including the assistant prefill + all generated tokens, before any parsing
-            #   - prompt_end_position — the number of tokens in the prompt (i.e., the index where generation starts). Useful for indexing into scores/cache
-            #   - generated_end_position — the total sequence length (prompt + generated). So generated_end_position - prompt_end_position = number of new
-            #   tokens
-            #   - answer_token_start_position — the absolute token position where the "\boxed{...}" content begins. This is the boundary between CoT and answer tokens
-            #   — critical for computing confidence only over the answer portion
-            #   - confidence_metric — which confidence method was used (e.g., the string passed via --confidence), or None if confidence wasn't computed
-            #   - confidence_score — the computed confidence value for the answer tokens using the specified metric, or None
-            #   - past_key_values — the KV cache from generation (a DynamicCache object). This gets popped out and saved as a separate .pt file at write time
-            #   (main.py:298) so you can resume/branch generation later without recomputing the prompt
-            # HLE correctness is determined later via an async LLM judge, not inline.
-            if dataset_name == "hle":
-                eval_result = None
-                correct = None
-            else:
-                eval_result = evaluate_one({
-                    "generated_text": full_generated_text,
-                    "ground_truth": entry["answer"],
-                    "prediction": parsed.final_answer,
-                }, dataset_name)
-
-                if eval_result:
-                    # For hotpotqa, score is a dict with 'em' and 'f1'
-                    if isinstance(eval_result["score"], dict):
-                        correct = eval_result["score"]
-                    else:
-                        # For other datasets, score is a float/bool
-                        correct = eval_result["score"] == 1.0
+                        try:
+                            confidence_score_obj: AllConfidenceData = compute_all_confidence_scores(
+                                llm,
+                                messages,
+                                gen.generated_text,
+                                parsed,
+                                nb_dropout_samples=nb_dropout_samples,
+                                use_fullstring=False,   # whether to apply dropout to the entire "\boxed{...}" string or just the answer tokens
+                                assistant_prefill=assistant_prefill,
+                                debug_conf=debug_conf,
+                                gen_cache=gen.past_key_values,
+                                experimental_jackknife=experimental_jackknife,
+                                experimental_modification=experimental_modification,
+                                experimental_grid=experimental_grid,
+                            )
+                        except ConfidenceAlignmentError as exc:
+                            confidence_error = str(exc)
+                            logger.warning(
+                                "Confidence scoring skipped for entry %s due to step-alignment failure: %s",
+                                entry["id"],
+                                exc,
+                            )
+                            confidence_score = None
+                            debug_info = {"confidence_error": confidence_error} if debug_conf else None
+                        else:
+                            debug_info = confidence_score_obj.debug_info if debug_conf else None
+                            if debug_info is not None and confidence_error is not None:
+                                debug_info = copy.deepcopy(debug_info)
+                                debug_info["confidence_error"] = confidence_error
+                            confidence_score = asdict(confidence_score_obj)
+                            confidence_score.pop("debug_info", None)
+                    finally:
+                        # Always reset to "cot" mode, even if compute_all_confidence_scores throws
+                        llm.switch_attn_implementation("cot")
                 else:
+                    confidence_score = None
+                    debug_info = None
+
+                # Save generation trajectory and confidence inputs for deferred scoring
+                if cot_dir:
+                    cot_data = {
+                        # Complete generation trajectory
+                        "messages": messages,
+                        "prompt_text": gen.prompt_text,
+                        "generated_text": gen.generated_text,
+                        "full_generated_text": full_generated_text,
+                        "assistant_prefill": assistant_prefill,
+                        "prompt_end_position": gen.prompt_end_position,
+                        "generated_end_position": gen.generated_end_position,
+                        "parsed_output": parsed,
+                        "entry": {"id": entry["id"], "question": entry["question"], "answer": entry["answer"]},
+                        # All inputs for compute_all_confidence_scores (except llm)
+                        "confidence_info": {
+                            "generated_text": gen.generated_text,
+                            "parsed_output": parsed,
+                            "assistant_prefill": assistant_prefill,
+                            "gen_cache": gen.past_key_values,
+                            "messages": messages,
+                        },
+                    }
+                    if nb_cot_samples > 1:
+                        cot_file = os.path.join(cot_dir, f"cot_{i}_sample_{sample_idx}.pkl")
+                    else:
+                        cot_file = os.path.join(cot_dir, f"cot_{i}.pkl")
+                    with open(cot_file, "wb") as f:
+                        pickle.dump(cot_data, f)
+
+                # Free KV cache — only needed for confidence scoring above.
+                # Prevents N caches from accumulating in the trajectories list.
+                del gen.past_key_values
+                gen.past_key_values = None
+                torch.cuda.empty_cache()
+
+                if dataset_name == "hle":
+                    eval_result = None
                     correct = None
+                else:
+                    eval_result = evaluate_one({
+                        "generated_text": full_generated_text,
+                        "ground_truth": entry["answer"],
+                        "prediction": parsed.final_answer,
+                    }, dataset_name)
 
-            traj = {
-                "id":                           entry["id"],
-                "question":                     entry["question"],
-                "ground_truth":                 entry["answer"],
-                "prompt":                       gen.prompt_text,
-                "cot_steps":                    parsed.cot_steps,
-                "final_answer":                 parsed.final_answer,
-                "raw_cot_block":                parsed.raw_cot_block,
-                "generated_text":               full_generated_text,
-                "prompt_end_position":           gen.prompt_end_position,
-                "generated_end_position":       gen.generated_end_position,
-                "answer_token_start_position":  answer_token_start_position,
-                "confidence_score": confidence_score,
-                "confidence_method": {None: "coin_flip", "default": f"jackknife{'_grid' if experimental_grid else ''}_default", "true": f"coin_flip+jackknife{'_grid' if experimental_grid else ''}_true"}[experimental_jackknife] if confidence_score else None,
-                "confidence_modification": experimental_modification if confidence_score else None,
-                "confidence_error":            confidence_error,
-                "debug_info":                   debug_info if debug_conf else None,
-                "runtime_seconds":              time.time() - t0,
-                "correct":                      correct,
-            }
+                    if eval_result:
+                        # For hotpotqa, score is a dict with 'em' and 'f1'
+                        if isinstance(eval_result["score"], dict):
+                            correct = eval_result["score"]
+                        else:
+                            # For other datasets, score is a float/bool
+                            correct = eval_result["score"] == 1.0
+                    else:
+                        correct = None
 
-            traj_file = os.path.join(out_dir, f"traj_{i}.json")
-            with open(traj_file, "w") as f:
-                json.dump({"index": i, "question": entry["question"], "trajectory": traj}, f, indent=2)
+                traj = {
+                    "id":                           entry["id"],
+                    "question":                     entry["question"],
+                    "ground_truth":                 entry["answer"],
+                    "prompt":                       gen.prompt_text,
+                    "cot_steps":                    parsed.cot_steps,
+                    "final_answer":                 parsed.final_answer,
+                    "raw_cot_block":                parsed.raw_cot_block,
+                    "generated_text":               full_generated_text,
+                    "prompt_end_position":           gen.prompt_end_position,
+                    "generated_end_position":       gen.generated_end_position,
+                    "answer_token_start_position":  answer_token_start_position,
+                    "confidence_score": confidence_score,
+                    "confidence_method": {None: "coin_flip", "default": f"jackknife{'_grid' if experimental_grid else ''}_default", "true": f"coin_flip+jackknife{'_grid' if experimental_grid else ''}_true"}[experimental_jackknife] if confidence_score else None,
+                    "confidence_modification": experimental_modification if confidence_score else None,
+                    "confidence_error":            confidence_error,
+                    "debug_info":                   debug_info if debug_conf else None,
+                    "runtime_seconds":              time.time() - t_sample,
+                    "correct":                      correct,
+                }
+
+                if nb_cot_samples > 1:
+                    traj["sample_idx"] = sample_idx
+                    traj_file = os.path.join(out_dir, f"traj_{i}_sample_{sample_idx}.json")
+                    envelope = {"index": i, "sample_idx": sample_idx, "question": entry["question"], "trajectory": traj}
+                else:
+                    traj_file = os.path.join(out_dir, f"traj_{i}.json")
+                    envelope = {"index": i, "question": entry["question"], "trajectory": traj}
+
+                with open(traj_file, "w") as f:
+                    json.dump(envelope, f, indent=2)
+
+              except Exception as e:
+                logger.error(f"Error processing entry {i} sample {sample_idx} (id={entry['id']}): {e}", exc_info=True)
+                # Recover GPU memory after OOM so subsequent iterations can proceed
+                if isinstance(e, torch.cuda.OutOfMemoryError):
+                    torch.cuda.empty_cache()
+                    logger.warning("Cleared CUDA cache after OOM error")
+                errors.append({"index": i, "sample_idx": sample_idx, "id": entry["id"], "error": str(e)})
+                traj = {
+                    "id":                           entry["id"],
+                    "question":                     entry["question"],
+                    "ground_truth":                 entry["answer"],
+                    "prompt":                       None,
+                    "error":                        str(e),
+                    "cot_steps":                    None,
+                    "final_answer":                 None,
+                    "raw_cot_block":                None,
+                    "generated_text":               None,
+                    "prompt_end_position":           None,
+                    "generated_end_position":       None,
+                    "answer_token_start_position":  None,
+                    "confidence_score":             None,
+                    "confidence_method":           None,
+                    "confidence_modification":     None,
+                    "confidence_error":            None,
+                    "runtime_seconds":              time.time() - t_sample,
+                    "correct":                      None,
+                }
+                if nb_cot_samples > 1:
+                    traj["sample_idx"] = sample_idx
+                    traj_file = os.path.join(out_dir, f"traj_{i}_sample_{sample_idx}.json")
+                    envelope = {"index": i, "sample_idx": sample_idx, "question": entry["question"], "trajectory": traj}
+                else:
+                    traj_file = os.path.join(out_dir, f"traj_{i}.json")
+                    envelope = {"index": i, "question": entry["question"], "trajectory": traj}
+                with open(traj_file, "w") as f:
+                    json.dump(envelope, f, indent=2)
 
         except Exception as e:
+            # Entry-level error (e.g., load_messages failed before sample loop)
             logger.error(f"Error processing entry {i} (id={entry['id']}): {e}", exc_info=True)
-            # Recover GPU memory after OOM so subsequent iterations can proceed
             if isinstance(e, torch.cuda.OutOfMemoryError):
                 torch.cuda.empty_cache()
                 logger.warning("Cleared CUDA cache after OOM error")
@@ -546,6 +645,15 @@ def main(args):
     if args.experimental_grid and args.experimental_jackknife is None:
         raise ValueError("--experimental_grid requires --experimental_jackknife to be set")
 
+    if args.nb_cot_samples < 1:
+        raise ValueError("--nb_cot_samples must be >= 1")
+    if args.nb_cot_samples > 1 and args.temperature == 0.0:
+        logger.warning(
+            "nb_cot_samples=%d with temperature=0.0 (greedy decoding): "
+            "all samples will be identical. Consider setting --temperature > 0.",
+            args.nb_cot_samples,
+        )
+
     if args.pickle_path:
         dataset = load_pickle_data(args.pickle_path)
         logger.info(f"Loaded {len(dataset)} entries from pickle '{args.pickle_path}'.")
@@ -576,10 +684,17 @@ def main(args):
         _jk_suffix = {None: "coinflip", "default": "jackknife_default", "true": "jackknife_true"}[args.experimental_jackknife]
     mod_suffix = args.experimental_modification or "none"
     dir_name = f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{start}_{end}_type{args.type}_{'conf' if args.confidence else 'vanilla'}_{_jk_suffix}_mod-{mod_suffix}"
+    if args.nb_cot_samples > 1:
+        dir_name += f"_samples{args.nb_cot_samples}"
     if args.tag:
         dir_name = f"{args.tag}_{dir_name}"
     out_dir = f"trajectories/{dir_name}"
     os.makedirs(out_dir, exist_ok=True)
+
+    cot_dir = None
+    if args.save_cots:
+        cot_dir = f"trajectories_cached_cots/{dir_name}"
+        os.makedirs(cot_dir, exist_ok=True)
 
     errors = generate_trajectories(
         model_name, dataloader, args.max_new_tokens,
@@ -597,6 +712,10 @@ def main(args):
         experimental_extra_box=args.experimental_extra_box,
         experimental_modification=args.experimental_modification,
         experimental_grid=args.experimental_grid,
+        tag=args.tag,
+        cot_dir=cot_dir,
+        temperature=args.temperature,
+        nb_cot_samples=args.nb_cot_samples,
     )
 
     if errors:

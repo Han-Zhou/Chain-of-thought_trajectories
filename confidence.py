@@ -10,15 +10,109 @@ from collections import defaultdict
 from transformers import DynamicCache
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
 from llm import LLM
+from utils.confidence_modification import apply_confidence_modification
 from utils.text_utils import find_token_indices_from_end, find_token_overlap
+from parsing import parse_output
 from utils.structures import ParsedOutput, ConfidenceScores, AllConfidenceData
 
 logger = logging.getLogger(__name__)
 
 
+class ConfidenceAlignmentError(ValueError):
+    """Raised when sampled CoT-step masking cannot be aligned to token spans."""
+
+
 def _jackknife_nb_keep(k: int) -> int:
     """Number of optional CoT steps to keep under jackknife dropout."""
-    return math.ceil(math.sqrt(k)) if k >= 1 else 0
+    # return math.ceil(math.sqrt(k)) if k >= 1 else 0
+    return k // 2 if k >= 1 else 0
+
+
+def _dropout_eligible_steps(cot_steps: list[str]) -> tuple[list[str], bool]:
+    """Return the CoT steps that are eligible for dropout masking.
+
+    If cot_steps[0] is an actual numbered reasoning step, it should be treated
+    like every other reasoning step. Otherwise, cot_steps[0] is a preamble
+    (for example "Let's think step-by-step.") and must stay always visible.
+    """
+    first_is_reasoning = bool(
+        cot_steps and re.match(r'^\s*step\s', cot_steps[0], re.IGNORECASE)
+    )
+    return (cot_steps if first_is_reasoning else cot_steps[1:]), first_is_reasoning
+
+
+def _jackknife_sample_steps(cot_steps: list[str], nb_dropout_samples: int, experimental_grid: bool = False):
+    """Sample jackknife keep/drop masks shared by both 'default' and 'true' modes.
+
+    If the first step starts with "Step" (case/whitespace insensitive), it's treated as
+    a reasoning step and can be masked. Otherwise, it's treated as a preamble and always kept.
+    From the eligible steps, keeps exactly ceil(sqrt(k)) per sample (or k directly in grid mode).
+
+    When experimental_grid is True, performs nb_dropout_samples runs of a 10-step grid:
+    - For each of nb_dropout_samples runs:
+      - Iteration i (1-indexed, i=1 to 10): k_i = floor(i * n / 10), keep k_i steps (no sqrt)
+      - Iteration 10: k_10 = n, keep all n steps
+    - Total samples returned: nb_dropout_samples * 10
+
+    Returns:
+        kept_indices: list[list[int]] — per-sample list of original cot_steps indices that are kept
+        step_masks: list[list[int]] — per-sample binary masks over the optional steps (1=kept, 0=dropped)
+    """
+    steps, first_is_reasoning = _dropout_eligible_steps(cot_steps)
+    n = len(steps)
+
+    # Grid mode: nb_dropout_samples runs of 10-step grid each
+    if experimental_grid:
+        kept_indices = []
+        step_masks = []
+
+        for run in range(nb_dropout_samples):
+            for i in range(1, 11):
+                if i < 10:
+                    k_i = math.floor(i * n / 10)
+                    nb_keep = k_i  # Use k directly, no sqrt
+                else:
+                    # Iteration 10: keep all steps
+                    nb_keep = n
+
+                # Randomly select nb_keep steps from n total steps
+                selected_indices = np.random.choice(n, size=nb_keep, replace=False)
+                is_step_selected = np.zeros(n, dtype=bool)
+                is_step_selected[selected_indices] = True
+
+                # Build kept_indices accounting for preamble
+                if first_is_reasoning:
+                    sample_kept = [j for j in range(n) if is_step_selected[j]]
+                else:
+                    sample_kept = [0] + [1 + j for j in range(n) if is_step_selected[j]]
+
+                kept_indices.append(sample_kept)
+                step_masks.append(is_step_selected.astype(int).tolist())
+
+        return kept_indices, step_masks
+
+    # Fall through to existing logic for non-grid mode
+    k = n
+    nb_keep = _jackknife_nb_keep(k)
+    nb_mask = k - nb_keep
+
+    is_step_selected = np.ones((nb_dropout_samples, k), dtype=bool)
+    for i in range(nb_dropout_samples):
+        masked_indices = np.random.choice(k, size=nb_mask, replace=False)
+        is_step_selected[i, masked_indices] = False
+
+    kept_indices = []
+    for i in range(nb_dropout_samples):
+        if first_is_reasoning:
+            # All indices can be selected, no forced first index
+            sample_kept = [j for j in range(k) if is_step_selected[i, j]]
+        else:
+            # index 0 always kept (first step is preamble); then add 1+j for each selected optional step
+            sample_kept = [0] + [1 + j for j in range(k) if is_step_selected[i, j]]
+        kept_indices.append(sample_kept)
+
+    step_masks = is_step_selected.astype(int).tolist()
+    return kept_indices, step_masks
 
 
 def crop_cache(cache, max_length):
@@ -56,6 +150,21 @@ def get_token_ids(tokenizer, tokens):
     return labels
 
 
+def _empty_sampled_confidence_scores() -> ConfidenceScores:
+    return ConfidenceScores(
+        answer_probabilities=[],
+        answer_entropy=[],
+        indirect_ptrue1_probabilities=[],
+        indirect_ptrue2_probabilities=[],
+        indirect_ptrue3_probabilities=[],
+        verbconf_probabilities=[],
+        verbconf_distribution=[],
+        verbconf_top_score=[],
+        verbconf_top_prob=[],
+        step_masks=None,
+    )
+
+
 def compute_all_confidence_scores(
     llm: LLM,
     messages: list[dict],
@@ -66,18 +175,13 @@ def compute_all_confidence_scores(
     assistant_prefill: str = "",
     debug_conf: bool = False,
     gen_cache=None,
-    experimental_jackknife: bool = False,
+    experimental_jackknife: str | None = None,
+    experimental_modification: str | None = None,
+    experimental_grid: bool = False,
 ) -> AllConfidenceData:
     debug_info = {}
 
-    if experimental_jackknife:
-        k = len(parsed_output.cot_steps) - 1  # first step is always kept
-        nb_keep = _jackknife_nb_keep(k)
-        debug_info["jackknife_k"] = k
-        debug_info["jackknife_nb_mask"] = k - nb_keep
-
     # Truncate generated_text to only include CoT steps (before the answer sentence)
-    full_text = (assistant_prefill + generated_text).strip()
     if parsed_output.answer_sentence_start is not None:
         # Truncate at the answer sentence boundary (excludes transition text like "Therefore...")
         cot_end_offset = parsed_output.answer_sentence_start - len(assistant_prefill)
@@ -93,8 +197,53 @@ def compute_all_confidence_scores(
     logger.info("compute_all_confidence_scores: truncated generated_text from %d to %d chars",
                 len(generated_text), len(cot_only_text))
 
-    # Compute base tokenization (no suffix) once, shared by all methods
+    # Re-parse cot_steps from the tokenizer-normalized text so that step
+    # strings exactly match the token stream.  apply_chat_template may
+    # normalise whitespace (e.g. collapse multiple spaces), causing the
+    # original parsed steps to diverge from what the tokenizer produces.
     base_content = (assistant_prefill + cot_only_text).strip()
+    normalized_content = llm.tokenizer.decode(
+        llm.tokenizer.encode(base_content, add_special_tokens=False),
+        skip_special_tokens=False,
+    )
+    reparsed = parse_output(normalized_content)
+    if reparsed.cot_steps:
+        parsed_output = copy.copy(parsed_output)
+        parsed_output.cot_steps = reparsed.cot_steps
+        logger.info("Re-parsed %d cot_steps from tokenizer-decoded text", len(reparsed.cot_steps))
+
+    modification = apply_confidence_modification(
+        normalized_content,
+        parsed_output.cot_steps,
+        experimental_modification,
+    )
+    parsed_output = copy.copy(parsed_output)
+    parsed_output.cot_steps = modification.modified_steps
+    cot_only_text = modification.modified_content
+    assistant_prefill = ""
+    normalized_content = cot_only_text
+    can_run_step_dropout = len(parsed_output.cot_steps) > 1
+
+    # Modification changes the token sequence, so the original gen_cache
+    # (aligned to the unmodified tokens) is no longer valid.
+    if modification.mode is not None:
+        gen_cache = None
+
+    if debug_conf:
+        debug_info["experimental_modification"] = experimental_modification
+        debug_info["modified_assistant_content"] = cot_only_text
+        debug_info["modified_step_mappings"] = modification.step_mappings
+
+    # Compute jackknife debug values AFTER all step list modifications
+    if experimental_jackknife is not None:
+        eligible_steps, _ = _dropout_eligible_steps(parsed_output.cot_steps)
+        k = len(eligible_steps)
+        nb_keep = _jackknife_nb_keep(k)
+        debug_info["jackknife_k"] = k
+        debug_info["jackknife_nb_mask"] = k - nb_keep
+
+    # Compute base tokenization (no suffix) once, shared by all methods
+    base_content = cot_only_text.strip()
     base_tokens = _tokenize_for_confidence(llm, messages, base_content)
 
     # Early/late split is now simply at the end of base_tokens (CoT only)
@@ -112,16 +261,19 @@ def compute_all_confidence_scores(
             early_output = llm.model(input_ids=early_tokens, past_key_values=empty_cache)
         precomputed_early_cache = early_output.past_key_values
 
-    # --- Coin-flip dropout (always computed) ---
-    vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks = \
-        dropout_answerlogits(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+    # --- Coin-flip dropout (skipped when mode is "default" or "true") ---
+    _coinflip_samples = 0 if experimental_jackknife in ["default", "true"] or not can_run_step_dropout else nb_dropout_samples
+    vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks, masked_steps_dbg = \
+        dropout_answerlogits(llm, messages, cot_only_text, parsed_output, _coinflip_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                              gen_cache=gen_cache, base_tokens=base_tokens,
                              precomputed_early_cache=precomputed_early_cache)
     if dbg:
         debug_info["answer_logits"] = dbg
+    if masked_steps_dbg:
+        debug_info["masked_steps"] = masked_steps_dbg
 
     vanilla_ptrue1, vanilla_ptrue2, vanilla_ptrue3, dropout_ptrue1, dropout_ptrue2, dropout_ptrue3, dbg, _ = \
-        dropout_indirectlogits(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+        dropout_indirectlogits(llm, messages, cot_only_text, parsed_output, _coinflip_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                                gen_cache=gen_cache, base_tokens=base_tokens,
                                precomputed_early_cache=precomputed_early_cache)
     if dbg:
@@ -131,54 +283,106 @@ def compute_all_confidence_scores(
      v_verbconf_dist, v_verbconf_top_score, v_verbconf_top_prob,
      d_verbconf_dist, d_verbconf_top_scores, d_verbconf_top_probs,
      dbg, _) = \
-        dropout_verbalconf(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+        dropout_verbalconf(llm, messages, cot_only_text, parsed_output, _coinflip_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                            gen_cache=gen_cache, base_tokens=base_tokens,
                            precomputed_early_cache=precomputed_early_cache,
-                           consume_early_cache=not experimental_jackknife)
+                           consume_early_cache=(experimental_jackknife is None))
     if dbg:
         debug_info["verbconf"] = dbg
 
-    # --- Jackknife dropout (only when flag is set) ---
+    # --- Jackknife dropout (only when mode is set) ---
     jackknife_scores = None
     jk_step_masks = None
-    if experimental_jackknife:
-        _, _, jk_answer_probs, jk_answer_entropy, dbg, jk_step_masks = \
-            dropout_answerlogits(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
-                                 gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
-                                 precomputed_early_cache=precomputed_early_cache)
-        if dbg:
-            debug_info["jackknife_answer_logits"] = dbg
+    jk_kept_indices = None
+    if experimental_jackknife == "default":
+        if can_run_step_dropout:
+            # Sample jackknife step masks once, reuse across all methods
+            jk_kept_indices, jk_step_masks = _jackknife_sample_steps(
+                parsed_output.cot_steps, nb_dropout_samples, experimental_grid=experimental_grid)
 
-        _, _, _, jk_ptrue1, jk_ptrue2, jk_ptrue3, dbg, _ = \
-            dropout_indirectlogits(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+            # Use actual number of samples from the masks (nb_dropout_samples * 10 in grid mode)
+            effective_nb_samples = len(jk_step_masks)
+
+            _, _, jk_answer_probs, jk_answer_entropy, dbg, _, jk_masked_steps_dbg = \
+                dropout_answerlogits(llm, messages, cot_only_text, parsed_output, effective_nb_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+                                     gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
+                                     precomputed_early_cache=precomputed_early_cache,
+                                     jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks)
+            if dbg:
+                debug_info["jackknife_answer_logits"] = dbg
+            if jk_masked_steps_dbg:
+                debug_info["jackknife_masked_steps"] = jk_masked_steps_dbg
+
+            _, _, _, jk_ptrue1, jk_ptrue2, jk_ptrue3, dbg, _ = \
+                dropout_indirectlogits(llm, messages, cot_only_text, parsed_output, effective_nb_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
+                                       gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
+                                       precomputed_early_cache=precomputed_early_cache,
+                                       jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks)
+            if dbg:
+                debug_info["jackknife_indirect_logits"] = dbg
+
+            (_, jk_verbconf,
+             _, _, _,
+             jk_verbconf_dist, jk_verbconf_top_scores, jk_verbconf_top_probs,
+             dbg, _) = \
+                dropout_verbalconf(llm, messages, cot_only_text, parsed_output, effective_nb_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                                    gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
-                                   precomputed_early_cache=precomputed_early_cache)
-        if dbg:
-            debug_info["jackknife_indirect_logits"] = dbg
+                                   precomputed_early_cache=precomputed_early_cache,
+                                   consume_early_cache=True,
+                                   jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks)
+            if dbg:
+                debug_info["jackknife_verbconf"] = dbg
 
-        (_, jk_verbconf,
-         _, _, _,
-         jk_verbconf_dist, jk_verbconf_top_scores, jk_verbconf_top_probs,
-         dbg, _) = \
-            dropout_verbalconf(llm, messages, cot_only_text, parsed_output, nb_dropout_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
-                               gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
-                               precomputed_early_cache=precomputed_early_cache,
-                               consume_early_cache=True)
-        if dbg:
-            debug_info["jackknife_verbconf"] = dbg
+            jackknife_scores = ConfidenceScores(
+                answer_probabilities=jk_answer_probs,
+                answer_entropy=jk_answer_entropy,
+                indirect_ptrue1_probabilities=jk_ptrue1,
+                indirect_ptrue2_probabilities=jk_ptrue2,
+                indirect_ptrue3_probabilities=jk_ptrue3,
+                verbconf_probabilities=jk_verbconf,
+                verbconf_distribution=jk_verbconf_dist,
+                verbconf_top_score=jk_verbconf_top_scores,
+                verbconf_top_prob=jk_verbconf_top_probs,
+                step_masks=jk_step_masks,
+            )
+        else:
+            jackknife_scores = _empty_sampled_confidence_scores()
 
-        jackknife_scores = ConfidenceScores(
-            answer_probabilities=jk_answer_probs,
-            answer_entropy=jk_answer_entropy,
-            indirect_ptrue1_probabilities=jk_ptrue1,
-            indirect_ptrue2_probabilities=jk_ptrue2,
-            indirect_ptrue3_probabilities=jk_ptrue3,
-            verbconf_probabilities=jk_verbconf,
-            verbconf_distribution=jk_verbconf_dist,
-            verbconf_top_score=jk_verbconf_top_scores,
-            verbconf_top_prob=jk_verbconf_top_probs,
-            step_masks=jk_step_masks,
+    elif experimental_jackknife == "true":
+        if can_run_step_dropout:
+            jackknife_scores, jk_step_masks = _jackknife_true_forward(
+                llm, messages, cot_only_text, parsed_output,
+                nb_dropout_samples=nb_dropout_samples,
+                assistant_prefill=assistant_prefill,
+                debug_conf=debug_conf,
+                debug_info=debug_info,
+                normalized_content=normalized_content,
+                experimental_grid=experimental_grid,
+            )
+        else:
+            jackknife_scores = _empty_sampled_confidence_scores()
+
+    # --- Collect all prompts for debug ---
+    if debug_conf:
+        ans_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
+        ptrue1_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}.\nTrue/False:"
+        ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"
+        verbconf_suffix = (
+            f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
+            "\nPlease respond with a score from 0 to 100 in <confidence> </confidence> tags."
+            "\nHow confident are you in your previous answer?"
+            "\n<confidence>"
         )
+        debug_info["all_prompts"] = {
+            "answer_logits": _build_prompt_text(llm, messages,
+                (assistant_prefill + cot_only_text + ans_suffix).strip()),
+            "indirect_ptrue1": _build_prompt_text(llm, messages,
+                (assistant_prefill + cot_only_text + ptrue1_suffix).strip()),
+            "indirect_ptrue2": _build_prompt_text(llm, messages,
+                (assistant_prefill + cot_only_text + ptrue2_suffix).strip()),
+            "verbconf": _build_prompt_text(llm, messages,
+                (assistant_prefill + cot_only_text + verbconf_suffix).strip()),
+        }
 
     return AllConfidenceData(
         vanilla_confidences=ConfidenceScores(
@@ -209,18 +413,283 @@ def compute_all_confidence_scores(
     )
 
 
-def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False):
+# Regex to match and capture step numbers for renumbering
+_STEP_NUMBER_RE = re.compile(r'^(Step\s+)\d+(\s*:)', re.IGNORECASE)
+
+
+def _renumber_step(step_text: str, new_number: int) -> str:
+    """Replace the step number in a step marker with new_number.
+
+    Args:
+        step_text: The original step text (e.g., "Step 5: Calculate the sum")
+        new_number: The new step number to use (e.g., 2)
+
+    Returns:
+        The step text with the number replaced (e.g., "Step 2: Calculate the sum")
+    """
+    return _STEP_NUMBER_RE.sub(rf'\g<1>{new_number}\g<2>', step_text, count=1)
+
+
+def _reconstruct_cot_text(normalized_content: str, cot_steps: list[str], kept_indices: list[int]) -> str:
+    """Rebuild CoT text keeping only the steps at kept_indices, with renumbered steps.
+
+    Preserves the non-step prefix (everything before the first step) verbatim.
+    Renumbers kept steps to be consecutive (Step 1, Step 2, Step 3, ...).
+    """
+    if not cot_steps:
+        return normalized_content
+
+    # Find where the first step starts — everything before it is the prefix
+    first_step_pos = normalized_content.find(cot_steps[0])
+    if first_step_pos == -1:
+        # Fallback: if we can't locate steps, return the full text
+        return normalized_content
+    prefix = normalized_content[:first_step_pos]
+
+    # Collect kept step texts
+    kept_step_texts = [cot_steps[i] for i in kept_indices if i < len(cot_steps)]
+
+    # Renumber steps to be consecutive
+    renumbered_steps = []
+    step_counter = 1
+    for step_text in kept_step_texts:
+        if _STEP_NUMBER_RE.match(step_text):
+            renumbered_steps.append(_renumber_step(step_text, step_counter))
+            step_counter += 1
+        else:
+            # Not a numbered step (e.g., preamble), keep as-is
+            renumbered_steps.append(step_text)
+
+    return prefix + "\n".join(renumbered_steps)
+
+
+def _jackknife_true_forward(
+    llm: LLM,
+    messages: list[dict],
+    cot_only_text: str,
+    parsed_output: ParsedOutput,
+    nb_dropout_samples: int,
+    assistant_prefill: str,
+    debug_conf: bool,
+    debug_info: dict,
+    normalized_content: str,
+    experimental_grid: bool = False,
+) -> tuple[ConfidenceScores, list[list[int]]]:
+    """Jackknife 'true' mode: rebuild prompts from sampled steps and run fresh forward passes.
+
+    For each dropout sample, reconstructs the assistant content from the
+    kept CoT steps, appends the method-specific suffix, builds the full
+    prompt via _build_prompt_text, and runs a fresh model forward pass
+    without any cache reuse or attention-mask modifications.
+
+    Returns (ConfidenceScores, step_masks).
+    """
+    device = next(llm.model.parameters()).device
+
+    # Sample which steps to keep — shared selection for all confidence methods
+    kept_indices_per_sample, step_masks = _jackknife_sample_steps(
+        parsed_output.cot_steps, nb_dropout_samples, experimental_grid=experimental_grid)
+
+    # Use actual number of samples (may be nb_dropout_samples * 10 in grid mode)
+    effective_nb_samples = len(kept_indices_per_sample)
+
+    # Define suffixes for each confidence method
+    ans_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
+    ptrue1_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}.\nTrue/False:"
+    ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"
+    verbconf_suffix = (
+        f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
+        "\nPlease respond with a score from 0 to 100 in <confidence> </confidence> tags."
+        "\nHow confident are you in your previous answer?"
+        "\n<confidence>"
+    )
+
+    # Token IDs for indirect logits
+    positive_true_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' True'])
+    negative_false_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' False'])
+    positive_yes_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' Yes'])
+    negative_no_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' No'])
+    yes_only_id = llm.tokenizer.encode(' Yes', add_special_tokens=False)
+    no_only_id = llm.tokenizer.encode(' No', add_special_tokens=False)
+
+    # Verbconf setup
+    verbconf_strings = ANSWER_TOKENS['VERBCONF']
+    token_seqs = [llm.tokenizer.encode(s, add_special_tokens=False) for s in verbconf_strings]
+    score_values = torch.FloatTensor([int(s) / 100 for s in verbconf_strings])
+
+    # Accumulators for per-sample results
+    all_answer_probs = []
+    all_answer_entropy = []
+    all_ptrue1 = []
+    all_ptrue2 = []
+    all_ptrue3 = []
+    all_verbconf = []
+    all_verbconf_dist = []
+    all_verbconf_top_scores = []
+    all_verbconf_top_probs = []
+
+    # Debug prompt accumulators
+    dbg_prompts_answer = []
+    dbg_prompts_ptrue1 = []
+    dbg_prompts_ptrue2 = []
+    dbg_prompts_verbconf = []
+
+    for sample_idx in range(effective_nb_samples):
+        kept_indices = kept_indices_per_sample[sample_idx]
+
+        # Reconstruct CoT text with only the kept steps
+        reconstructed_cot = _reconstruct_cot_text(
+            normalized_content, parsed_output.cot_steps, kept_indices)
+
+        # Build the full assistant content for each method
+        reconstructed_base = (assistant_prefill + reconstructed_cot).strip() if assistant_prefill else reconstructed_cot.strip()
+
+        # --- answer_logits ---
+        ans_content = (reconstructed_base + ans_suffix).strip()
+        ans_prompt = _build_prompt_text(llm, messages, ans_content)
+        ans_tokens = llm.tokenizer(ans_prompt, return_tensors="pt")["input_ids"].to(device)
+
+        if debug_conf:
+            dbg_prompts_answer.append(ans_prompt)
+
+        # Find answer token positions
+        boxed_string = f"\\boxed{{{parsed_output.final_answer}}}"
+        with torch.no_grad():
+            ans_output = llm.model.forward(input_ids=ans_tokens)
+
+        # Find answer tokens in the full sequence
+        ans_token_ids = ans_tokens[0]
+        boxed_start, boxed_end = find_token_indices_from_end(
+            llm.tokenizer, ans_token_ids, boxed_string, llm.model_name)
+        a_start, a_end = find_token_indices_from_end(
+            llm.tokenizer, ans_token_ids[boxed_start:boxed_end],
+            parsed_output.final_answer, llm.model_name)
+        a_start += boxed_start
+        a_end += boxed_start
+
+        answer_toks = ans_token_ids[a_start:a_end]
+        nb_answer_tokens = len(answer_toks)
+        token_strings = [llm.tokenizer.decode([answer_toks[t].item()]) for t in range(nb_answer_tokens)]
+
+        v_logits = ans_output.logits[0, a_start - 1:a_end - 1, :]
+        v_probs = v_logits.softmax(dim=-1)
+        sample_answer_probs = [{token_strings[t]: v_probs[t, answer_toks[t]].item()} for t in range(nb_answer_tokens)]
+        all_answer_probs.append(sample_answer_probs)
+
+        v_logprobs = torch.nan_to_num(v_probs.log(), neginf=-99)
+        entropy_values = (-(v_probs * v_logprobs).sum(dim=-1)).float().cpu().numpy().tolist()
+        sample_entropy = [{token_strings[t]: entropy_values[t]} for t in range(nb_answer_tokens)]
+        all_answer_entropy.append(sample_entropy)
+
+        # --- indirect_ptrue1 ---
+        ptrue1_content = (reconstructed_base + ptrue1_suffix).strip()
+        ptrue1_prompt = _build_prompt_text(llm, messages, ptrue1_content)
+        ptrue1_tokens = llm.tokenizer(ptrue1_prompt, return_tensors="pt")["input_ids"].to(device)
+
+        if debug_conf:
+            dbg_prompts_ptrue1.append(ptrue1_prompt)
+
+        with torch.no_grad():
+            ptrue1_output = llm.model.forward(input_ids=ptrue1_tokens)
+
+        p1_pos = ptrue1_output.logits[0, -1, positive_true_ids].sum()
+        p1_neg = ptrue1_output.logits[0, -1, negative_false_ids].sum()
+        p1_sm = torch.softmax(torch.stack([p1_pos.float(), p1_neg.float()]), dim=0)
+        all_ptrue1.append({"True": p1_sm[0].item(), "False": p1_sm[1].item()})
+
+        # --- indirect_ptrue2 (also used for ptrue3) ---
+        ptrue2_content = (reconstructed_base + ptrue2_suffix).strip()
+        ptrue2_prompt = _build_prompt_text(llm, messages, ptrue2_content)
+        ptrue2_tokens = llm.tokenizer(ptrue2_prompt, return_tensors="pt")["input_ids"].to(device)
+
+        if debug_conf:
+            dbg_prompts_ptrue2.append(ptrue2_prompt)
+
+        with torch.no_grad():
+            ptrue2_output = llm.model.forward(input_ids=ptrue2_tokens)
+
+        p2_pos = ptrue2_output.logits[0, -1, positive_yes_ids].sum()
+        p2_neg = ptrue2_output.logits[0, -1, negative_no_ids].sum()
+        p2_sm = torch.softmax(torch.stack([p2_pos.float(), p2_neg.float()]), dim=0)
+        all_ptrue2.append({"Yes": p2_sm[0].item(), "No": p2_sm[1].item()})
+
+        # ptrue3: Yes/No only (no synonyms) — reuse ptrue2 output
+        p3_pos = ptrue2_output.logits[0, -1, yes_only_id[0]]
+        p3_neg = ptrue2_output.logits[0, -1, no_only_id[0]]
+        p3_sm = torch.softmax(torch.stack([p3_pos.float(), p3_neg.float()]), dim=0)
+        all_ptrue3.append({"Yes": p3_sm[0].item(), "No": p3_sm[1].item()})
+
+        # --- verbconf ---
+        verbconf_content = (reconstructed_base + verbconf_suffix).strip()
+        verbconf_prompt = _build_prompt_text(llm, messages, verbconf_content)
+        verbconf_tokens = llm.tokenizer(verbconf_prompt, return_tensors="pt")["input_ids"].to(device)
+
+        if debug_conf:
+            dbg_prompts_verbconf.append(verbconf_prompt)
+
+        with torch.no_grad():
+            verbconf_output = llm.model.forward(input_ids=verbconf_tokens)
+
+        # Compute joint probs for multi-token numbers using the single-sample output
+        vc_probs = _compute_verbconf_joint_probs(llm, verbconf_output, token_seqs, device)
+        vc_probs_1d = vc_probs[0] if vc_probs.dim() > 1 else vc_probs
+        sample_verbconf = (score_values * vc_probs_1d).sum().item()
+        all_verbconf.append(sample_verbconf)
+        all_verbconf_dist.append(vc_probs_1d.tolist())
+        top_idx = vc_probs_1d.argmax().item()
+        all_verbconf_top_scores.append(top_idx)
+        all_verbconf_top_probs.append(vc_probs_1d[top_idx].item())
+
+        torch.cuda.empty_cache()
+
+    # Save debug prompts for "true" mode
+    if debug_conf:
+        debug_info["jackknife_true_prompts"] = {
+            "answer_logits": dbg_prompts_answer,
+            "indirect_ptrue1": dbg_prompts_ptrue1,
+            "indirect_ptrue2": dbg_prompts_ptrue2,
+            "verbconf": dbg_prompts_verbconf,
+        }
+        debug_info["jackknife_masked_steps"] = [
+            {
+                "sample_idx": i,
+                "kept_step_indices": kept_indices_per_sample[i],
+                "kept_steps": [parsed_output.cot_steps[j] for j in kept_indices_per_sample[i] if j < len(parsed_output.cot_steps)],
+                "dropped_steps": [parsed_output.cot_steps[j] for j in range(len(parsed_output.cot_steps)) if j not in kept_indices_per_sample[i]],
+            }
+            for i in range(nb_dropout_samples)
+        ]
+
+    scores = ConfidenceScores(
+        answer_probabilities=all_answer_probs,
+        answer_entropy=all_answer_entropy,
+        indirect_ptrue1_probabilities=all_ptrue1,
+        indirect_ptrue2_probabilities=all_ptrue2,
+        indirect_ptrue3_probabilities=all_ptrue3,
+        verbconf_probabilities=all_verbconf,
+        verbconf_distribution=all_verbconf_dist,
+        verbconf_top_score=all_verbconf_top_scores,
+        verbconf_top_prob=all_verbconf_top_probs,
+        step_masks=step_masks,
+    )
+
+    return scores, step_masks
+
+
+def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None):
     """Logit-based confidence on the answer tokens themselves."""
     suffix_text = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
-    logger.info("dropout_answerlogits: generated_text='%s', suffix='%s'", generated_text[:100], suffix_text)
+    # logger.info("dropout_answerlogits: generated_text='%s', suffix='%s'", generated_text[:100], suffix_text)
 
-    late_tokens, vanilla_out, dropout_out, ans_start, ans_end, dropout_step_masks = \
+    late_tokens, vanilla_out, dropout_out, ans_start, ans_end, dropout_step_masks, masked_steps_debug = \
         dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text=suffix_text, nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
                         gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
                         precomputed_early_cache=precomputed_early_cache,
-                        consume_early_cache=consume_early_cache)
+                        consume_early_cache=consume_early_cache,
+                        debug_conf=debug_conf,
+                        jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks)
 
     answer_tokens = late_tokens[0, ans_start:ans_end]
     nb_answer_tokens = len(answer_tokens)
@@ -256,12 +725,12 @@ def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropou
     # --- Debug ---
     dbg = _debug_answer_logit_tokens(llm, late_tokens, ans_start, ans_end, v_probs, vanilla_answer_probs) if debug_conf else None
 
-    return vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks
+    return vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks, masked_steps_debug
 
 
-def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False):
+def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None):
     """P(True) and P(Yes) probing after the answer."""
-    logger.info("dropout_indirectlogits: generated_text='%s'", generated_text[:100])
+    # logger.info("dropout_indirectlogits: generated_text='%s'", generated_text[:100])
 
     positive_true_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' True'])
     negative_false_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' False'])
@@ -270,26 +739,28 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
 
     # ptrue1: "True/False:"
     ptrue1_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}.\nTrue/False:"
-    logger.info("dropout_indirectlogits ptrue1: suffix='%s'", ptrue1_suffix)
-    _, vanilla1, dropout1, _, _, dropout_step_masks = \
+    # logger.info("dropout_indirectlogits ptrue1: suffix='%s'", ptrue1_suffix)
+    _, vanilla1, dropout1, _, _, dropout_step_masks, _ = \
         dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text=ptrue1_suffix,
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
                         gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
-                        precomputed_early_cache=precomputed_early_cache)
+                        precomputed_early_cache=precomputed_early_cache,
+                        jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks)
 
     # ptrue2: "Is the answer \boxed{<X>}?"
     ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"
-    logger.info("dropout_indirectlogits ptrue2: suffix='%s'", ptrue2_suffix)
-    _, vanilla2, dropout2, _, _, _ = \
+    # logger.info("dropout_indirectlogits ptrue2: suffix='%s'", ptrue2_suffix)
+    _, vanilla2, dropout2, _, _, _, _ = \
         dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text=ptrue2_suffix,
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
                         gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
                         precomputed_early_cache=precomputed_early_cache,
-                        consume_early_cache=consume_early_cache)
+                        consume_early_cache=consume_early_cache,
+                        jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks)
 
     # Vanilla ptrue1
     v_pos1 = vanilla1.logits[0, -1, positive_true_ids].sum()
@@ -417,7 +888,7 @@ def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
     return joint_logprobs.softmax(-1)
 
 
-def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False):
+def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None):
     """Verbalized confidence (0-100 score)."""
     suffix = (
         f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
@@ -425,16 +896,17 @@ def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_
         "\nHow confident are you in your previous answer?"
         "\n<confidence>"
     )
-    logger.info("dropout_verbalconf: generated_text='%s', suffix='%s'", generated_text[:100], suffix)
+    # logger.info("dropout_verbalconf: generated_text='%s', suffix='%s'", generated_text[:100], suffix)
 
-    _, vanilla_out, dropout_out, _, _, dropout_step_masks = \
+    _, vanilla_out, dropout_out, _, _, dropout_step_masks, _ = \
         dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text=suffix,
                         nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
                         gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
                         precomputed_early_cache=precomputed_early_cache,
-                        consume_early_cache=consume_early_cache)
+                        consume_early_cache=consume_early_cache,
+                        jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks)
 
     verbconf_strings = ANSWER_TOKENS['VERBCONF']
     token_seqs = [llm.tokenizer.encode(s, add_special_tokens=False) for s in verbconf_strings]
@@ -502,15 +974,15 @@ def _extract_thinking_and_content(content: str, model_name: str) -> tuple[str, s
     return thinking, final_content
 
 
-def _tokenize_for_confidence(llm, messages, full_assistant_content):
-    """Tokenize a conversation with the full assistant response.
+def _build_prompt_text(llm, messages, full_assistant_content):
+    """Build the full prompt text for confidence scoring (no tokenization).
 
-    Matches the tokenization approach in llm.generate_one() for consistency,
-    including model-specific post-processing.
+    Applies chat template and model-specific post-processing, matching
+    the approach in llm.generate_one() for consistency.
     """
     _t0 = time.perf_counter()
     conf_messages = copy.deepcopy(messages)
-    logger.info("deepcopy(messages) in _tokenize_for_confidence took %.4fs", time.perf_counter() - _t0)
+    logger.info("deepcopy(messages) in _build_prompt_text took %.4fs", time.perf_counter() - _t0)
 
     # Extract thinking and content for GPT models with channel tags
     thinking, content = _extract_thinking_and_content(full_assistant_content, llm.model_name)
@@ -529,6 +1001,30 @@ def _tokenize_for_confidence(llm, messages, full_assistant_content):
 
     # breakpoint()
 
+    # For Qwen models with <think> tags, handle separately
+    if "qwen" in llm.model_name.lower() and "<think>" in full_assistant_content:
+        think_match = re.search(r"(.*?</think>)(.*)", full_assistant_content, re.DOTALL)
+        if think_match and think_match.group(2).strip():  # Only if there's content after </think>
+            think_part = think_match.group(1)
+            rest_part = think_match.group(2)
+
+            # Apply chat template to everything up to </think>
+            conf_messages[-1]["content"] = think_part
+            prompt_text = llm.tokenizer.apply_chat_template(
+                conf_messages,
+                tokenize=False,
+                add_generation_prompt=False,
+                continue_final_message=True,
+            )
+            # Append the rest directly
+            prompt_text += rest_part
+
+            # Still apply the empty <think></think> cleanup
+            prompt_text = re.sub(r"<think>\s*</think>\s*", "", prompt_text)
+            return prompt_text
+
+
+    # Apply chat template to everything up to </think> 
     prompt_text = llm.tokenizer.apply_chat_template(
         conf_messages,
         tokenize=False,
@@ -536,14 +1032,14 @@ def _tokenize_for_confidence(llm, messages, full_assistant_content):
         continue_final_message=True,
     )
 
-    # breakpoint()
+    prompt_text = re.sub(r"<think>\s*</think>\s*", "", prompt_text)
 
-    # Apply same post-processing as generate_one()
-    if "qwen" in llm.model_name.lower():
-        prompt_text = re.sub(r"<think>\s*</think>\s*", "", prompt_text)
+    return prompt_text
 
-    # breakpoint()
 
+def _tokenize_for_confidence(llm, messages, full_assistant_content):
+    """Tokenize a conversation with the full assistant response."""
+    prompt_text = _build_prompt_text(llm, messages, full_assistant_content)
     tokens = llm.tokenizer(prompt_text, return_tensors="pt")["input_ids"]
     return tokens
 
@@ -563,6 +1059,9 @@ def dropout_forward(
     use_jackknife: bool = False,
     precomputed_early_cache=None,
     consume_early_cache: bool = False,
+    debug_conf: bool = False,
+    jk_kept_indices=None,
+    jk_step_masks=None,
 ):
     """Core forward pass for dropout experiment.
 
@@ -585,11 +1084,11 @@ def dropout_forward(
     if suffix_text:
         full_content = (assistant_prefill + generated_text + suffix_text).strip()
         tokens = _tokenize_for_confidence(llm, messages, full_content)
-        logger.info("dropout_forward: full_content (with suffix) = '%s'", full_content)
+        # logger.info("dropout_forward: full_content (with suffix) = '%s'", full_content)
     else:
         tokens = base_tokens
         full_content = (assistant_prefill + generated_text).strip()
-        logger.info("dropout_forward: full_content (no suffix) = '%s'", full_content)
+        # logger.info("dropout_forward: full_content (no suffix) = '%s'", full_content)
 
     # -- Locate answer region ---------------------------------------------------
     # Since generated_text now ends before \boxed{}, the split is at the end of base_tokens
@@ -723,6 +1222,7 @@ def dropout_forward(
     # -- Dropout forward --------------------------------------------------------
     dropout_output = None
     dropout_step_masks = None
+    masked_steps_debug = None
     if will_run_dropout:
         if _owns_early_cache:
             logger.info("consuming early_cache directly for dropout_late_forward")
@@ -731,7 +1231,7 @@ def dropout_forward(
             _t0 = time.perf_counter()
             _dropout_cache = copy.deepcopy(early_cache)
             logger.info("deepcopy(early_cache) for dropout_late_forward took %.4fs", time.perf_counter() - _t0)
-        dropout_output, dropout_step_masks = dropout_late_forward(
+        dropout_output, dropout_step_masks, masked_steps_debug = dropout_late_forward(
             llm,
             parsed_output.cot_steps,
             early_tokens[0],
@@ -743,9 +1243,12 @@ def dropout_forward(
             nb_dropout_samples,
             threshold,
             use_jackknife=use_jackknife,
+            debug_conf=debug_conf,
+            jk_kept_indices=jk_kept_indices,
+            jk_step_masks=jk_step_masks,
         )
 
-    return late_tokens, vanilla_output, dropout_output, answer_start_late, answer_end_late, dropout_step_masks
+    return late_tokens, vanilla_output, dropout_output, answer_start_late, answer_end_late, dropout_step_masks, masked_steps_debug
 
 
 def dropout_late_forward(
@@ -760,13 +1263,16 @@ def dropout_late_forward(
     nb_dropout_samples,
     threshold,
     use_jackknife=False,
+    debug_conf=False,
+    jk_kept_indices=None,
+    jk_step_masks=None,
 ):
     """Batched forward with per-sample dropout attention masks.
 
     For each sample, a random subset of reasoning steps is masked so that
     the answer-region tokens cannot attend to those steps.
     """
-    steps = cot_steps[1:]          # always keep the first step
+    steps, _ = _dropout_eligible_steps(cot_steps)
     nb_late = late_tokens.shape[1]
     device = late_tokens.device
 
@@ -781,14 +1287,24 @@ def dropout_late_forward(
 
     # Randomly select which steps to keep per sample
     if use_jackknife:
-        # Jackknife: keep ceil(log(k)) steps, mask the rest
-        k = len(steps)
-        nb_keep = _jackknife_nb_keep(k)
-        nb_mask = k - nb_keep
-        is_step_selected = np.ones((nb_dropout_samples, k), dtype=bool)
-        for i in range(nb_dropout_samples):
-            masked_indices = np.random.choice(k, size=nb_mask, replace=False)
-            is_step_selected[i, masked_indices] = False
+        # Jackknife: reuse pre-sampled step masks if provided, otherwise sample once
+        if jk_step_masks is not None:
+            is_step_selected = np.array(jk_step_masks, dtype=bool)
+            expected_shape = (nb_dropout_samples, len(steps))
+            if is_step_selected.shape != expected_shape:
+                raise ValueError(
+                    "Jackknife step mask shape mismatch: "
+                    f"expected {expected_shape}, got {is_step_selected.shape}"
+                )
+        else:
+            # Sample jackknife masks
+            k = len(steps)
+            nb_keep = _jackknife_nb_keep(k)
+            nb_mask = k - nb_keep
+            is_step_selected = np.ones((nb_dropout_samples, k), dtype=bool)
+            for i in range(nb_dropout_samples):
+                masked_indices = np.random.choice(k, size=nb_mask, replace=False)
+                is_step_selected[i, masked_indices] = False
     else:
         # Coin-flip: each step independently kept with probability = threshold
         is_step_selected = (np.random.random((nb_dropout_samples, len(steps))) <= threshold)
@@ -796,12 +1312,29 @@ def dropout_late_forward(
     # Walk backwards through steps, finding each one's token range and masking.
     # Positions in early_token_ids directly correspond to early cache columns.
     remaining_ids = early_token_ids.clone()
+
+    
     for step_id, step in reversed(list(enumerate(steps))):
         try:
+
+            curstep = step
+            curstr = llm.tokenizer.decode(remaining_ids.tolist())
+
+
+            if curstep not in curstr:
+                print(curstep in curstr)
+                # breakpoint()
+                logger.info("Step extraction UNSUCCESSFUL")
+
             step_start, step_end = find_token_indices_from_end(
                 llm.tokenizer, remaining_ids, step, llm.model_name)
-        except ValueError:
-            break
+        except ConfidenceAlignmentError:
+            raise
+        except ValueError as exc:
+            raise ConfidenceAlignmentError(
+                "Unable to align dropout mask to token span "
+                f"(step_id={step_id}, step={step!r}, remaining_len={len(remaining_ids)})."
+            ) from exc
 
         for i in range(nb_dropout_samples):
             late_mask[i, 0,
@@ -810,24 +1343,72 @@ def dropout_late_forward(
 
         remaining_ids = remaining_ids[:step_start + 1]
 
-    # Expand for the dropout batch
-    late_tokens_batch = late_tokens.expand(nb_dropout_samples, -1)
-    early_cache.reorder_cache(torch.tensor([0] * nb_dropout_samples))
-    late_mask = late_mask.to(device=device, dtype=next(llm.model.parameters()).dtype)
+    # Capture debug info before dtype conversion (comparisons need float32)
+    masked_steps_debug = None
+    if debug_conf:
+        masked_steps_debug = _debug_masked_text(
+            llm, early_token_ids, late_mask, modify_start_late,
+            nb_early_tokens, is_step_selected, steps, nb_dropout_samples, use_jackknife)
 
-    with torch.no_grad():
-        late_output = llm.model.forward(
-            input_ids=late_tokens_batch,
-            attention_mask=late_mask,
-            past_key_values=early_cache,
-            output_hidden_states=True,
-        )
-        late_output['input_ids'] = late_tokens_batch
+    # Chunk processing to reduce memory: process 10 samples at a time
+    CHUNK_SIZE = 10
+    num_chunks = (nb_dropout_samples + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+    all_logits = []
+    all_hidden_states = []
+    all_input_ids = []
+
+    for chunk_idx in range(num_chunks):
+        start_idx = chunk_idx * CHUNK_SIZE
+        end_idx = min(start_idx + CHUNK_SIZE, nb_dropout_samples)
+        chunk_size = end_idx - start_idx
+
+        logger.info(f"Processing dropout chunk {chunk_idx + 1}/{num_chunks} (samples {start_idx}:{end_idx})")
+
+        # Slice the mask for this chunk
+        chunk_mask = late_mask[start_idx:end_idx]
+
+        # Expand tokens for this chunk only
+        chunk_tokens = late_tokens.expand(chunk_size, -1)
+
+        # Deep copy cache and replicate only for this chunk
+        _t0 = time.perf_counter()
+        chunk_cache = copy.deepcopy(early_cache)
+        logger.info(f"deepcopy(early_cache) for chunk {chunk_idx} took {time.perf_counter() - _t0:.4f}s")
+        chunk_cache.reorder_cache(torch.tensor([0] * chunk_size))
+
+        # Convert mask to correct dtype
+        chunk_mask = chunk_mask.to(device=device, dtype=next(llm.model.parameters()).dtype)
+
+        with torch.no_grad():
+            chunk_output = llm.model.forward(
+                input_ids=chunk_tokens,
+                attention_mask=chunk_mask,
+                past_key_values=chunk_cache,
+                output_hidden_states=True,
+            )
+
+        # Collect outputs
+        all_logits.append(chunk_output.logits)
+        all_hidden_states.append(chunk_output.hidden_states)
+        all_input_ids.append(chunk_tokens)
+
+        # Free chunk cache memory
+        del chunk_cache
+        torch.cuda.empty_cache()
+
+    # Concatenate all chunks
+    late_output = type(chunk_output)(
+        logits=torch.cat(all_logits, dim=0),
+        hidden_states=tuple(torch.cat([hs[i] for hs in all_hidden_states], dim=0)
+                           for i in range(len(all_hidden_states[0]))),
+    )
+    late_output['input_ids'] = torch.cat(all_input_ids, dim=0)
 
     # Convert is_step_selected to binary masks (1 = kept, 0 = masked)
     step_masks = is_step_selected.astype(int).tolist()
 
-    return late_output, step_masks
+    return late_output, step_masks, masked_steps_debug
 
 
 # ---------------------------------------------------------------------------
@@ -921,7 +1502,7 @@ def _debug_verbconf_tokens(llm, token_seqs, v_probs, vanilla_verbconf):
     }
 
 
-def _debug_masked_text(llm, early_token_ids, late_mask, modify_start_late, nb_early_tokens, is_step_selected, steps, nb_dropout_samples):
+def _debug_masked_text(llm, early_token_ids, late_mask, modify_start_late, nb_early_tokens, is_step_selected, steps, nb_dropout_samples, use_jackknife):
     """Return debug info about which text is masked/kept per dropout sample."""
     samples = []
     for i in range(nb_dropout_samples):
@@ -933,5 +1514,10 @@ def _debug_masked_text(llm, early_token_ids, late_mask, modify_start_late, nb_ea
             "kept_text": llm.tokenizer.decode(early_token_ids[kept_positions]),
             "masked_text": llm.tokenizer.decode(early_token_ids[masked_positions]),
             "dropped_steps": [steps[j] for j in range(len(steps)) if not is_step_selected[i, j]],
+            "use_jacknife": use_jackknife,
         })
+
+        # if samples[-1]["masked_text"] == "":
+        #     breakpoint()
+
     return samples

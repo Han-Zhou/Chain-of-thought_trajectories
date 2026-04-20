@@ -14,6 +14,7 @@ import asyncio
 import glob as glob_mod
 import json
 import os
+import re
 import statistics
 import sys
 
@@ -24,6 +25,11 @@ from eval.hle_eval import (
     load_hle_total_questions,
     DEFAULT_JUDGE_MODEL,
 )
+from eval.codeqa_eval import compute_codeqa_metrics
+from eval.cs1qa_eval import compute_cs1qa_type_metrics, compute_cs1qa_answer_metrics
+
+# Datasets handled by dedicated evaluators (not in EVAL_REGISTRY but supported)
+_CUSTOM_EVAL_DATASETS = {"bfcl", "codeqa", "cs1qa_type", "cs1qa_span", "cs1qa_answer"}
 
 
 def read_trajectories(file_path: str) -> list[dict]:
@@ -46,12 +52,25 @@ def read_trajectories(file_path: str) -> list[dict]:
     return trajectories
 
 
+def _traj_sort_key(path: str) -> tuple[int, int]:
+    """Extract (datapoint_index, sample_index) from traj filename.
+
+    Handles both single-sample (traj_N.json) and multi-sample
+    (traj_N_sample_M.json) naming conventions.
+    """
+    basename = os.path.basename(path)
+    m = re.match(r"traj_(\d+)(?:_sample_(\d+))?\.json", basename)
+    if m:
+        return (int(m.group(1)), int(m.group(2) or 0))
+    return (int(basename.replace("traj_", "").replace(".json", "")), 0)
+
+
 def read_trajectory_dir(dir_path: str) -> list[dict]:
     """Read individual traj_N.json files from a directory, sorted by index."""
     entries = []
     for fpath in sorted(
         glob_mod.glob(os.path.join(dir_path, "traj_*.json")),
-        key=lambda p: int(os.path.basename(p).replace("traj_", "").replace(".json", "")),
+        key=_traj_sort_key,
     ):
         with open(fpath, "r") as f:
             entries.append(json.load(f))
@@ -118,13 +137,143 @@ def evaluate_file(file_path: str, dataset_name: str) -> dict:
         correct = sum(1 for s in scores if s == 1.0)
         output["correct"] = correct
         output["aggregate_score"] = correct / len(results)
+    elif metric == "em+f1":
+        # Dual metric: each score is a dict with 'em' (bool) and 'f1' (float)
+        em_scores = [s["em"] for s in scores]
+        f1_scores = [s["f1"] for s in scores]
+        em_correct = sum(1 for s in em_scores if s)
+        output["em_correct"] = em_correct
+        output["em_accuracy"] = em_correct / len(results)
+        output["aggregate_score"] = statistics.mean(f1_scores)
+        output["median_f1"] = statistics.median(f1_scores)
+        if len(f1_scores) > 1:
+            output["stdev_f1"] = statistics.stdev(f1_scores)
     elif metric == "f1":
         output["aggregate_score"] = statistics.mean(scores)
         output["median_score"] = statistics.median(scores)
         if len(scores) > 1:
             output["stdev"] = statistics.stdev(scores)
+        if dataset_name == "codeqa":
+            output["detailed_metrics"] = compute_codeqa_metrics(results)
 
     return output
+
+
+def evaluate_cs1qa_dir(dir_path: str, dataset_name: str) -> dict:
+    """Run CS1QA evaluation on a directory of traj_N.json files.
+
+    For cs1qa_type: computes accuracy + confusion matrix + per-class P/R/F1.
+    For cs1qa_answer: computes BLEU-1 + per-type breakdown.
+    For cs1qa_span: computes mean F1 + mean EM.
+    """
+    entries = read_trajectory_dir(dir_path)
+    if not entries:
+        return {"dataset": dataset_name, "error": "No trajectory files found"}
+
+    results = []
+    extraction_failures = 0
+
+    for entry in entries:
+        traj = entry.get("trajectory", entry)
+        result = evaluate_one(traj, dataset_name)
+        if result is None:
+            continue
+        if result["extraction_failed"]:
+            extraction_failures += 1
+        result["index"] = entry.get("index")
+        result["id"] = traj.get("id")
+        # Carry question_type metadata through for per-type aggregation
+        metadata = traj.get("metadata") or {}
+        result["question_type"] = metadata.get("question_type")
+        result["metadata"] = metadata
+        results.append(result)
+
+    if not results:
+        return {"dataset": dataset_name, "error": "No evaluable entries found"}
+
+    scores = [r["score"] for r in results]
+
+    output = {
+        "dataset": dataset_name,
+        "metric": results[0]["metric"],
+        "total": len(results),
+        "extraction_failures": extraction_failures,
+    }
+
+    if dataset_name == "cs1qa_type":
+        correct = sum(1 for s in scores if s == 1.0)
+        output["correct"] = correct
+        output["aggregate_score"] = correct / len(results)
+        output["detailed_metrics"] = compute_cs1qa_type_metrics(results)
+    elif dataset_name == "cs1qa_answer":
+        output["aggregate_score"] = statistics.mean(scores) if scores else 0.0
+        output["detailed_metrics"] = compute_cs1qa_answer_metrics(results)
+    elif dataset_name == "cs1qa_span":
+        output["aggregate_score"] = statistics.mean(scores) if scores else 0.0
+        if len(scores) > 1:
+            output["stdev"] = statistics.stdev(scores)
+        # Also compute mean EM
+        em_scores = [r.get("scores", {}).get("em", 0.0) for r in results]
+        output["mean_em"] = statistics.mean(em_scores) if em_scores else 0.0
+
+    output["results"] = results
+    return output
+
+
+def print_cs1qa_summary(result: dict):
+    """Print CS1QA-specific evaluation summary."""
+    if "error" in result:
+        print(f"Error: {result['error']}")
+        return
+
+    dataset = result["dataset"]
+    total = result["total"]
+    agg = result["aggregate_score"]
+    failures = result["extraction_failures"]
+
+    print(f"\n{'=' * 60}")
+    print(f"Dataset:             {dataset}")
+    print(f"Total:               {total}")
+    print(f"Extraction failures: {failures}")
+
+    if dataset == "cs1qa_type":
+        dm = result.get("detailed_metrics", {})
+        print(f"Accuracy:            {dm.get('accuracy', 0):.2f}%")
+        print(f"F1 (macro):          {dm.get('f1_macro', 0):.2f}%")
+        print(f"F1 (weighted):       {dm.get('f1_weighted', 0):.2f}%")
+        print(f"Acc+F1 (macro):      {dm.get('acc_and_f1_macro', 0):.2f}%")
+        print(f"Acc+F1 (weighted):   {dm.get('acc_and_f1_weighted', 0):.2f}%")
+        per_class = dm.get("per_class", {})
+        if per_class:
+            print(f"\n  {'Type':<22s} {'Prec':>6s} {'Rec':>6s} {'F1':>6s}")
+            print(f"  {'-'*22} {'-'*6} {'-'*6} {'-'*6}")
+            for label, metrics in per_class.items():
+                print(f"  {label:<22s} {metrics['precision']:6.4f} {metrics['recall']:6.4f} {metrics['f1']:6.4f}")
+
+    elif dataset == "cs1qa_answer":
+        dm = result.get("detailed_metrics", {})
+        print(f"BLEU-1 (mean):       {dm.get('bleu1_mean', 0):.2f}%")
+        print(f"Token F1 (mean):     {dm.get('token_f1_mean', 0):.2f}%")
+        print(f"ROUGE-L (mean):      {dm.get('rouge_l_mean', 0):.2f}%")
+        if dm.get("bleu1_ST") is not None:
+            print(f"BLEU-1 ST:           {dm['bleu1_ST']:.2f}%")
+        if dm.get("bleu1_TA") is not None:
+            print(f"BLEU-1 TA:           {dm['bleu1_TA']:.2f}%")
+        per_type = dm.get("per_type_bleu1", {})
+        if per_type:
+            print(f"\n  Per-type BLEU-1:")
+            for t, score in per_type.items():
+                if score is not None:
+                    print(f"    {t:<22s} {score:.2f}%")
+
+    elif dataset == "cs1qa_span":
+        print(f"Mean F1:             {agg:.4f}")
+        if "mean_em" in result:
+            print(f"Mean EM:             {result['mean_em']:.4f}")
+        if "stdev" in result:
+            print(f"F1 Stdev:            {result['stdev']:.4f}")
+
+    print(f"{'=' * 60}")
 
 
 def evaluate_hle_dir(
@@ -193,12 +342,31 @@ def print_summary(result: dict):
         correct = result["correct"]
         print(f"Correct:     {correct}/{total}")
         print(f"Accuracy:    {agg:.2%}")
+    elif metric == "em+f1":
+        em_correct = result["em_correct"]
+        print(f"EM Correct:  {em_correct}/{total}")
+        print(f"EM Accuracy: {result['em_accuracy']:.2%}")
+        print(f"Mean F1:     {agg:.4f}")
+        if "median_f1" in result:
+            print(f"Median F1:   {result['median_f1']:.4f}")
+        if "stdev_f1" in result:
+            print(f"F1 Stdev:    {result['stdev_f1']:.4f}")
     elif metric == "f1":
         print(f"Mean F1:     {agg:.4f}")
         if "median_score" in result:
             print(f"Median F1:   {result['median_score']:.4f}")
         if "stdev" in result:
             print(f"Stdev:       {result['stdev']:.4f}")
+        if dataset == "codeqa":
+            dm = result.get("detailed_metrics", {})
+            if dm:
+                print(f"Mean EM:     {dm.get('em_mean', 0):.2f}%")
+                print(f"Mean BLEU-4: {dm.get('bleu_mean', 0):.2f}%")
+                print(f"Mean ROUGE-L: {dm.get('rouge_l_mean', 0):.2f}%")
+                print(f"Mean METEOR: {dm.get('meteor_mean', 0):.2f}%")
+                print(f"Mean Precision: {dm.get('precision_mean', 0):.2f}%")
+                print(f"Mean Recall:    {dm.get('recall_mean', 0):.2f}%")
+                print(f"Mean F1 (%):    {dm.get('f1_mean', 0):.2f}%")
 
     print(f"{'=' * 50}")
 
@@ -209,7 +377,10 @@ def print_summary(result: dict):
         gt = r["ground_truth"]
         score = r["score"]
         flag = "FAIL" if r["extraction_failed"] else ("OK" if score == 1.0 else "WRONG")
-        if metric == "f1":
+        if metric == "em+f1":
+            em_str = "EM" if score["em"] else "  "
+            flag = f"{em_str} F1={score['f1']:.3f}"
+        elif metric == "f1":
             flag = f"F1={score:.3f}"
         print(f"  [{idx}] pred={pred!r:30s} gt={gt!r:30s}  {flag}")
 
@@ -300,10 +471,24 @@ def main():
             print(f"\nDetailed results written to: {output_path}")
         return
 
+    # --- CS1QA-specific evaluation paths ---
+    if dataset_name in ("cs1qa_type", "cs1qa_span", "cs1qa_answer"):
+        if not args.trajectory_dir:
+            print("Error: --trajectory_dir is required for CS1QA evaluation.", file=sys.stderr)
+            sys.exit(1)
+        print(f"Evaluating CS1QA: {args.trajectory_dir} (subtask: {dataset_name})")
+        result = evaluate_cs1qa_dir(args.trajectory_dir, dataset_name)
+        print_cs1qa_summary(result)
+        if output_path:
+            with open(output_path, "w") as f:
+                json.dump(result, f, indent=2, default=str)
+            print(f"\nDetailed results written to: {output_path}")
+        return
+
     # --- Generic evaluation path ---
-    if dataset_name not in EVAL_REGISTRY:
+    if dataset_name not in EVAL_REGISTRY and dataset_name not in _CUSTOM_EVAL_DATASETS:
         print(f"Error: Unknown dataset '{dataset_name}'.", file=sys.stderr)
-        print(f"Supported: {', '.join(sorted(EVAL_REGISTRY.keys()))}", file=sys.stderr)
+        print(f"Supported: {', '.join(sorted(set(EVAL_REGISTRY.keys()) | _CUSTOM_EVAL_DATASETS))}", file=sys.stderr)
         sys.exit(1)
 
     # For non-HLE, find or use the trajectory file
