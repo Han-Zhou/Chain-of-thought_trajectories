@@ -21,6 +21,10 @@ JUDGE_MAX_COMPLETION_TOKENS = 4096
 CALIBRATION_BETA = 100
 CI_Z_SCORE = 1.96
 
+# Third-party API provider (matches ~/.codex/config.toml "yibu" provider)
+DEFAULT_JUDGE_BASE_URL = "https://yibuapi.com/v1"
+DEFAULT_JUDGE_API_KEY_ENV = "YIBU_API_KEY"
+
 
 # The exact prompt as in the original repo
 JUDGE_PROMPT = """Judge whether the following [response] to [question] is correct or not based on the precise and unambiguous [correct_answer] below.
@@ -54,9 +58,25 @@ def _get_client(
     base_url: str | None = None,
     api_key: str | None = None,
 ) -> AsyncOpenAI:
+    resolved_base_url = (
+        base_url
+        or os.environ.get("JUDGE_BASE_URL")
+        or os.environ.get("OPENAI_BASE_URL")
+        or DEFAULT_JUDGE_BASE_URL
+    )
+    resolved_api_key = (
+        api_key
+        or os.environ.get(DEFAULT_JUDGE_API_KEY_ENV)
+        or os.environ.get("OPENAI_API_KEY", "")
+    )
+    if not resolved_api_key:
+        raise RuntimeError(
+            f"No judge API key found. Set ${DEFAULT_JUDGE_API_KEY_ENV} "
+            "(third-party provider) or $OPENAI_API_KEY."
+        )
     return AsyncOpenAI(
-        base_url=base_url or os.environ.get("OPENAI_BASE_URL"),
-        api_key=api_key or os.environ.get("OPENAI_API_KEY", ""),
+        base_url=resolved_base_url,
+        api_key=resolved_api_key,
         timeout=300.0,
         max_retries=1,
     )
@@ -260,3 +280,66 @@ def compute_hle_metrics(results: list[dict], total_questions: int) -> dict:
 
 def load_hle_total_questions() -> int:
     return len(load_dataset("hle"))
+
+
+def _live_smoke_test() -> None:
+    """Live smoke test that actually calls the third-party judge API.
+
+    Run directly:  python -m eval.hle_eval
+    Requires $YIBU_API_KEY (or $OPENAI_API_KEY) in the environment.
+    """
+    if not (os.environ.get(DEFAULT_JUDGE_API_KEY_ENV) or os.environ.get("OPENAI_API_KEY")):
+        raise SystemExit(
+            f"Set ${DEFAULT_JUDGE_API_KEY_ENV} to run the live HLE judge smoke test."
+        )
+
+    judge_model = os.environ.get("HLE_JUDGE_MODEL", DEFAULT_JUDGE_MODEL)
+
+    client = _get_client()
+    assert str(client.base_url).rstrip("/") == DEFAULT_JUDGE_BASE_URL.rstrip("/"), (
+        f"unexpected base_url: {client.base_url}"
+    )
+    assert client.api_key, "api key must be resolved"
+    print(f"[ok] client base_url={client.base_url} judge_model={judge_model}")
+
+    correct_result = asyncio.run(
+        evaluate_hle_async(
+            {
+                "question": "What is 2 + 2?",
+                "ground_truth": "4",
+                "generated_text": (
+                    "Step 1: Add two and two.\n"
+                    "The final answer is \\boxed{4}.\n"
+                    "Confidence: 95%"
+                ),
+            },
+            judge_model=judge_model,
+        )
+    )
+    assert correct_result["judge_response"] is not None, f"judge failed: {correct_result}"
+    assert correct_result["score"] == 1.0, f"expected score=1.0, got {correct_result}"
+    assert "4" in str(correct_result["prediction"])
+    print(f"[ok] correct-answer case: score={correct_result['score']} "
+          f"prediction={correct_result['prediction']!r}")
+
+    incorrect_result = asyncio.run(
+        evaluate_hle_async(
+            {
+                "question": "What is the capital of France?",
+                "ground_truth": "Paris",
+                "generated_text": "The final answer is \\boxed{London}. Confidence: 80%",
+            },
+            judge_model=judge_model,
+        )
+    )
+    assert incorrect_result["judge_response"] is not None, f"judge failed: {incorrect_result}"
+    assert incorrect_result["score"] == 0.0, f"expected score=0.0, got {incorrect_result}"
+    assert incorrect_result["judge_response"]["correct"] == "no"
+    print(f"[ok] incorrect-answer case: score={incorrect_result['score']} "
+          f"prediction={incorrect_result['prediction']!r}")
+
+    print("[ok] HLE live smoke test passed.")
+
+
+if __name__ == "__main__":
+    _live_smoke_test()

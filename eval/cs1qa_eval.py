@@ -194,23 +194,32 @@ def evaluate_cs1qa_span(trajectory: dict) -> dict:
 
     span = _extract_span(generated_text)
 
-    if span is None:
-        return {
-            "prediction": None,
-            "ground_truth": ground_truth,
-            "score": 0.0,
-            "metric": "f1",
-            "scores": {"f1": 0.0, "em": 0.0},
-            "extraction_failed": True,
-        }
+    # Detect model abstention (e.g. "none", "n/a", or no extractable span)
+    abstained = span is None or span == (None, None)
 
     # Compare against each annotation, take best F1
     best_f1, best_em = 0.0, 0.0
     for label in ground_truth:
         label_tuple = (label[0], label[1]) if isinstance(label, (list, tuple)) else label
-        f1, em = calculate_F1_EM([span], label_tuple)
+        # Handle "no-span" ground truth: correct iff the model also abstained.
+        if label_tuple[0] is None or label_tuple[1] is None:
+            f1, em = (1.0, 1.0) if abstained else (0.0, 0.0)
+        elif abstained:
+            f1, em = 0.0, 0.0
+        else:
+            f1, em = calculate_F1_EM([span], label_tuple)
         if f1 > best_f1:
             best_f1, best_em = f1, em
+
+    if span is None:
+        return {
+            "prediction": None,
+            "ground_truth": ground_truth,
+            "score": best_f1,
+            "metric": "f1",
+            "scores": {"f1": round(best_f1 * 100, 4), "em": round(best_em * 100, 4)},
+            "extraction_failed": best_f1 == 0.0,
+        }
 
     return {
         "prediction": f"{span[0]}-{span[1]}",

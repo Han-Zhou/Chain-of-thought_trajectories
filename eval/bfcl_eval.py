@@ -631,19 +631,29 @@ def evaluate_bfcl(trajectory: dict) -> dict:
     ground_truth = trajectory.get("ground_truth", [])
     func_description = trajectory.get("func_description", [])
     test_category = trajectory.get("test_category", "simple_python")
+    prediction = trajectory.get("prediction")
 
-    # breakpoint()
+    if isinstance(ground_truth, str):
+        try:
+            ground_truth = json.loads(ground_truth)
+        except json.JSONDecodeError:
+            pass
+
+    # Prefer the already-extracted final answer (a bracketed call string) over
+    # the raw generated text, which still contains the prompt, CoT, and
+    # `\boxed{...}` wrapper that would defeat ast.parse.
+    parse_input = prediction if isinstance(prediction, str) and prediction else generated_text
 
     # Try to parse model output
     decoded = None
     try:
-        decoded = default_decode_ast_prompting(generated_text)
+        decoded = default_decode_ast_prompting(parse_input)
     except Exception:
         pass
 
     if decoded is None:
         try:
-            decoded = parse_json_function_call(generated_text)
+            decoded = parse_json_function_call(parse_input)
         except Exception:
             pass
 

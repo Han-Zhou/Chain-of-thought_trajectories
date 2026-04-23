@@ -49,4 +49,6 @@ class AllConfidenceData:
     vanilla_confidences: ConfidenceScores
     dropout_confidences: ConfidenceScores
     jackknife_confidences: ConfidenceScores | None = None
+    bootstrap_confidences: ConfidenceScores | None = None
+    coinflip_true_confidences: ConfidenceScores | None = None
     debug_info: dict = field(default_factory=dict)

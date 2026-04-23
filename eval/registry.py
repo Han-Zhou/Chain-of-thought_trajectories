@@ -13,6 +13,7 @@ from eval.comparators import (
     normalized_text_match,
     math_equal,
     qa_f1_score,
+    _normalize_qa_answer,
 )
 from eval.bfcl_eval import evaluate_bfcl
 from eval.codeqa_eval import evaluate_codeqa
@@ -40,6 +41,11 @@ def evaluate_hotpotqa_dual(prediction: str, reference: str) -> dict:
     Returns a dict with 'em' (bool) and 'f1' (float) keys.
     """
     em = normalized_text_match(prediction, reference)
+    if not em:
+        norm_pred = _normalize_qa_answer(prediction)
+        norm_ref = _normalize_qa_answer(reference)
+        if norm_pred and norm_pred in norm_ref:
+            em = True
     f1 = qa_f1_score(prediction, reference)
     return {"em": em, "f1": f1}
 

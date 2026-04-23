@@ -66,6 +66,10 @@ SYSTEM_MATH = (
     "Do not include units or explanations."
 )
 
+SYSTEM_COLLEGE_MATH = (
+"When you output the final answer, output it concisely without additional explanations."
+)
+
 SYSTEM_BINARY = (
     "When you output the final answer, output ONLY 'Yes' or 'No'. "
     "Do not include periods, explanations, or any other text."
@@ -87,27 +91,7 @@ SYSTEM_OTHER = (
 
 # --- BFCL v1 ---------------------------------------------------------------
 # Extra fields: {functions}  — JSON description of available API functions.
-BFCL_prev = """\
-You are given a user request and a list of available API functions.
-Your task is to decide which function(s) to call and with what arguments.
 
-Available functions:
-{functions}
-
-User request:
-{question}
-
-Reason step-by-step through the request, then specify the exact function \
-call(s) needed.
-
-Step 1: Identify what the user is asking for.
-Step 2: Match the request to the most relevant function(s).
-Step 3: Determine the correct argument values from the request.
-Step 4: Verify the chosen call satisfies all constraints in the function \
-schema.
-
-\\boxed{function call(s) in the required format}
-"""
 
 BFCL = """\
 You are also an expert in composing functions.You are given a question and a set of possible functions. Based on the question, you will need to make one or more function/tool calls to achieve the purpose. If none of the functions can be used, point it out. If the given question lacks the parameters required by the function, also point it out.
@@ -180,26 +164,15 @@ Analyze the code step-by-step and answer the question accurately.
 
 # --- CS1QA -----------------------------------------------------------------
 CS1QA = """\
-You are an expert computer science instructor helping a student with an \
-introductory programming question.
-
 Question:
 {question}
 
 Reason step-by-step before answering.
-
-Step 1: Identify the core concept or programming construct being tested.
-Step 2: Recall the relevant rules or definitions.
-Step 3: Apply those rules to the specific scenario in the question.
-Step 4: Arrive at the correct answer and explain it clearly.
-
 """
 
 # --- CS1QA Type Classification ---------------------------------------------
 # Extra fields: {code}  — the code snippet the question is about.
 CS1QA_TYPE = """\
-You are an expert at classifying introductory programming questions.
-
 Code:
 ```
 {code}
@@ -212,15 +185,12 @@ Classify this question into exactly one of the following types:
 code_understanding, logical, error, usage, algorithm, task, comparison, \
 reasoning, code_explain, variable, guiding
 
-Reason step-by-step about what the question is asking, then output the \
-type label in \\boxed{type_label}.
+Reason step-by-step about what the question is asking.
 """
 
 # --- CS1QA Span Prediction -------------------------------------------------
 # Extra fields: {code}  — the code snippet with line numbers prepended.
 CS1QA_SPAN = """\
-You are an expert at identifying relevant code for programming questions.
-
 Code (with line numbers):
 ```
 {code}
@@ -230,16 +200,12 @@ Question:
 {question}
 
 Identify which lines of code are most relevant to answering this question. \
-Reason step-by-step, then output the line range as \\boxed{startLine-endLine} \
-(e.g. \\boxed{5-12}).
+Reason step-by-step.
 """
 
 # --- CS1QA Answer Generation -----------------------------------------------
 # Extra fields: {code}  — the code snippet the question is about.
 CS1QA_ANSWER = """\
-You are an expert computer science instructor helping a student with an \
-introductory programming question.
-
 Code:
 ```
 {code}
@@ -249,8 +215,6 @@ Question:
 {question}
 
 Analyze the code step-by-step and answer the question clearly and concisely.
-
-\\boxed{{your answer}}
 """
 
 # --- HotPotQA --------------------------------------------------------------
@@ -319,7 +283,7 @@ DATASET_ANSWER_FORMAT: dict[str, str] = {
     "bigbench_causal":   SYSTEM_BINARY,
     "logiqa":            SYSTEM_MCQ,
     "college_math":      SYSTEM_MATH,
-    "college_math_test": SYSTEM_MATH,
+    "college_math_test": SYSTEM_COLLEGE_MATH,
     "math500":           SYSTEM_MATH,
     "olympiadbench":     SYSTEM_MATH,
     "hotpotqa":          SYSTEM_OTHER,

@@ -177,8 +177,18 @@ def parse():
     args.add_argument(
         "--nb_dropout_samples",
         type=int,
-        default=3,
-        help="Number of dropout samples for confidence scoring."
+        default=None,
+        help="Number of dropout samples for confidence scoring. Defaults to 3. Must not be set with --vanilla_only."
+    )
+    args.add_argument(
+        "--vanilla_only",
+        action="store_true",
+        default=False,
+        help=(
+            "Compute only vanilla confidence scores (no coin-flip or jackknife dropout). "
+            "Mutually exclusive with --experimental_jackknife, --experimental_grid, "
+            "and --nb_dropout_samples."
+        ),
     )
     args.add_argument(
         "--experimental_grid",
@@ -187,13 +197,43 @@ def parse():
         help="Enable grid-based jackknife sampling (requires --experimental_jackknife)."
     )
     args.add_argument(
+        "--experimental_preserve_final_step",
+        action="store_true",
+        default=False,
+        help=(
+            "Always keep the final CoT step during jackknife/dropout masking. "
+            "Masking pool is computed from n-1 steps instead of n."
+        ),
+    )
+    args.add_argument(
+        "--experimental_bootstrap",
+        action="store_true",
+        default=False,
+        help=(
+            "Bootstrap confidence scoring: sample n-1 steps with replacement, "
+            "always keep final step. Defaults to 100 samples (override with --nb_dropout_samples). "
+            "Mutually exclusive with --experimental_jackknife, --experimental_grid, --vanilla_only."
+        ),
+    )
+    args.add_argument(
+        "--experimental_coinflip_true",
+        action="store_true",
+        default=False,
+        help=(
+            "Token-level coin-flip dropout: reconstruct prompts from independently "
+            "Bernoulli-sampled CoT steps (p=0.5) and run fresh forward passes. "
+            "Mutually exclusive with --experimental_jackknife, --experimental_bootstrap, "
+            "--vanilla_only."
+        ),
+    )
+    args.add_argument(
         "--experimental_extra_box",
         action="store_true",
         default=False,
         help=(
             "Two-phase generation: generate without \\boxed instruction, then "
             "append '\\nTherefore the answer is \\boxed{' and generate the answer "
-            "with stop string '}'. Supported for all datasets except cs1qa, codeqa, and hle."
+            "with stop string '}'."
         ),
     )
     args.add_argument(
@@ -216,6 +256,16 @@ def parse():
         ),
     )
     args.add_argument(
+        "--from_pregenerated",
+        type=str,
+        default=None,
+        help=(
+            "Directory of pregenerated trajectory JSONs. Uses traj_{i}_sample_0.json "
+            "(or traj_{i}.json) for each datapoint. Skips generation and runs only "
+            "confidence scoring. Requires --confidence."
+        ),
+    )
+    args.add_argument(
         "--tag",
         type=str,
         default=None,
@@ -228,10 +278,52 @@ def parse():
         args.error("--dataset is required when not using --pickle_path.")
     if parsed.pickle_path is not None and parsed.dataset is None:
         args.error("--dataset is required when using --pickle_path (needed for evaluation).")
+    if parsed.vanilla_only:
+        if parsed.experimental_jackknife is not None:
+            args.error("--vanilla_only is mutually exclusive with --experimental_jackknife.")
+        if parsed.experimental_grid:
+            args.error("--vanilla_only is mutually exclusive with --experimental_grid.")
+        if parsed.nb_dropout_samples is not None:
+            args.error("--vanilla_only is mutually exclusive with --nb_dropout_samples.")
+        parsed.nb_dropout_samples = 0
+    elif parsed.nb_dropout_samples is None:
+        parsed.nb_dropout_samples = 3
+    if parsed.experimental_bootstrap:
+        if parsed.experimental_jackknife is not None:
+            args.error("--experimental_bootstrap is mutually exclusive with --experimental_jackknife.")
+        if parsed.experimental_grid:
+            args.error("--experimental_bootstrap is mutually exclusive with --experimental_grid.")
+        if parsed.vanilla_only:
+            args.error("--experimental_bootstrap is mutually exclusive with --vanilla_only.")
+        if parsed.nb_dropout_samples == 3:
+            parsed.nb_dropout_samples = 100
+    if parsed.experimental_coinflip_true:
+        if parsed.experimental_jackknife is not None:
+            args.error("--experimental_coinflip_true is mutually exclusive with --experimental_jackknife.")
+        if parsed.experimental_bootstrap:
+            args.error("--experimental_coinflip_true is mutually exclusive with --experimental_bootstrap.")
+        if parsed.vanilla_only:
+            args.error("--experimental_coinflip_true is mutually exclusive with --vanilla_only.")
+    if parsed.from_pregenerated is not None:
+        if not parsed.confidence:
+            args.error("--from_pregenerated requires --confidence.")
+        if parsed.debug:
+            args.error("--from_pregenerated and --debug are mutually exclusive.")
     return parsed
 
 
 
+
+
+def _load_pregenerated_traj(pregen_dir: str, index: int) -> dict:
+    for fname in (f"traj_{index}_sample_0.json", f"traj_{index}.json"):
+        path = os.path.join(pregen_dir, fname)
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)["trajectory"]
+    raise FileNotFoundError(
+        f"No pregenerated trajectory found for index {index} in {pregen_dir}"
+    )
 
 
 def generate_continuation(llm, messages, max_new_tokens, temperature=0.0, suffix="\nTherefore the answer is \\boxed{", stop_strings=None):
@@ -289,7 +381,7 @@ def generate_continuation(llm, messages, max_new_tokens, temperature=0.0, suffix
     return gen2, assistant_prefill, full_generated_text
 
 
-def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=None, discord=False, nb_dropout_samples=3, experimental_extra_box=False, experimental_modification=None, experimental_grid=False, tag=None, cot_dir=None, temperature=0.0, nb_cot_samples=1):
+def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=None, discord=False, nb_dropout_samples=3, experimental_extra_box=False, experimental_modification=None, experimental_grid=False, tag=None, cot_dir=None, temperature=0.0, nb_cot_samples=1, vanilla_only=False, from_pregenerated=None, experimental_preserve_final_step=False, experimental_bootstrap=False, experimental_coinflip_true=False):
 
     debug_dir = "debug_cache"
 
@@ -322,6 +414,9 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
             if debug:
                 gen, parsed, assistant_prefill, full_generated_text, messages = cached_entries[i]
                 nb_samples_for_entry = 1
+            elif from_pregenerated:
+                messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type, experimental_extra_box=experimental_extra_box)
+                nb_samples_for_entry = 1
             else:
                 messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type, experimental_extra_box=experimental_extra_box)
                 nb_samples_for_entry = nb_cot_samples
@@ -331,7 +426,18 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                 t_sample = time.time()
 
                 if not debug:
-                    if experimental_extra_box:
+                    if from_pregenerated:
+                        traj_saved = _load_pregenerated_traj(from_pregenerated, i)
+                        full_generated_text = traj_saved["generated_text"]
+                        assistant_prefill = messages[-1]["content"] if messages[-1]["role"] == "assistant" else ""
+                        gen = GenerationResult(
+                            prompt_text=traj_saved.get("prompt", ""),
+                            generated_text=full_generated_text[len(assistant_prefill):],
+                            prompt_end_position=traj_saved["prompt_end_position"],
+                            generated_end_position=traj_saved["generated_end_position"],
+                            past_key_values=None,
+                        )
+                    elif experimental_extra_box:
                         gen, assistant_prefill, full_generated_text = generate_continuation(llm, messages, max_new_tokens, temperature=temperature)
                     else:
                         has_assistant_prefill = messages[-1]["role"] == "assistant"
@@ -407,7 +513,8 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                             extra_box_suffix=extra_box_suffix,
                             llama_answer_cleanup=is_llama,
                         )
-                    entries_to_save.append((gen, parsed, assistant_prefill, full_generated_text, messages))
+                    if not from_pregenerated:
+                        entries_to_save.append((gen, parsed, assistant_prefill, full_generated_text, messages))
 
                 if parsed.answer_fullstring_start is not None:
                     # answer_fullstring_start is an offset into full_generated_text (prefill + new tokens).
@@ -436,6 +543,10 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                                 experimental_jackknife=experimental_jackknife,
                                 experimental_modification=experimental_modification,
                                 experimental_grid=experimental_grid,
+                                vanilla_only=vanilla_only,
+                                preserve_final_step=experimental_preserve_final_step,
+                                experimental_bootstrap=experimental_bootstrap,
+                                experimental_coinflip_true=experimental_coinflip_true,
                             )
                         except ConfidenceAlignmentError as exc:
                             confidence_error = str(exc)
@@ -503,6 +614,8 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                         "generated_text": full_generated_text,
                         "ground_truth": entry["answer"],
                         "prediction": parsed.final_answer,
+                        "func_description": (entry.get("metadata") or {}).get("functions", []),
+                        "test_category": (entry.get("metadata") or {}).get("bfcl_type", "simple_python"),
                     }, dataset_name)
 
                     if eval_result:
@@ -528,13 +641,18 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                     "generated_end_position":       gen.generated_end_position,
                     "answer_token_start_position":  answer_token_start_position,
                     "confidence_score": confidence_score,
-                    "confidence_method": {None: "coin_flip", "default": f"jackknife{'_grid' if experimental_grid else ''}_default", "true": f"coin_flip+jackknife{'_grid' if experimental_grid else ''}_true"}[experimental_jackknife] if confidence_score else None,
+                    "confidence_method": ("vanilla_only" if vanilla_only else "bootstrap" if experimental_bootstrap else "coinflip_true" if experimental_coinflip_true else {None: "coin_flip", "default": f"jackknife{'_grid' if experimental_grid else ''}_default", "true": f"coin_flip+jackknife{'_grid' if experimental_grid else ''}_true"}[experimental_jackknife]) if confidence_score else None,
                     "confidence_modification": experimental_modification if confidence_score else None,
                     "confidence_error":            confidence_error,
                     "debug_info":                   debug_info if debug_conf else None,
                     "runtime_seconds":              time.time() - t_sample,
                     "correct":                      correct,
                 }
+
+                if dataset_name == "bfcl":
+                    meta = entry.get("metadata") or {}
+                    traj["func_description"] = meta.get("functions", [])
+                    traj["test_category"] = meta.get("bfcl_type", "simple_python")
 
                 if nb_cot_samples > 1:
                     traj["sample_idx"] = sample_idx
@@ -678,7 +796,13 @@ def main(args):
 
     logger.info(f"generating {args.dataset} [{start}:{end}]")
 
-    if args.experimental_grid:
+    if args.vanilla_only:
+        _jk_suffix = "vanillaonly"
+    elif args.experimental_bootstrap:
+        _jk_suffix = "bootstrap"
+    elif args.experimental_coinflip_true:
+        _jk_suffix = "coinflip_true"
+    elif args.experimental_grid:
         _jk_suffix = {None: "coinflip", "default": "jackknife_grid_default", "true": "jackknife_grid_true"}[args.experimental_jackknife]
     else:
         _jk_suffix = {None: "coinflip", "default": "jackknife_default", "true": "jackknife_true"}[args.experimental_jackknife]
@@ -716,6 +840,11 @@ def main(args):
         cot_dir=cot_dir,
         temperature=args.temperature,
         nb_cot_samples=args.nb_cot_samples,
+        vanilla_only=args.vanilla_only,
+        from_pregenerated=args.from_pregenerated,
+        experimental_preserve_final_step=args.experimental_preserve_final_step,
+        experimental_bootstrap=args.experimental_bootstrap,
+        experimental_coinflip_true=args.experimental_coinflip_true,
     )
 
     if errors:

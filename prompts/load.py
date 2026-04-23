@@ -126,6 +126,7 @@ _SUPPORTED_MESSAGE_DATASETS = {
     "cs1qa_type", "cs1qa_span", "cs1qa_answer",
     "college_math", "bigbench_causal", "bigbench_movie",
     "hotpotqa", "math500", "olympiadbench",
+    "codeqa",
 }
 
 
@@ -150,7 +151,7 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
             f"Options:\n{choices_text}"
         )
 
-    elif dataset in ("cs1qa_type", "cs1qa_span", "cs1qa_answer"):
+    elif dataset in ("cs1qa_type", "cs1qa_span", "cs1qa_answer", "codeqa"):
         system_prompt, user_template, assistant_start = prompt_parts
         code = entry.get("context") or entry.get("code") or ""
         user_prompt = user_template.format(question=entry["question"], code=code)

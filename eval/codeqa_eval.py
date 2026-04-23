@@ -13,7 +13,7 @@ import math
 import statistics
 from collections import Counter
 
-from eval.meteor import compute_meteor_score
+# from eval.meteor import compute_meteor_score
 
 
 def normalize_answer(s: str) -> str:
@@ -213,25 +213,27 @@ def evaluate_codeqa(trajectory: dict) -> dict:
     # Compute best scores across all ground truths
     em, precision, recall, f1 = _best_score(prediction, ground_truths)
 
-    # BLEU: average of per-sentence smoothed BLEU
-    # Normalize all ground truths and split into tokens
-    gt_token_lists = [gt.split() for gt in normalized_ground_truths]
     pred_tokens = prediction.split()
-    bleu = _compute_bleu_sentence(gt_token_lists, pred_tokens, max_order=4, smooth=True)
 
-    # ROUGE-L: against the best reference (the one that maximized F1)
-    # Find which reference gave best F1
-    best_gt_idx = 0
-    best_f1_check = 0.0
-    for i, norm_gt in enumerate(normalized_ground_truths):
-        _, _, f1_check = _f1_score(pred_tokens, norm_gt.split())
-        if f1_check > best_f1_check:
-            best_f1_check = f1_check
-            best_gt_idx = i
-
-    best_ref_tokens = normalized_ground_truths[best_gt_idx].split()
-    rouge_l = _rouge_l_sentence(pred_tokens, best_ref_tokens, beta=1.2)
-    meteor = compute_meteor_score(prediction, normalized_ground_truths)
+    # BLEU / ROUGE-L / METEOR disabled
+    # # BLEU: average of per-sentence smoothed BLEU
+    # # Normalize all ground truths and split into tokens
+    # gt_token_lists = [gt.split() for gt in normalized_ground_truths]
+    # bleu = _compute_bleu_sentence(gt_token_lists, pred_tokens, max_order=4, smooth=True)
+    #
+    # # ROUGE-L: against the best reference (the one that maximized F1)
+    # # Find which reference gave best F1
+    # best_gt_idx = 0
+    # best_f1_check = 0.0
+    # for i, norm_gt in enumerate(normalized_ground_truths):
+    #     _, _, f1_check = _f1_score(pred_tokens, norm_gt.split())
+    #     if f1_check > best_f1_check:
+    #         best_f1_check = f1_check
+    #         best_gt_idx = i
+    #
+    # best_ref_tokens = normalized_ground_truths[best_gt_idx].split()
+    # rouge_l = _rouge_l_sentence(pred_tokens, best_ref_tokens, beta=1.2)
+    # meteor = compute_meteor_score(prediction, normalized_ground_truths)
 
     return {
         "prediction": prediction,
@@ -240,9 +242,9 @@ def evaluate_codeqa(trajectory: dict) -> dict:
         "metric": "f1",
         "scores": {
             "em":        round(em * 100, 4),
-            "bleu":      round(bleu * 100, 4),
-            "rouge_l":   round(rouge_l * 100, 4),
-            "meteor":    round(meteor * 100, 4),
+            # "bleu":      round(bleu * 100, 4),
+            # "rouge_l":   round(rouge_l * 100, 4),
+            # "meteor":    round(meteor * 100, 4),
             "precision": round(precision * 100, 4),
             "recall":    round(recall * 100, 4),
             "f1":        round(f1 * 100, 4),
@@ -253,7 +255,7 @@ def evaluate_codeqa(trajectory: dict) -> dict:
 
 def compute_codeqa_metrics(results: list[dict]) -> dict:
     """Compute aggregate CodeQA metrics from per-trajectory scores."""
-    metric_names = ("em", "bleu", "rouge_l", "meteor", "precision", "recall", "f1")
+    metric_names = ("em", "precision", "recall", "f1")
     metrics = {}
     for metric_name in metric_names:
         values = [

@@ -208,6 +208,115 @@ class TestEvaluateBFCL:
         assert result["score"] == 0.0
         assert result["extraction_failed"] is True
 
+
+class TestBFCLPipelineWiring:
+    """Regression tests for the on-disk trajectory shape produced by main.py.
+
+    Reproduces traj_0.json from the qwen-bfcl-100 run: prediction holds the
+    bracketed final answer, generated_text is the full prompt+CoT+\\boxed{...}
+    blob, and ground_truth is a JSON string (as serialized by BFCLDataLoader).
+    """
+
+    SCHEMA = make_schema(
+        "calculate_triangle_area",
+        {
+            "base": {"type": "integer"},
+            "height": {"type": "integer"},
+            "unit": {"type": "string"},
+        },
+        ["base", "height"],
+    )
+    GROUND_TRUTH_LIST = [
+        {
+            "calculate_triangle_area": {
+                "base": [10],
+                "height": [5],
+                "unit": ["units", ""],
+            }
+        }
+    ]
+    PREDICTION = '[calculate_triangle_area(base=10, height=5, unit="units")]'
+    GENERATED_TEXT = (
+        "<think>\nStep 1: pick the function.\n</think>\n"
+        "Therefore the answer is \\boxed{"
+        '[calculate_triangle_area(base=10, height=5, unit="units")]}'
+    )
+
+    def test_uses_prediction_field_when_generated_text_is_unparseable(self):
+        traj = {
+            "generated_text": self.GENERATED_TEXT,
+            "prediction": self.PREDICTION,
+            "ground_truth": self.GROUND_TRUTH_LIST,
+            "func_description": [self.SCHEMA],
+            "test_category": "simple_python",
+        }
+
+        result = evaluate_bfcl(traj)
+
+        assert result["extraction_failed"] is False
+        assert result["score"] == 1.0
+        assert result["prediction"] == [
+            {"calculate_triangle_area": {"base": 10, "height": 5, "unit": "units"}}
+        ]
+
+    def test_ground_truth_accepted_as_json_string(self):
+        import json as _json
+
+        traj = {
+            "generated_text": self.GENERATED_TEXT,
+            "prediction": self.PREDICTION,
+            "ground_truth": _json.dumps(self.GROUND_TRUTH_LIST),
+            "func_description": [self.SCHEMA],
+            "test_category": "simple_python",
+        }
+
+        result = evaluate_bfcl(traj)
+
+        assert result["extraction_failed"] is False
+        assert result["score"] == 1.0
+
+    def test_without_prediction_falls_back_to_generated_text(self):
+        traj = {
+            "generated_text": self.PREDICTION,
+            "ground_truth": self.GROUND_TRUTH_LIST,
+            "func_description": [self.SCHEMA],
+            "test_category": "simple_python",
+        }
+
+        result = evaluate_bfcl(traj)
+
+        assert result["extraction_failed"] is False
+        assert result["score"] == 1.0
+
+    def test_real_traj0_payload_scores_correct(self):
+        """End-to-end against the exact traj_0.json from the failing run."""
+        import json as _json
+        from pathlib import Path
+
+        path = Path(
+            "trajectories/417-qwen-bfcl-100-defaultjk_qwen_thinking_bfcl_zero_0_100_"
+            "type1_conf_jackknife_default_mod-none/traj_0.json"
+        )
+        if not path.exists():
+            pytest.skip(f"trajectory not present: {path}")
+
+        envelope = _json.loads(path.read_text())
+        on_disk = envelope["trajectory"]
+
+        traj = {
+            "generated_text": on_disk["generated_text"],
+            "prediction": on_disk["final_answer"],
+            "ground_truth": on_disk["ground_truth"],
+            "func_description": [self.SCHEMA],
+            "test_category": "simple_python",
+        }
+
+        result = evaluate_bfcl(traj)
+
+        assert result["extraction_failed"] is False
+        assert result["score"] == 1.0
+
+
 class TestBFCLKnownBugs:
     # @pytest.mark.xfail(
     #     strict=True,

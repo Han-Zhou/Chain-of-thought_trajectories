@@ -41,12 +41,15 @@ def _dropout_eligible_steps(cot_steps: list[str]) -> tuple[list[str], bool]:
     return (cot_steps if first_is_reasoning else cot_steps[1:]), first_is_reasoning
 
 
-def _jackknife_sample_steps(cot_steps: list[str], nb_dropout_samples: int, experimental_grid: bool = False):
+def _jackknife_sample_steps(cot_steps: list[str], nb_dropout_samples: int, experimental_grid: bool = False, preserve_final_step: bool = False):
     """Sample jackknife keep/drop masks shared by both 'default' and 'true' modes.
 
     If the first step starts with "Step" (case/whitespace insensitive), it's treated as
     a reasoning step and can be masked. Otherwise, it's treated as a preamble and always kept.
     From the eligible steps, keeps exactly ceil(sqrt(k)) per sample (or k directly in grid mode).
+
+    When preserve_final_step is True, the last eligible step is always kept and the
+    masking pool is computed from n-1 steps instead of n.
 
     When experimental_grid is True, performs nb_dropout_samples runs of a 10-step grid:
     - For each of nb_dropout_samples runs:
@@ -60,6 +63,7 @@ def _jackknife_sample_steps(cot_steps: list[str], nb_dropout_samples: int, exper
     """
     steps, first_is_reasoning = _dropout_eligible_steps(cot_steps)
     n = len(steps)
+    maskable = n - 1 if (preserve_final_step and n > 1) else n
 
     # Grid mode: nb_dropout_samples runs of 10-step grid each
     if experimental_grid:
@@ -69,16 +73,16 @@ def _jackknife_sample_steps(cot_steps: list[str], nb_dropout_samples: int, exper
         for run in range(nb_dropout_samples):
             for i in range(1, 11):
                 if i < 10:
-                    k_i = math.floor(i * n / 10)
-                    nb_keep = k_i  # Use k directly, no sqrt
+                    k_i = math.floor(i * maskable / 10)
+                    nb_keep = k_i
                 else:
-                    # Iteration 10: keep all steps
-                    nb_keep = n
+                    nb_keep = maskable
 
-                # Randomly select nb_keep steps from n total steps
-                selected_indices = np.random.choice(n, size=nb_keep, replace=False)
+                selected_indices = np.random.choice(maskable, size=nb_keep, replace=False)
                 is_step_selected = np.zeros(n, dtype=bool)
                 is_step_selected[selected_indices] = True
+                if preserve_final_step and n > 1:
+                    is_step_selected[n - 1] = True
 
                 # Build kept_indices accounting for preamble
                 if first_is_reasoning:
@@ -92,11 +96,13 @@ def _jackknife_sample_steps(cot_steps: list[str], nb_dropout_samples: int, exper
         return kept_indices, step_masks
 
     # Fall through to existing logic for non-grid mode
-    k = n
+    k = maskable
     nb_keep = _jackknife_nb_keep(k)
     nb_mask = k - nb_keep
 
-    is_step_selected = np.ones((nb_dropout_samples, k), dtype=bool)
+    is_step_selected = np.ones((nb_dropout_samples, n), dtype=bool)
+    if preserve_final_step and n > 1:
+        is_step_selected[:, n - 1] = True
     for i in range(nb_dropout_samples):
         masked_indices = np.random.choice(k, size=nb_mask, replace=False)
         is_step_selected[i, masked_indices] = False
@@ -104,14 +110,92 @@ def _jackknife_sample_steps(cot_steps: list[str], nb_dropout_samples: int, exper
     kept_indices = []
     for i in range(nb_dropout_samples):
         if first_is_reasoning:
-            # All indices can be selected, no forced first index
-            sample_kept = [j for j in range(k) if is_step_selected[i, j]]
+            sample_kept = [j for j in range(n) if is_step_selected[i, j]]
         else:
-            # index 0 always kept (first step is preamble); then add 1+j for each selected optional step
-            sample_kept = [0] + [1 + j for j in range(k) if is_step_selected[i, j]]
+            sample_kept = [0] + [1 + j for j in range(n) if is_step_selected[i, j]]
         kept_indices.append(sample_kept)
 
     step_masks = is_step_selected.astype(int).tolist()
+    return kept_indices, step_masks
+
+
+def _bootstrap_sample_steps(cot_steps: list[str], nb_samples: int = 100):
+    """Sample bootstrap replicates of CoT steps (with replacement).
+
+    Always keeps the final eligible step. Samples (n-1) steps with replacement
+    from the first (n-1) eligible steps, sorts them, appends the final step.
+    Total steps per sample = n (same length as original eligible set).
+
+    Returns:
+        kept_indices: list[list[int]] — per-sample list of original cot_steps
+            indices (may contain duplicates)
+        step_counts: list[list[int]] — per-sample count of how many times each
+            eligible step was sampled (analogous to binary step_masks but ≥ 0)
+    """
+    steps, first_is_reasoning = _dropout_eligible_steps(cot_steps)
+    n = len(steps)
+    if n <= 1:
+        return [], []
+
+    pool_size = n - 1
+
+    kept_indices = []
+    step_counts = []
+    for _ in range(nb_samples):
+        sampled = np.sort(np.random.choice(pool_size, size=pool_size, replace=True))
+        sampled = np.append(sampled, n - 1)
+
+        counts = np.zeros(n, dtype=int)
+        for idx in sampled:
+            counts[idx] += 1
+
+        if first_is_reasoning:
+            sample_kept = sampled.tolist()
+        else:
+            sample_kept = [0] + [1 + j for j in sampled]
+
+        kept_indices.append(sample_kept)
+        step_counts.append(counts.tolist())
+
+    return kept_indices, step_counts
+
+
+def _coinflip_sample_steps(cot_steps: list[str], nb_dropout_samples: int, threshold: float = 0.5, preserve_final_step: bool = False):
+    """Sample coin-flip keep/drop masks for token-level dropout.
+
+    Each eligible step is independently kept with probability `threshold`.
+    If all steps are dropped in a sample, that sample is redrawn.
+
+    Returns:
+        kept_indices: list[list[int]] — per-sample list of original cot_steps indices that are kept
+        step_masks: list[list[int]] — per-sample binary masks over the optional steps (1=kept, 0=dropped)
+    """
+    steps, first_is_reasoning = _dropout_eligible_steps(cot_steps)
+    n = len(steps)
+    maskable = n - 1 if (preserve_final_step and n > 1) else n
+
+    kept_indices = []
+    step_masks = []
+
+    for _ in range(nb_dropout_samples):
+        while True:
+            selected = np.random.random(maskable) <= threshold
+            if selected.any():
+                break
+
+        is_step_selected = np.zeros(n, dtype=bool)
+        is_step_selected[:maskable] = selected
+        if preserve_final_step and n > 1:
+            is_step_selected[n - 1] = True
+
+        if first_is_reasoning:
+            sample_kept = [j for j in range(n) if is_step_selected[j]]
+        else:
+            sample_kept = [0] + [1 + j for j in range(n) if is_step_selected[j]]
+
+        kept_indices.append(sample_kept)
+        step_masks.append(is_step_selected.astype(int).tolist())
+
     return kept_indices, step_masks
 
 
@@ -178,6 +262,10 @@ def compute_all_confidence_scores(
     experimental_jackknife: str | None = None,
     experimental_modification: str | None = None,
     experimental_grid: bool = False,
+    vanilla_only: bool = False,
+    preserve_final_step: bool = False,
+    experimental_bootstrap: bool = False,
+    experimental_coinflip_true: bool = False,
 ) -> AllConfidenceData:
     debug_info = {}
 
@@ -250,8 +338,13 @@ def compute_all_confidence_scores(
     early_late_split = base_tokens.shape[1]
 
     if gen_cache is not None:
-        precomputed_early_cache = copy.deepcopy(gen_cache)
-        crop_cache(precomputed_early_cache, early_late_split)
+        if vanilla_only:
+            # Take ownership of gen_cache directly — no deepcopy. Crop in place.
+            precomputed_early_cache = gen_cache
+            crop_cache(precomputed_early_cache, early_late_split)
+        else:
+            precomputed_early_cache = copy.deepcopy(gen_cache)
+            crop_cache(precomputed_early_cache, early_late_split)
     else:
         # No generation cache available — one forward pass to build early_cache
         device = next(llm.model.parameters()).device
@@ -262,11 +355,15 @@ def compute_all_confidence_scores(
         precomputed_early_cache = early_output.past_key_values
 
     # --- Coin-flip dropout (skipped when mode is "default" or "true") ---
-    _coinflip_samples = 0 if experimental_jackknife in ["default", "true"] or not can_run_step_dropout else nb_dropout_samples
+    _coinflip_samples = 0 if experimental_jackknife in ["default", "true"] or experimental_coinflip_true or not can_run_step_dropout else nb_dropout_samples
     vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks, masked_steps_dbg = \
         dropout_answerlogits(llm, messages, cot_only_text, parsed_output, _coinflip_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                              gen_cache=gen_cache, base_tokens=base_tokens,
-                             precomputed_early_cache=precomputed_early_cache)
+                             precomputed_early_cache=precomputed_early_cache,
+                             vanilla_only=vanilla_only,
+                             consume_early_cache=vanilla_only,
+                             recrop_early_cache_len=early_late_split if vanilla_only else None,
+                             preserve_final_step=preserve_final_step)
     if dbg:
         debug_info["answer_logits"] = dbg
     if masked_steps_dbg:
@@ -275,7 +372,11 @@ def compute_all_confidence_scores(
     vanilla_ptrue1, vanilla_ptrue2, vanilla_ptrue3, dropout_ptrue1, dropout_ptrue2, dropout_ptrue3, dbg, _ = \
         dropout_indirectlogits(llm, messages, cot_only_text, parsed_output, _coinflip_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                                gen_cache=gen_cache, base_tokens=base_tokens,
-                               precomputed_early_cache=precomputed_early_cache)
+                               precomputed_early_cache=precomputed_early_cache,
+                               vanilla_only=vanilla_only,
+                               consume_early_cache=vanilla_only,
+                               recrop_early_cache_len=early_late_split if vanilla_only else None,
+                               preserve_final_step=preserve_final_step)
     if dbg:
         debug_info["indirect_logits"] = dbg
 
@@ -286,7 +387,9 @@ def compute_all_confidence_scores(
         dropout_verbalconf(llm, messages, cot_only_text, parsed_output, _coinflip_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                            gen_cache=gen_cache, base_tokens=base_tokens,
                            precomputed_early_cache=precomputed_early_cache,
-                           consume_early_cache=(experimental_jackknife is None))
+                           consume_early_cache=(experimental_jackknife is None),
+                           vanilla_only=vanilla_only,
+                           preserve_final_step=preserve_final_step)
     if dbg:
         debug_info["verbconf"] = dbg
 
@@ -298,7 +401,7 @@ def compute_all_confidence_scores(
         if can_run_step_dropout:
             # Sample jackknife step masks once, reuse across all methods
             jk_kept_indices, jk_step_masks = _jackknife_sample_steps(
-                parsed_output.cot_steps, nb_dropout_samples, experimental_grid=experimental_grid)
+                parsed_output.cot_steps, nb_dropout_samples, experimental_grid=experimental_grid, preserve_final_step=preserve_final_step)
 
             # Use actual number of samples from the masks (nb_dropout_samples * 10 in grid mode)
             effective_nb_samples = len(jk_step_masks)
@@ -358,6 +461,7 @@ def compute_all_confidence_scores(
                 debug_info=debug_info,
                 normalized_content=normalized_content,
                 experimental_grid=experimental_grid,
+                preserve_final_step=preserve_final_step,
             )
         else:
             jackknife_scores = _empty_sampled_confidence_scores()
@@ -384,6 +488,37 @@ def compute_all_confidence_scores(
                 (assistant_prefill + cot_only_text + verbconf_suffix).strip()),
         }
 
+    # --- Bootstrap (only when flag is set) ---
+    bootstrap_scores = None
+    if experimental_bootstrap:
+        if can_run_step_dropout:
+            bootstrap_scores, bs_step_counts = _bootstrap_forward(
+                llm, messages, cot_only_text, parsed_output,
+                nb_dropout_samples=nb_dropout_samples,
+                assistant_prefill=assistant_prefill,
+                debug_conf=debug_conf,
+                debug_info=debug_info,
+                normalized_content=normalized_content,
+            )
+        else:
+            bootstrap_scores = _empty_sampled_confidence_scores()
+
+    # --- Coinflip-true (only when flag is set) ---
+    coinflip_true_scores = None
+    if experimental_coinflip_true:
+        if can_run_step_dropout:
+            coinflip_true_scores, _cf_masks = _coinflip_true_forward(
+                llm, messages, cot_only_text, parsed_output,
+                nb_dropout_samples=nb_dropout_samples,
+                assistant_prefill=assistant_prefill,
+                debug_conf=debug_conf,
+                debug_info=debug_info,
+                normalized_content=normalized_content,
+                preserve_final_step=preserve_final_step,
+            )
+        else:
+            coinflip_true_scores = _empty_sampled_confidence_scores()
+
     return AllConfidenceData(
         vanilla_confidences=ConfidenceScores(
             answer_probabilities=vanilla_answer_probs,
@@ -409,6 +544,8 @@ def compute_all_confidence_scores(
             step_masks=dropout_step_masks,
         ),
         jackknife_confidences=jackknife_scores,
+        bootstrap_confidences=bootstrap_scores,
+        coinflip_true_confidences=coinflip_true_scores,
         debug_info=debug_info,
     )
 
@@ -474,6 +611,7 @@ def _jackknife_true_forward(
     debug_info: dict,
     normalized_content: str,
     experimental_grid: bool = False,
+    preserve_final_step: bool = False,
 ) -> tuple[ConfidenceScores, list[list[int]]]:
     """Jackknife 'true' mode: rebuild prompts from sampled steps and run fresh forward passes.
 
@@ -488,7 +626,7 @@ def _jackknife_true_forward(
 
     # Sample which steps to keep — shared selection for all confidence methods
     kept_indices_per_sample, step_masks = _jackknife_sample_steps(
-        parsed_output.cot_steps, nb_dropout_samples, experimental_grid=experimental_grid)
+        parsed_output.cot_steps, nb_dropout_samples, experimental_grid=experimental_grid, preserve_final_step=preserve_final_step)
 
     # Use actual number of samples (may be nb_dropout_samples * 10 in grid mode)
     effective_nb_samples = len(kept_indices_per_sample)
@@ -515,7 +653,7 @@ def _jackknife_true_forward(
     # Verbconf setup
     verbconf_strings = ANSWER_TOKENS['VERBCONF']
     token_seqs = [llm.tokenizer.encode(s, add_special_tokens=False) for s in verbconf_strings]
-    score_values = torch.FloatTensor([int(s) / 100 for s in verbconf_strings])
+    score_values = torch.tensor([int(s) / 100 for s in verbconf_strings], dtype=torch.float64)
 
     # Accumulators for per-sample results
     all_answer_probs = []
@@ -572,12 +710,12 @@ def _jackknife_true_forward(
         token_strings = [llm.tokenizer.decode([answer_toks[t].item()]) for t in range(nb_answer_tokens)]
 
         v_logits = ans_output.logits[0, a_start - 1:a_end - 1, :]
-        v_probs = v_logits.softmax(dim=-1)
+        v_probs = v_logits.double().softmax(dim=-1)
         sample_answer_probs = [{token_strings[t]: v_probs[t, answer_toks[t]].item()} for t in range(nb_answer_tokens)]
         all_answer_probs.append(sample_answer_probs)
 
         v_logprobs = torch.nan_to_num(v_probs.log(), neginf=-99)
-        entropy_values = (-(v_probs * v_logprobs).sum(dim=-1)).float().cpu().numpy().tolist()
+        entropy_values = (-(v_probs * v_logprobs).sum(dim=-1)).cpu().numpy().tolist()
         sample_entropy = [{token_strings[t]: entropy_values[t]} for t in range(nb_answer_tokens)]
         all_answer_entropy.append(sample_entropy)
 
@@ -594,7 +732,7 @@ def _jackknife_true_forward(
 
         p1_pos = ptrue1_output.logits[0, -1, positive_true_ids].sum()
         p1_neg = ptrue1_output.logits[0, -1, negative_false_ids].sum()
-        p1_sm = torch.softmax(torch.stack([p1_pos.float(), p1_neg.float()]), dim=0)
+        p1_sm = torch.softmax(torch.stack([p1_pos.double(), p1_neg.double()]), dim=0)
         all_ptrue1.append({"True": p1_sm[0].item(), "False": p1_sm[1].item()})
 
         # --- indirect_ptrue2 (also used for ptrue3) ---
@@ -610,13 +748,13 @@ def _jackknife_true_forward(
 
         p2_pos = ptrue2_output.logits[0, -1, positive_yes_ids].sum()
         p2_neg = ptrue2_output.logits[0, -1, negative_no_ids].sum()
-        p2_sm = torch.softmax(torch.stack([p2_pos.float(), p2_neg.float()]), dim=0)
+        p2_sm = torch.softmax(torch.stack([p2_pos.double(), p2_neg.double()]), dim=0)
         all_ptrue2.append({"Yes": p2_sm[0].item(), "No": p2_sm[1].item()})
 
         # ptrue3: Yes/No only (no synonyms) — reuse ptrue2 output
         p3_pos = ptrue2_output.logits[0, -1, yes_only_id[0]]
         p3_neg = ptrue2_output.logits[0, -1, no_only_id[0]]
-        p3_sm = torch.softmax(torch.stack([p3_pos.float(), p3_neg.float()]), dim=0)
+        p3_sm = torch.softmax(torch.stack([p3_pos.double(), p3_neg.double()]), dim=0)
         all_ptrue3.append({"Yes": p3_sm[0].item(), "No": p3_sm[1].item()})
 
         # --- verbconf ---
@@ -676,7 +814,399 @@ def _jackknife_true_forward(
     return scores, step_masks
 
 
-def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None):
+def _coinflip_true_forward(
+    llm: LLM,
+    messages: list[dict],
+    cot_only_text: str,
+    parsed_output: ParsedOutput,
+    nb_dropout_samples: int,
+    assistant_prefill: str,
+    debug_conf: bool,
+    debug_info: dict,
+    normalized_content: str,
+    preserve_final_step: bool = False,
+) -> tuple[ConfidenceScores, list[list[int]]]:
+    """Coin-flip 'true' mode: rebuild prompts from sampled steps and run fresh forward passes.
+
+    Like _jackknife_true_forward but each eligible step is independently kept
+    with p=0.5 (Bernoulli) instead of a fixed-count mask.
+    """
+    device = next(llm.model.parameters()).device
+
+    kept_indices_per_sample, step_masks = _coinflip_sample_steps(
+        parsed_output.cot_steps, nb_dropout_samples, preserve_final_step=preserve_final_step)
+
+    effective_nb_samples = len(kept_indices_per_sample)
+
+    ans_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
+    ptrue1_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}.\nTrue/False:"
+    ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"
+    verbconf_suffix = (
+        f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
+        "\nPlease respond with a score from 0 to 100 in <confidence> </confidence> tags."
+        "\nHow confident are you in your previous answer?"
+        "\n<confidence>"
+    )
+
+    positive_true_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' True'])
+    negative_false_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' False'])
+    positive_yes_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' Yes'])
+    negative_no_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' No'])
+    yes_only_id = llm.tokenizer.encode(' Yes', add_special_tokens=False)
+    no_only_id = llm.tokenizer.encode(' No', add_special_tokens=False)
+
+    verbconf_strings = ANSWER_TOKENS['VERBCONF']
+    token_seqs = [llm.tokenizer.encode(s, add_special_tokens=False) for s in verbconf_strings]
+    score_values = torch.tensor([int(s) / 100 for s in verbconf_strings], dtype=torch.float64)
+
+    all_answer_probs = []
+    all_answer_entropy = []
+    all_ptrue1 = []
+    all_ptrue2 = []
+    all_ptrue3 = []
+    all_verbconf = []
+    all_verbconf_dist = []
+    all_verbconf_top_scores = []
+    all_verbconf_top_probs = []
+
+    dbg_prompts_answer = []
+    dbg_prompts_ptrue1 = []
+    dbg_prompts_ptrue2 = []
+    dbg_prompts_verbconf = []
+
+    for sample_idx in range(effective_nb_samples):
+        kept_indices = kept_indices_per_sample[sample_idx]
+
+        reconstructed_cot = _reconstruct_cot_text(
+            normalized_content, parsed_output.cot_steps, kept_indices)
+
+        reconstructed_base = (assistant_prefill + reconstructed_cot).strip() if assistant_prefill else reconstructed_cot.strip()
+
+        # --- answer_logits ---
+        ans_content = (reconstructed_base + ans_suffix).strip()
+        ans_prompt = _build_prompt_text(llm, messages, ans_content)
+        ans_tokens = llm.tokenizer(ans_prompt, return_tensors="pt")["input_ids"].to(device)
+
+        if debug_conf:
+            dbg_prompts_answer.append(ans_prompt)
+
+        boxed_string = f"\\boxed{{{parsed_output.final_answer}}}"
+        with torch.no_grad():
+            ans_output = llm.model.forward(input_ids=ans_tokens)
+
+        ans_token_ids = ans_tokens[0]
+        boxed_start, boxed_end = find_token_indices_from_end(
+            llm.tokenizer, ans_token_ids, boxed_string, llm.model_name)
+        a_start, a_end = find_token_indices_from_end(
+            llm.tokenizer, ans_token_ids[boxed_start:boxed_end],
+            parsed_output.final_answer, llm.model_name)
+        a_start += boxed_start
+        a_end += boxed_start
+
+        answer_toks = ans_token_ids[a_start:a_end]
+        nb_answer_tokens = len(answer_toks)
+        token_strings = [llm.tokenizer.decode([answer_toks[t].item()]) for t in range(nb_answer_tokens)]
+
+        v_logits = ans_output.logits[0, a_start - 1:a_end - 1, :]
+        v_probs = v_logits.double().softmax(dim=-1)
+        sample_answer_probs = [{token_strings[t]: v_probs[t, answer_toks[t]].item()} for t in range(nb_answer_tokens)]
+        all_answer_probs.append(sample_answer_probs)
+
+        v_logprobs = torch.nan_to_num(v_probs.log(), neginf=-99)
+        entropy_values = (-(v_probs * v_logprobs).sum(dim=-1)).cpu().numpy().tolist()
+        sample_entropy = [{token_strings[t]: entropy_values[t]} for t in range(nb_answer_tokens)]
+        all_answer_entropy.append(sample_entropy)
+
+        # --- indirect_ptrue1 ---
+        ptrue1_content = (reconstructed_base + ptrue1_suffix).strip()
+        ptrue1_prompt = _build_prompt_text(llm, messages, ptrue1_content)
+        ptrue1_tokens = llm.tokenizer(ptrue1_prompt, return_tensors="pt")["input_ids"].to(device)
+
+        if debug_conf:
+            dbg_prompts_ptrue1.append(ptrue1_prompt)
+
+        with torch.no_grad():
+            ptrue1_output = llm.model.forward(input_ids=ptrue1_tokens)
+
+        p1_pos = ptrue1_output.logits[0, -1, positive_true_ids].sum()
+        p1_neg = ptrue1_output.logits[0, -1, negative_false_ids].sum()
+        p1_sm = torch.softmax(torch.stack([p1_pos.double(), p1_neg.double()]), dim=0)
+        all_ptrue1.append({"True": p1_sm[0].item(), "False": p1_sm[1].item()})
+
+        # --- indirect_ptrue2 (also used for ptrue3) ---
+        ptrue2_content = (reconstructed_base + ptrue2_suffix).strip()
+        ptrue2_prompt = _build_prompt_text(llm, messages, ptrue2_content)
+        ptrue2_tokens = llm.tokenizer(ptrue2_prompt, return_tensors="pt")["input_ids"].to(device)
+
+        if debug_conf:
+            dbg_prompts_ptrue2.append(ptrue2_prompt)
+
+        with torch.no_grad():
+            ptrue2_output = llm.model.forward(input_ids=ptrue2_tokens)
+
+        p2_pos = ptrue2_output.logits[0, -1, positive_yes_ids].sum()
+        p2_neg = ptrue2_output.logits[0, -1, negative_no_ids].sum()
+        p2_sm = torch.softmax(torch.stack([p2_pos.double(), p2_neg.double()]), dim=0)
+        all_ptrue2.append({"Yes": p2_sm[0].item(), "No": p2_sm[1].item()})
+
+        p3_pos = ptrue2_output.logits[0, -1, yes_only_id[0]]
+        p3_neg = ptrue2_output.logits[0, -1, no_only_id[0]]
+        p3_sm = torch.softmax(torch.stack([p3_pos.double(), p3_neg.double()]), dim=0)
+        all_ptrue3.append({"Yes": p3_sm[0].item(), "No": p3_sm[1].item()})
+
+        # --- verbconf ---
+        verbconf_content = (reconstructed_base + verbconf_suffix).strip()
+        verbconf_prompt = _build_prompt_text(llm, messages, verbconf_content)
+        verbconf_tokens = llm.tokenizer(verbconf_prompt, return_tensors="pt")["input_ids"].to(device)
+
+        if debug_conf:
+            dbg_prompts_verbconf.append(verbconf_prompt)
+
+        with torch.no_grad():
+            verbconf_output = llm.model.forward(input_ids=verbconf_tokens)
+
+        vc_probs = _compute_verbconf_joint_probs(llm, verbconf_output, token_seqs, device)
+        vc_probs_1d = vc_probs[0] if vc_probs.dim() > 1 else vc_probs
+        sample_verbconf = (score_values * vc_probs_1d).sum().item()
+        all_verbconf.append(sample_verbconf)
+        all_verbconf_dist.append(vc_probs_1d.tolist())
+        top_idx = vc_probs_1d.argmax().item()
+        all_verbconf_top_scores.append(top_idx)
+        all_verbconf_top_probs.append(vc_probs_1d[top_idx].item())
+
+        torch.cuda.empty_cache()
+
+    if debug_conf:
+        debug_info["coinflip_true_prompts"] = {
+            "answer_logits": dbg_prompts_answer,
+            "indirect_ptrue1": dbg_prompts_ptrue1,
+            "indirect_ptrue2": dbg_prompts_ptrue2,
+            "verbconf": dbg_prompts_verbconf,
+        }
+        debug_info["coinflip_true_masked_steps"] = [
+            {
+                "sample_idx": i,
+                "kept_step_indices": kept_indices_per_sample[i],
+                "kept_steps": [parsed_output.cot_steps[j] for j in kept_indices_per_sample[i] if j < len(parsed_output.cot_steps)],
+                "dropped_steps": [parsed_output.cot_steps[j] for j in range(len(parsed_output.cot_steps)) if j not in kept_indices_per_sample[i]],
+            }
+            for i in range(effective_nb_samples)
+        ]
+
+    scores = ConfidenceScores(
+        answer_probabilities=all_answer_probs,
+        answer_entropy=all_answer_entropy,
+        indirect_ptrue1_probabilities=all_ptrue1,
+        indirect_ptrue2_probabilities=all_ptrue2,
+        indirect_ptrue3_probabilities=all_ptrue3,
+        verbconf_probabilities=all_verbconf,
+        verbconf_distribution=all_verbconf_dist,
+        verbconf_top_score=all_verbconf_top_scores,
+        verbconf_top_prob=all_verbconf_top_probs,
+        step_masks=step_masks,
+    )
+
+    return scores, step_masks
+
+
+def _bootstrap_forward(
+    llm: LLM,
+    messages: list[dict],
+    cot_only_text: str,
+    parsed_output: ParsedOutput,
+    nb_dropout_samples: int,
+    assistant_prefill: str,
+    debug_conf: bool,
+    debug_info: dict,
+    normalized_content: str,
+) -> tuple[ConfidenceScores, list[list[int]]]:
+    """Bootstrap confidence: resample steps with replacement and run fresh forward passes.
+
+    For each bootstrap sample, draws (n-1) steps with replacement from the
+    first (n-1) eligible steps, sorts them, appends the final step, rebuilds
+    the prompt, and runs all four confidence methods via fresh forward passes.
+
+    Returns (ConfidenceScores, step_counts).
+    """
+    device = next(llm.model.parameters()).device
+
+    kept_indices_per_sample, step_counts = _bootstrap_sample_steps(
+        parsed_output.cot_steps, nb_dropout_samples)
+
+    effective_nb_samples = len(kept_indices_per_sample)
+
+    ans_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
+    ptrue1_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}.\nTrue/False:"
+    ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"
+    verbconf_suffix = (
+        f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
+        "\nPlease respond with a score from 0 to 100 in <confidence> </confidence> tags."
+        "\nHow confident are you in your previous answer?"
+        "\n<confidence>"
+    )
+
+    positive_true_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' True'])
+    negative_false_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' False'])
+    positive_yes_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' Yes'])
+    negative_no_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' No'])
+    yes_only_id = llm.tokenizer.encode(' Yes', add_special_tokens=False)
+    no_only_id = llm.tokenizer.encode(' No', add_special_tokens=False)
+
+    verbconf_strings = ANSWER_TOKENS['VERBCONF']
+    token_seqs = [llm.tokenizer.encode(s, add_special_tokens=False) for s in verbconf_strings]
+    score_values = torch.tensor([int(s) / 100 for s in verbconf_strings], dtype=torch.float64)
+
+    all_answer_probs = []
+    all_answer_entropy = []
+    all_ptrue1 = []
+    all_ptrue2 = []
+    all_ptrue3 = []
+    all_verbconf = []
+    all_verbconf_dist = []
+    all_verbconf_top_scores = []
+    all_verbconf_top_probs = []
+
+    dbg_prompts_answer = []
+    dbg_prompts_ptrue1 = []
+    dbg_prompts_ptrue2 = []
+    dbg_prompts_verbconf = []
+
+    for sample_idx in range(effective_nb_samples):
+        kept_indices = kept_indices_per_sample[sample_idx]
+
+        reconstructed_cot = _reconstruct_cot_text(
+            normalized_content, parsed_output.cot_steps, kept_indices)
+
+        reconstructed_base = (assistant_prefill + reconstructed_cot).strip() if assistant_prefill else reconstructed_cot.strip()
+
+        # --- answer_logits ---
+        ans_content = (reconstructed_base + ans_suffix).strip()
+        ans_prompt = _build_prompt_text(llm, messages, ans_content)
+        ans_tokens = llm.tokenizer(ans_prompt, return_tensors="pt")["input_ids"].to(device)
+
+        if debug_conf:
+            dbg_prompts_answer.append(ans_prompt)
+
+        boxed_string = f"\\boxed{{{parsed_output.final_answer}}}"
+        with torch.no_grad():
+            ans_output = llm.model.forward(input_ids=ans_tokens)
+
+        ans_token_ids = ans_tokens[0]
+        boxed_start, boxed_end = find_token_indices_from_end(
+            llm.tokenizer, ans_token_ids, boxed_string, llm.model_name)
+        a_start, a_end = find_token_indices_from_end(
+            llm.tokenizer, ans_token_ids[boxed_start:boxed_end],
+            parsed_output.final_answer, llm.model_name)
+        a_start += boxed_start
+        a_end += boxed_start
+
+        answer_toks = ans_token_ids[a_start:a_end]
+        nb_answer_tokens = len(answer_toks)
+        token_strings = [llm.tokenizer.decode([answer_toks[t].item()]) for t in range(nb_answer_tokens)]
+
+        v_logits = ans_output.logits[0, a_start - 1:a_end - 1, :]
+        v_probs = v_logits.double().softmax(dim=-1)
+        sample_answer_probs = [{token_strings[t]: v_probs[t, answer_toks[t]].item()} for t in range(nb_answer_tokens)]
+        all_answer_probs.append(sample_answer_probs)
+
+        v_logprobs = torch.nan_to_num(v_probs.log(), neginf=-99)
+        entropy_values = (-(v_probs * v_logprobs).sum(dim=-1)).cpu().numpy().tolist()
+        sample_entropy = [{token_strings[t]: entropy_values[t]} for t in range(nb_answer_tokens)]
+        all_answer_entropy.append(sample_entropy)
+
+        # --- indirect_ptrue1 ---
+        ptrue1_content = (reconstructed_base + ptrue1_suffix).strip()
+        ptrue1_prompt = _build_prompt_text(llm, messages, ptrue1_content)
+        ptrue1_tokens = llm.tokenizer(ptrue1_prompt, return_tensors="pt")["input_ids"].to(device)
+
+        if debug_conf:
+            dbg_prompts_ptrue1.append(ptrue1_prompt)
+
+        with torch.no_grad():
+            ptrue1_output = llm.model.forward(input_ids=ptrue1_tokens)
+
+        p1_pos = ptrue1_output.logits[0, -1, positive_true_ids].sum()
+        p1_neg = ptrue1_output.logits[0, -1, negative_false_ids].sum()
+        p1_sm = torch.softmax(torch.stack([p1_pos.double(), p1_neg.double()]), dim=0)
+        all_ptrue1.append({"True": p1_sm[0].item(), "False": p1_sm[1].item()})
+
+        # --- indirect_ptrue2 (also used for ptrue3) ---
+        ptrue2_content = (reconstructed_base + ptrue2_suffix).strip()
+        ptrue2_prompt = _build_prompt_text(llm, messages, ptrue2_content)
+        ptrue2_tokens = llm.tokenizer(ptrue2_prompt, return_tensors="pt")["input_ids"].to(device)
+
+        if debug_conf:
+            dbg_prompts_ptrue2.append(ptrue2_prompt)
+
+        with torch.no_grad():
+            ptrue2_output = llm.model.forward(input_ids=ptrue2_tokens)
+
+        p2_pos = ptrue2_output.logits[0, -1, positive_yes_ids].sum()
+        p2_neg = ptrue2_output.logits[0, -1, negative_no_ids].sum()
+        p2_sm = torch.softmax(torch.stack([p2_pos.double(), p2_neg.double()]), dim=0)
+        all_ptrue2.append({"Yes": p2_sm[0].item(), "No": p2_sm[1].item()})
+
+        p3_pos = ptrue2_output.logits[0, -1, yes_only_id[0]]
+        p3_neg = ptrue2_output.logits[0, -1, no_only_id[0]]
+        p3_sm = torch.softmax(torch.stack([p3_pos.double(), p3_neg.double()]), dim=0)
+        all_ptrue3.append({"Yes": p3_sm[0].item(), "No": p3_sm[1].item()})
+
+        # --- verbconf ---
+        verbconf_content = (reconstructed_base + verbconf_suffix).strip()
+        verbconf_prompt = _build_prompt_text(llm, messages, verbconf_content)
+        verbconf_tokens = llm.tokenizer(verbconf_prompt, return_tensors="pt")["input_ids"].to(device)
+
+        if debug_conf:
+            dbg_prompts_verbconf.append(verbconf_prompt)
+
+        with torch.no_grad():
+            verbconf_output = llm.model.forward(input_ids=verbconf_tokens)
+
+        vc_probs = _compute_verbconf_joint_probs(llm, verbconf_output, token_seqs, device)
+        vc_probs_1d = vc_probs[0] if vc_probs.dim() > 1 else vc_probs
+        sample_verbconf = (score_values * vc_probs_1d).sum().item()
+        all_verbconf.append(sample_verbconf)
+        all_verbconf_dist.append(vc_probs_1d.tolist())
+        top_idx = vc_probs_1d.argmax().item()
+        all_verbconf_top_scores.append(top_idx)
+        all_verbconf_top_probs.append(vc_probs_1d[top_idx].item())
+
+        torch.cuda.empty_cache()
+
+    if debug_conf:
+        debug_info["bootstrap_prompts"] = {
+            "answer_logits": dbg_prompts_answer,
+            "indirect_ptrue1": dbg_prompts_ptrue1,
+            "indirect_ptrue2": dbg_prompts_ptrue2,
+            "verbconf": dbg_prompts_verbconf,
+        }
+        debug_info["bootstrap_samples"] = [
+            {
+                "sample_idx": i,
+                "kept_step_indices": kept_indices_per_sample[i],
+                "step_counts": step_counts[i],
+                "kept_steps": [parsed_output.cot_steps[j] for j in kept_indices_per_sample[i] if j < len(parsed_output.cot_steps)],
+            }
+            for i in range(effective_nb_samples)
+        ]
+
+    scores = ConfidenceScores(
+        answer_probabilities=all_answer_probs,
+        answer_entropy=all_answer_entropy,
+        indirect_ptrue1_probabilities=all_ptrue1,
+        indirect_ptrue2_probabilities=all_ptrue2,
+        indirect_ptrue3_probabilities=all_ptrue3,
+        verbconf_probabilities=all_verbconf,
+        verbconf_distribution=all_verbconf_dist,
+        verbconf_top_score=all_verbconf_top_scores,
+        verbconf_top_prob=all_verbconf_top_probs,
+        step_masks=step_counts,
+    )
+
+    return scores, step_counts
+
+
+def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None, vanilla_only=False, recrop_early_cache_len=None, preserve_final_step=False):
     """Logit-based confidence on the answer tokens themselves."""
     suffix_text = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
     # logger.info("dropout_answerlogits: generated_text='%s', suffix='%s'", generated_text[:100], suffix_text)
@@ -689,7 +1219,10 @@ def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropou
                         precomputed_early_cache=precomputed_early_cache,
                         consume_early_cache=consume_early_cache,
                         debug_conf=debug_conf,
-                        jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks)
+                        jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks,
+                        vanilla_only=vanilla_only,
+                        recrop_early_cache_len=recrop_early_cache_len,
+                        preserve_final_step=preserve_final_step)
 
     answer_tokens = late_tokens[0, ans_start:ans_end]
     nb_answer_tokens = len(answer_tokens)
@@ -698,24 +1231,24 @@ def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropou
     # --- Vanilla ---
     # Logit at position t-1 predicts token at position t
     v_logits = vanilla_out.logits[0, ans_start - 1:ans_end - 1, :]
-    v_probs = v_logits.softmax(dim=-1)
+    v_probs = v_logits.double().softmax(dim=-1)
 
     vanilla_answer_probs = [{token_strings[t]: v_probs[t, answer_tokens[t]].item()} for t in range(nb_answer_tokens)]
 
     v_logprobs = torch.nan_to_num(v_probs.log(), neginf=-99)
-    entropy_values = (-(v_probs * v_logprobs).sum(dim=-1)).float().cpu().numpy().tolist()
+    entropy_values = (-(v_probs * v_logprobs).sum(dim=-1)).cpu().numpy().tolist()
     vanilla_answer_entropy = [{token_strings[t]: entropy_values[t]} for t in range(nb_answer_tokens)]
 
     # --- Dropout ---
     if dropout_out is not None:
-        d_probs = dropout_out.logits[:, ans_start - 1:ans_end - 1, :].softmax(dim=-1)
+        d_probs = dropout_out.logits[:, ans_start - 1:ans_end - 1, :].double().softmax(dim=-1)
 
         dropout_answer_probs = [[{token_strings[t]: d_probs[s, t, answer_tokens[t]].item()}
                                   for t in range(nb_answer_tokens)]
                                  for s in range(d_probs.shape[0])]
 
         d_logprobs = torch.nan_to_num(d_probs.log(), neginf=-99)
-        d_entropy_values = (-(d_probs * d_logprobs).sum(dim=-1)).float().cpu().numpy().tolist()
+        d_entropy_values = (-(d_probs * d_logprobs).sum(dim=-1)).cpu().numpy().tolist()
         dropout_answer_entropy = [[{token_strings[t]: d_entropy_values[s][t]} for t in range(nb_answer_tokens)]
                                    for s in range(len(d_entropy_values))]
     else:
@@ -728,7 +1261,7 @@ def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropou
     return vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks, masked_steps_debug
 
 
-def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None):
+def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None, vanilla_only=False, recrop_early_cache_len=None, preserve_final_step=False):
     """P(True) and P(Yes) probing after the answer."""
     # logger.info("dropout_indirectlogits: generated_text='%s'", generated_text[:100])
 
@@ -747,7 +1280,11 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
                         gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
                         precomputed_early_cache=precomputed_early_cache,
-                        jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks)
+                        jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks,
+                        vanilla_only=vanilla_only,
+                        consume_early_cache=vanilla_only,
+                        recrop_early_cache_len=recrop_early_cache_len,
+                        preserve_final_step=preserve_final_step)
 
     # ptrue2: "Is the answer \boxed{<X>}?"
     ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"
@@ -759,19 +1296,22 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
                         gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
                         precomputed_early_cache=precomputed_early_cache,
-                        consume_early_cache=consume_early_cache,
-                        jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks)
+                        consume_early_cache=consume_early_cache or vanilla_only,
+                        jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks,
+                        vanilla_only=vanilla_only,
+                        recrop_early_cache_len=recrop_early_cache_len,
+                        preserve_final_step=preserve_final_step)
 
     # Vanilla ptrue1
     v_pos1 = vanilla1.logits[0, -1, positive_true_ids].sum()
     v_neg1 = vanilla1.logits[0, -1, negative_false_ids].sum()
-    v_softmax1 = torch.softmax(torch.stack([v_pos1.float(), v_neg1.float()]), dim=0)
+    v_softmax1 = torch.softmax(torch.stack([v_pos1.double(), v_neg1.double()]), dim=0)
     vanilla_ptrue1 = {"True": v_softmax1[0].item(), "False": v_softmax1[1].item()}
 
     # Vanilla ptrue2
     v_pos2 = vanilla2.logits[0, -1, positive_yes_ids].sum()
     v_neg2 = vanilla2.logits[0, -1, negative_no_ids].sum()
-    v_softmax2 = torch.softmax(torch.stack([v_pos2.float(), v_neg2.float()]), dim=0)
+    v_softmax2 = torch.softmax(torch.stack([v_pos2.double(), v_neg2.double()]), dim=0)
     vanilla_ptrue2 = {"Yes": v_softmax2[0].item(), "No": v_softmax2[1].item()}
 
     # Vanilla ptrue3 (Yes/No only — no synonyms)
@@ -779,27 +1319,27 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
     no_only_id = llm.tokenizer.encode(' No', add_special_tokens=False)
     v_pos3 = vanilla2.logits[0, -1, yes_only_id[0]]
     v_neg3 = vanilla2.logits[0, -1, no_only_id[0]]
-    v_softmax3 = torch.softmax(torch.stack([v_pos3.float(), v_neg3.float()]), dim=0)
+    v_softmax3 = torch.softmax(torch.stack([v_pos3.double(), v_neg3.double()]), dim=0)
     vanilla_ptrue3 = {"Yes": v_softmax3[0].item(), "No": v_softmax3[1].item()}
 
     # Dropout
     if dropout1 is not None:
         d_pos1 = dropout1.logits[:, -1, positive_true_ids].sum(-1)
         d_neg1 = dropout1.logits[:, -1, negative_false_ids].sum(-1)
-        d_softmax1 = torch.softmax(torch.stack([d_pos1.float(), d_neg1.float()], dim=-1), dim=-1)
+        d_softmax1 = torch.softmax(torch.stack([d_pos1.double(), d_neg1.double()], dim=-1), dim=-1)
         dropout_ptrue1 = [{"True": d_softmax1[s, 0].item(), "False": d_softmax1[s, 1].item()}
                            for s in range(d_softmax1.shape[0])]
 
         d_pos2 = dropout2.logits[:, -1, positive_yes_ids].sum(-1)
         d_neg2 = dropout2.logits[:, -1, negative_no_ids].sum(-1)
-        d_softmax2 = torch.softmax(torch.stack([d_pos2.float(), d_neg2.float()], dim=-1), dim=-1)
+        d_softmax2 = torch.softmax(torch.stack([d_pos2.double(), d_neg2.double()], dim=-1), dim=-1)
         dropout_ptrue2 = [{"Yes": d_softmax2[s, 0].item(), "No": d_softmax2[s, 1].item()}
                            for s in range(d_softmax2.shape[0])]
 
         # Dropout ptrue3 (Yes/No only — no synonyms)
         d_pos3 = dropout2.logits[:, -1, yes_only_id[0]]
         d_neg3 = dropout2.logits[:, -1, no_only_id[0]]
-        d_softmax3 = torch.softmax(torch.stack([d_pos3.float(), d_neg3.float()], dim=-1), dim=-1)
+        d_softmax3 = torch.softmax(torch.stack([d_pos3.double(), d_neg3.double()], dim=-1), dim=-1)
         dropout_ptrue3 = [{"Yes": d_softmax3[s, 0].item(), "No": d_softmax3[s, 1].item()}
                            for s in range(d_softmax3.shape[0])]
     else:
@@ -820,12 +1360,44 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
     return [vanilla_ptrue1], [vanilla_ptrue2], [vanilla_ptrue3], dropout_ptrue1, dropout_ptrue2, dropout_ptrue3, dbg, dropout_step_masks
 
 
+def _slice_cache_batch(cache, start, end):
+    """Return a deepcopied cache with the batch dimension sliced to [start:end].
+
+    Slices first (cheap view), then deepcopies only the sliced tensors so peak
+    memory scales with the chunk size rather than the full batch.
+    """
+    # Build a shallow shell sharing structure, then deepcopy after slicing.
+    if hasattr(cache, 'key_cache'):
+        # Save originals, swap in sliced views, deepcopy, then restore.
+        orig_k = cache.key_cache
+        orig_v = cache.value_cache
+        sliced_k = [
+            (k[start:end] if (k is not None and k.dim() == 4) else k)
+            for k in orig_k
+        ]
+        sliced_v = [
+            (v[start:end] if (v is not None and v.dim() == 4) else v)
+            for v in orig_v
+        ]
+        cache.key_cache = sliced_k
+        cache.value_cache = sliced_v
+        try:
+            sliced = copy.deepcopy(cache)
+        finally:
+            cache.key_cache = orig_k
+            cache.value_cache = orig_v
+        return sliced
+    return copy.deepcopy(cache)
+
+
 def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
     """Compute joint probabilities for multi-token number sequences.
 
     For a number like 42 tokenized as [tok_4, tok_2], computes:
         P(42) = P(tok_4) * P(tok_2 | tok_4)
     Each prefix gets its own cloned KV cache so conditioning is exact.
+
+    Processes the batch dimension in chunks of 10 to reduce peak memory.
 
     Args:
         model_output: forward-pass output with .logits and .past_key_values
@@ -837,10 +1409,10 @@ def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
     """
 
     batch_size = model_output.logits.shape[0]
-    joint_logprobs = torch.zeros(batch_size, len(token_seqs))
+    joint_logprobs = torch.zeros(batch_size, len(token_seqs), dtype=torch.float64)
 
     # --- depth 0: first-token log-probs from existing logits ---
-    logprobs_0 = model_output.logits[:, -1, :].float().log_softmax(-1).cpu()
+    logprobs_0 = model_output.logits[:, -1, :].double().log_softmax(-1).cpu()
     for i, seq in enumerate(token_seqs):
         joint_logprobs[:, i] = logprobs_0[:, seq[0]]
 
@@ -848,47 +1420,71 @@ def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
     if max_depth <= 1:
         return joint_logprobs.softmax(-1)
 
-    # --- depth >= 1: one forward pass per unique prefix token ---
-    prefix_cache = {(): model_output.past_key_values}
+    # --- depth >= 1: chunk the batch dimension to cap peak memory ---
+    CHUNK_SIZE = 10
+    num_chunks = (batch_size + CHUNK_SIZE - 1) // CHUNK_SIZE
 
-    for d in range(1, max_depth):
-        groups = defaultdict(list)
-        for i, seq in enumerate(token_seqs):
-            if len(seq) > d:
-                prefix = tuple(seq[:d])
-                groups[prefix].append((i, seq[d]))
+    for chunk_idx in range(num_chunks):
+        start = chunk_idx * CHUNK_SIZE
+        end = min(start + CHUNK_SIZE, batch_size)
+        chunk_bs = end - start
 
-        if not groups:
-            break
+        logger.info(
+            "Processing verbconf chunk %d/%d (samples %d:%d)",
+            chunk_idx + 1, num_chunks, start, end,
+        )
 
-        new_prefix_cache = {}
-        for prefix, entries in groups.items():
-            parent_prefix = prefix[:-1]
-            feed_token = prefix[-1]
+        # Root cache for this chunk = slice of model_output.past_key_values
+        _t0 = time.perf_counter()
+        chunk_root_cache = _slice_cache_batch(model_output.past_key_values, start, end)
+        logger.info(
+            "slice+deepcopy(past_key_values) for verbconf chunk %d took %.4fs",
+            chunk_idx, time.perf_counter() - _t0,
+        )
 
-            parent_kv = prefix_cache[parent_prefix]
-            _t0 = time.perf_counter()
-            kv = copy.deepcopy(parent_kv)
-            logger.info("deepcopy(parent_kv) in _compute_verbconf_joint_probs took %.4fs", time.perf_counter() - _t0)
+        prefix_cache = {(): chunk_root_cache}
 
-            tok_input = torch.full((batch_size, 1), feed_token, device=device)
+        for d in range(1, max_depth):
+            groups = defaultdict(list)
+            for i, seq in enumerate(token_seqs):
+                if len(seq) > d:
+                    prefix = tuple(seq[:d])
+                    groups[prefix].append((i, seq[d]))
 
-            with torch.no_grad():
-                out = llm.model.forward(input_ids=tok_input, past_key_values=kv)
+            if not groups:
+                break
 
-            logprobs_d = out.logits[:, -1, :].float().log_softmax(-1).cpu()
+            new_prefix_cache = {}
+            for prefix, entries in groups.items():
+                parent_prefix = prefix[:-1]
+                feed_token = prefix[-1]
 
-            for seq_idx, next_tok in entries:
-                joint_logprobs[:, seq_idx] += logprobs_d[:, next_tok]
+                parent_kv = prefix_cache[parent_prefix]
+                _t0 = time.perf_counter()
+                kv = copy.deepcopy(parent_kv)
+                logger.info("deepcopy(parent_kv) in _compute_verbconf_joint_probs took %.4fs", time.perf_counter() - _t0)
 
-            new_prefix_cache[prefix] = out.past_key_values
+                tok_input = torch.full((chunk_bs, 1), feed_token, device=device)
 
-        prefix_cache = new_prefix_cache
+                with torch.no_grad():
+                    out = llm.model.forward(input_ids=tok_input, past_key_values=kv)
+
+                logprobs_d = out.logits[:, -1, :].double().log_softmax(-1).cpu()
+
+                for seq_idx, next_tok in entries:
+                    joint_logprobs[start:end, seq_idx] += logprobs_d[:, next_tok]
+
+                new_prefix_cache[prefix] = out.past_key_values
+
+            prefix_cache = new_prefix_cache
+
+        del prefix_cache
+        torch.cuda.empty_cache()
 
     return joint_logprobs.softmax(-1)
 
 
-def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None):
+def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None, vanilla_only=False, recrop_early_cache_len=None, preserve_final_step=False):
     """Verbalized confidence (0-100 score)."""
     suffix = (
         f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
@@ -905,12 +1501,15 @@ def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
                         gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=use_jackknife,
                         precomputed_early_cache=precomputed_early_cache,
-                        consume_early_cache=consume_early_cache,
-                        jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks)
+                        consume_early_cache=consume_early_cache or vanilla_only,
+                        jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks,
+                        vanilla_only=vanilla_only,
+                        recrop_early_cache_len=None,
+                        preserve_final_step=preserve_final_step)
 
     verbconf_strings = ANSWER_TOKENS['VERBCONF']
     token_seqs = [llm.tokenizer.encode(s, add_special_tokens=False) for s in verbconf_strings]
-    score_values = torch.FloatTensor([int(s) / 100 for s in verbconf_strings])
+    score_values = torch.tensor([int(s) / 100 for s in verbconf_strings], dtype=torch.float64)
     device = next(llm.model.parameters()).device
 
     # Vanilla
@@ -1062,6 +1661,9 @@ def dropout_forward(
     debug_conf: bool = False,
     jk_kept_indices=None,
     jk_step_masks=None,
+    vanilla_only: bool = False,
+    recrop_early_cache_len: int | None = None,
+    preserve_final_step: bool = False,
 ):
     """Core forward pass for dropout experiment.
 
@@ -1143,7 +1745,7 @@ def dropout_forward(
         early_cache = early_output.past_key_values
 
     # -- Vanilla forward --------------------------------------------------------
-    if suffix_text and gen_cache is not None:
+    if suffix_text and gen_cache is not None and not vanilla_only:
         overlap_len = min(find_token_overlap(base_tokens[0], tokens[0]), gen_cache_len)
         nb_discarded = gen_cache_len - overlap_len
         logger.info(
@@ -1168,7 +1770,7 @@ def dropout_forward(
                 vanilla_output = llm.model.forward(
                     input_ids=remaining_tokens,
                     past_key_values=vanilla_cache,
-                    output_hidden_states=True,
+                    # output_hidden_states=True,
                 )
         else:
             # Pathological case: overlap doesn't extend past split
@@ -1178,7 +1780,7 @@ def dropout_forward(
                     vanilla_output = llm.model.forward(
                         input_ids=late_tokens,
                         past_key_values=early_cache,
-                        output_hidden_states=True,
+                        # output_hidden_states=True,
                     )
                 else:
                     _t0 = time.perf_counter()
@@ -1187,36 +1789,37 @@ def dropout_forward(
                     vanilla_output = llm.model.forward(
                         input_ids=late_tokens,
                         past_key_values=_early_cache_copy,
-                        output_hidden_states=True,
+                        # output_hidden_states=True,
                     )
     else:
         if gen_cache is not None:
             nb_discarded = gen_cache_len - early_late_split
             logger.info(
-                "KV cache reuse (no suffix): reused=%d, discarded=%d (of %d)",
-                early_late_split, nb_discarded, gen_cache_len,
+                "KV cache reuse (suffix=%s): reused=%d, discarded=%d (of %d)",
+                bool(suffix_text), early_late_split, nb_discarded, gen_cache_len,
             )
             logger.info(
-                "KV cache overlap boundary (no suffix): cache_tail='%s' | remaining_head='%s'",
+                "KV cache overlap boundary (suffix=%s): cache_tail='%s' | remaining_head='%s'",
+                bool(suffix_text),
                 llm.tokenizer.decode(tokens[0, early_late_split-3:early_late_split].tolist()),
                 llm.tokenizer.decode(late_tokens[0, :3].tolist()),
             )
         with torch.no_grad():
             if _owns_early_cache and not will_run_dropout:
-                logger.info("consuming early_cache directly for vanilla (no suffix)")
+                logger.info("consuming early_cache directly for vanilla (suffix=%s)", bool(suffix_text))
                 vanilla_output = llm.model.forward(
                     input_ids=late_tokens,
                     past_key_values=early_cache,
-                    output_hidden_states=True,
+                    # output_hidden_states=True,
                 )
             else:
                 _t0 = time.perf_counter()
                 _early_cache_copy = copy.deepcopy(early_cache)
-                logger.info("deepcopy(early_cache) for vanilla (no suffix) took %.4fs", time.perf_counter() - _t0)
+                logger.info("deepcopy(early_cache) for vanilla (suffix=%s) took %.4fs", bool(suffix_text), time.perf_counter() - _t0)
                 vanilla_output = llm.model.forward(
                     input_ids=late_tokens,
                     past_key_values=_early_cache_copy,
-                    output_hidden_states=True,
+                    # output_hidden_states=True,
                 )
 
     # -- Dropout forward --------------------------------------------------------
@@ -1246,7 +1849,14 @@ def dropout_forward(
             debug_conf=debug_conf,
             jk_kept_indices=jk_kept_indices,
             jk_step_masks=jk_step_masks,
+            preserve_final_step=preserve_final_step,
         )
+
+    # In vanilla_only mode the early_cache was mutated in place by the vanilla
+    # forward (extended with late_tokens). Crop it back so the next caller can
+    # reuse it as a fresh early_cache. Skip on the final caller (recrop_len=None).
+    if vanilla_only and recrop_early_cache_len is not None and precomputed_early_cache is not None:
+        crop_cache(precomputed_early_cache, recrop_early_cache_len)
 
     return late_tokens, vanilla_output, dropout_output, answer_start_late, answer_end_late, dropout_step_masks, masked_steps_debug
 
@@ -1266,6 +1876,7 @@ def dropout_late_forward(
     debug_conf=False,
     jk_kept_indices=None,
     jk_step_masks=None,
+    preserve_final_step=False,
 ):
     """Batched forward with per-sample dropout attention masks.
 
@@ -1308,6 +1919,8 @@ def dropout_late_forward(
     else:
         # Coin-flip: each step independently kept with probability = threshold
         is_step_selected = (np.random.random((nb_dropout_samples, len(steps))) <= threshold)
+        if preserve_final_step and len(steps) > 0:
+            is_step_selected[:, -1] = True
 
     # Walk backwards through steps, finding each one's token range and masking.
     # Positions in early_token_ids directly correspond to early cache columns.
@@ -1385,12 +1998,12 @@ def dropout_late_forward(
                 input_ids=chunk_tokens,
                 attention_mask=chunk_mask,
                 past_key_values=chunk_cache,
-                output_hidden_states=True,
+                # output_hidden_states=True,
             )
 
         # Collect outputs
         all_logits.append(chunk_output.logits)
-        all_hidden_states.append(chunk_output.hidden_states)
+        # all_hidden_states.append(chunk_output.hidden_states)
         all_input_ids.append(chunk_tokens)
 
         # Free chunk cache memory
@@ -1400,8 +2013,8 @@ def dropout_late_forward(
     # Concatenate all chunks
     late_output = type(chunk_output)(
         logits=torch.cat(all_logits, dim=0),
-        hidden_states=tuple(torch.cat([hs[i] for hs in all_hidden_states], dim=0)
-                           for i in range(len(all_hidden_states[0]))),
+        # hidden_states=tuple(torch.cat([hs[i] for hs in all_hidden_states], dim=0)
+        #                    for i in range(len(all_hidden_states[0]))),
     )
     late_output['input_ids'] = torch.cat(all_input_ids, dim=0)
 
@@ -1462,7 +2075,7 @@ def _debug_answer_logit_tokens(llm, late_tokens, ans_start, ans_end, v_probs, va
 def _debug_indirect_logit_tokens(llm, vanilla_out, positive_ids, negative_ids, label="True/False"):
     """Return debug info about indirect P(True) probing tokens."""
     logits = vanilla_out.logits[0, -1, :]
-    probs = logits.float().softmax(-1)
+    probs = logits.double().softmax(-1)
     pos_entries = [{"token": llm.tokenizer.decode([tid]), "id": tid,
                     "logit": round(logits[tid].item(), 4), "prob": round(probs[tid].item(), 6)}
                    for tid in positive_ids]
@@ -1471,7 +2084,7 @@ def _debug_indirect_logit_tokens(llm, vanilla_out, positive_ids, negative_ids, l
                    for tid in negative_ids]
     pos_sum = logits[positive_ids].sum()
     neg_sum = logits[negative_ids].sum()
-    normalized = torch.softmax(torch.stack([pos_sum.float(), neg_sum.float()]), dim=0)
+    normalized = torch.softmax(torch.stack([pos_sum.double(), neg_sum.double()]), dim=0)
     return {
         "label": label,
         "positive_tokens": pos_entries,

@@ -6,8 +6,8 @@ echo "Running qwen on both math500..."
 
 
 python3 main.py \
-    --pickle_path $PICKLE_DIR/bigbench_movie.pkl \
-    --dataset bigbench_movie \
+    --pickle_path $PICKLE_DIR/math500.pkl \
+    --dataset math500 \
     --model qwen \
     --shot_mode zero \
     --max_new_tokens 15000 \
