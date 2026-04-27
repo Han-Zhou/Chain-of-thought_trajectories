@@ -1,0 +1,460 @@
+{
+  "index": 61,
+  "sample_idx": 28,
+  "question": "So, does it run well without _scene.close()?!It doesn't move on my screen..!",
+  "trajectory": {
+    "id": "601",
+    "question": "So, does it run well without _scene.close()?!It doesn't move on my screen..!",
+    "ground_truth": "logical",
+    "prompt": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nYou are an expert reasoning assistant. For every problem you receive, think carefully and reason step-by-step. Label each reasoning step as 'Step 1:', 'Step 2:', etc. Keep your reasoning concise, and be brief in each step.\n\nDuring your reasoning, do NOT reveal, hint at, or restate the final answer. Do not write lines like 'Answer:', 'Final answer:', any answer strings, or any concluding sentence. Stop immediately after your last numbered reasoning step.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nCode:\n```\nfrom cs1graphics import *\nfrom time import sleep\n\n_scene = None\n_world = None\n\nt = 0.2\n\ndef create_world():\n    global _scene, _world\n    if _scene:\n        raise RuntimeError(\"A world already exists!\")\n    _world = _World(500, 300)\n    _scene = Canvas(_world.width, _world.height)\n    _scene.setTitle(\"Mario World\")\n    _world.draw_scene()\n\nclass _World(object):\n    def __init__(self, width, height):\n        self.width = width\n        self.height = height\n\n    def draw_scene(self):\n        \"\"\"\n        draw background here\n        Don't forget _scene.add(name)\n        \"\"\"\n        grass = Rectangle(1000, 150, Point(250, 250))\n        grass.setFillColor('green')\n        grass.setDepth(100)\n        _scene.add(grass)\n\n        #blocks\n        block = Rectangle(40, 40, Point(200, 100))\n        block.setFillColor('brown')\n\n        qmark = Text(\"?\", 20, Point(200, 100))\n        qmark.setFontColor('Yellow')\n        qmark.setDepth(48)\n        _scene.add(qmark)\n\n        block2 = block.clone()\n        block2.move(40, 0)\n        block.setDepth(50)\n        _scene.add(block)\n        _scene.add(block2)\n\n        #pipe\n        pipe = Polygon(Point(400, 150), Point(400, 160), Point(410, 160), Point(410, 320), Point(470, 320), Point(470, 160), Point(480, 160), Point(480, 150))\n        pipe.setFillColor('lightgreen')\n        pipe.setDepth(10)\n        pipe.move(-10, 0)\n        _scene.add(pipe)\n\n\nclass Mushroom(object):\n    def __init__(self, x=200, y=92):\n        mushroom = Layer()\n        uppermush = Ellipse(38, 18, Point(x, y))\n        uppermush.setFillColor('red')\n        uppermush.setDepth(52)\n        lowermush = Ellipse(35, 25, Point(x, y+8))\n        lowermush.setFillColor('beige')\n        lowermush.setDepth(53)\n        mushroom.add(lowermush)\n        mushroom.add(uppermush)\n        mushroom.setDepth(52)\n\n        self.layer = mushroom\n        _scene.add(self.layer)\n\n    def diappear(self):\n        self.layer.scale(0.001)\n\n    def move(self, x, y):\n        self.layer.move(x, y)\n\n    def arise(self):\n        self.layer.setDepth(45)\n        self.layer.move(0, -20)\n\n\n\nCOLOR = ['Red', 'Blue']\nTYPE = ['super', 'normal']\n\nclass Mario(object):\n    def __init__(self, color='Blue', type='normal'):\n        assert type in TYPE and color in COLOR\n        self.color = color\n        self.type = type\n        self.step_size = 3\n\n    # Constructing Mario\n        mario = Layer()\n        # body\n        body = Rectangle(33, 22, Point(200, 200))\n        body.setFillColor(color)\n        body.setDepth(50)\n        mario.add(body)\n\n        # face\n        face = Ellipse(30, 20, Point(200, 180))\n        face.setFillColor('beige')\n        face.setDepth(40)\n        mario.add(face)\n\n        #hat\n        hat = Polygon(Point(185, 175), Point(220, 175), Point(220, 173), Point(215, 173), Point(212, 168), Point(188, 168))\n        hat.setFillColor(color)\n        hat.setDepth(39)\n        mario.add(hat)\n\n        #beard\n        beard = Polygon(Point(207, 183), Point(217, 183), Point(215, 180), Point(209, 180))\n        beard.setFillColor('Brown')\n        beard.setDepth(38)\n        mario.add(beard)\n\n        shoe = Layer()\n        #left shoe\n        lshoe = Rectangle(15, 6, Point(191, 215))\n        lshoe.setFillColor('black')\n        lshoe.setDepth(52)\n        shoe.add(lshoe)\n\n        #right shoe\n        rshoe = lshoe.clone()\n        rshoe.move(17, 0)\n        shoe.add(rshoe)\n        mario.add(shoe)\n\n        # save alias of moveable parts\n        self.layer = mario\n        self.body = body\n        self.hat = hat\n        self.shoe = shoe\n        _scene.add(self.layer)\n\n        self.moving_part_count = 0\n\n        if type == 'super':\n            self.supermario()\n\n\n    def shoe_move(self):\n\n        if self.moving_part_count % 3 == 0:\n            self.shoe.move(3, 0)\n        elif self.moving_part_count % 3 == 1:\n            self.shoe.move(-5,0)\n        else: self.shoe.move(2,0)\n        self.moving_part_count += 1\n        if self.moving_part_count % 3 == 0: self.moving_part_count = 0\n\n    def move(self,x=10,y=0):\n        self.layer.move(x,y)\n\n\n    def supermario(self):\n        tempPt = self.body.getReferencePoint()\n        self.layer.adjustReference(tempPt.getX(), tempPt.getY())\n        for i in range(3):\n            self.layer.scale(1.3)\n            sleep(t/2)\n            self.layer.scale(0.9)\n            sleep(t/2)\n\n    def walk(self,x=20):\n        assert x > 0\n        total_step = int(x / self.step_size)\n        for i in range(total_step):\n            sleep(t/4)\n            self.move(self.step_size, 0)\n            self.shoe_move()\n\ndef show_animation():\n    sleep(t)\n    mario.move(0, -50)\n    mushroom.arise()\n\n    sleep(t)\n    mario.move(0, 50)\n    mushroom.move(0, 8)\n\n    for i in range(7):\n        sleep(t/2)\n        mushroom.move(10, 0)\n        mario.move(10, 0)\n        mario.shoe_move()\n        sleep(t/2)\n        mario.shoe_move()\n\n    sleep(t/2)\n    mushroom.move(0, 50)\n    mario.move(10, 0)\n    mario.shoe_move()\n    sleep(t/2)\n    mario.shoe_move()\n\n    sleep(t)\n    mushroom.move(0, 50)\n\n    sleep(t/2)\n    mushroom.diappear()\n    sleep(t/2)\n    mario.supermario()\n\n    for i in range(6):\n        sleep(t/2)\n        mario.move(10, 0)\n        mario.shoe_move()\n        sleep(t/2)\n        mario.shoe_move()\n\n    for i in range(2):\n        sleep(t)\n        mario.move(28, -60)\n\n    for i in range(1):\n        sleep(t)\n        mario.move(32, 40)\n\n    sleep(2*t)\n    for i in range(4):\n        sleep(t)\n        mario.move(0, 25)\n        \ndef interactive_example():\n    while True:\n        e = _scene.wait()\n        d = e.getDescription()\n        if d == \"keyboard\":\n            k = e.getKey()\n            if k == \"q\":\n                _scene.close()\n                break\n            elif k == \"w\":\n                mario.walk(20)\n            elif k == \"r\":\n                mario.walk(40)\n            elif k == \"j\":\n                mario.move(0, -50)\n                sleep(t)\n                mario.move(0, 50)\n\ncreate_world()\nmario = Mario('Blue', 'normal')\nmushroom = Mushroom(200, 92)\n\nshow_animation()\n#interactive_example()\n\n```\n\nQuestion:\nSo, does it run well without _scene.close()?!It doesn't move on my screen..!\n\nClassify this question into exactly one of the following types:\ncode_understanding, logical, error, usage, algorithm, task, comparison, reasoning, code_explain, variable, guiding\n\nReason step-by-step about what the question is asking.\n\n\nLet's think step-by-step.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nStep 1: The question is asking if the program runs well without the line `_scene.close()`, but it seems like it doesn't move on the screen.\n\nStep 2: The question is inquiring about the functionality of the program without a specific line of code.\n\nStep 3: This is related to the behavior of the program when it is executed.\n\nStep 4: Based on these points, the question falls under the 'usage' category as it pertains to how the program behaves when run in a particular situation.\nTherefore the answer is \\boxed{",
+    "cot_steps": [
+      "Step 1: The question is asking if the program runs well without the line `_scene.close()`, but it seems like it doesn't move on the screen.",
+      "Step 2: The question is inquiring about the functionality of the program without a specific line of code.",
+      "Step 3: This is related to the behavior of the program when it is executed.",
+      "Step 4: Based on these points, the question falls under the 'usage' category as it pertains to how the program behaves when run in a particular situation."
+    ],
+    "final_answer": "usage",
+    "raw_cot_block": "Step 1: The question is asking if the program runs well without the line `_scene.close()`, but it seems like it doesn't move on the screen.\n\nStep 2: The question is inquiring about the functionality of the program without a specific line of code.\n\nStep 3: This is related to the behavior of the program when it is executed.\n\nStep 4: Based on these points, the question falls under the 'usage' category as it pertains to how the program behaves when run in a particular situation.\nTherefore the answer is",
+    "generated_text": "Step 1: The question is asking if the program runs well without the line `_scene.close()`, but it seems like it doesn't move on the screen.\n\nStep 2: The question is inquiring about the functionality of the program without a specific line of code.\n\nStep 3: This is related to the behavior of the program when it is executed.\n\nStep 4: Based on these points, the question falls under the 'usage' category as it pertains to how the program behaves when run in a particular situation.\nTherefore the answer is \\boxed{usage}",
+    "prompt_end_position": 2030,
+    "generated_end_position": 2033,
+    "answer_token_start_position": 2142,
+    "confidence_score": {
+      "vanilla_confidences": {
+        "answer_probabilities": [
+          {
+            "usage": 0.9951473142740392
+          }
+        ],
+        "answer_entropy": [
+          {
+            "usage": 0.04464446238294696
+          }
+        ],
+        "indirect_ptrue1_probabilities": [
+          {
+            "True": 0.5774953651858118,
+            "False": 0.42250463481418826
+          }
+        ],
+        "indirect_ptrue2_probabilities": [
+          {
+            "Yes": 2.902311985211097e-06,
+            "No": 0.9999970976880148
+          }
+        ],
+        "indirect_ptrue3_probabilities": [
+          {
+            "Yes": 0.013222821752305148,
+            "No": 0.9867771782476948
+          }
+        ],
+        "verbconf_probabilities": [
+          0.8479393802002924
+        ],
+        "verbconf_distribution": [
+          0.007430382012430904,
+          0.00022437809460367457,
+          1.0494303133940687e-05,
+          6.775631354316414e-06,
+          7.67779618769473e-06,
+          0.0002881071764190847,
+          1.1171127536284188e-05,
+          1.3474951954405662e-05,
+          2.8526473511331782e-05,
+          2.2216439908890882e-05,
+          0.0018786947846978885,
+          6.775631354316414e-06,
+          8.70008287304866e-06,
+          3.860638372397816e-06,
+          5.617195686784408e-06,
+          0.00019801297349557613,
+          5.9794736832393025e-06,
+          5.276867004544787e-06,
+          5.9794736832393025e-06,
+          6.3651166030534025e-06,
+          0.007430382012430904,
+          2.6798141852547676e-05,
+          2.8526473511331782e-05,
+          1.3474951954405662e-05,
+          1.1171127536284188e-05,
+          0.0027334847824234177,
+          8.172971498501707e-06,
+          7.67779618769473e-06,
+          1.9605939406052994e-05,
+          6.775631354316414e-06,
+          0.005106821894465049,
+          1.5269120962284584e-05,
+          9.261190010486469e-06,
+          9.956717592149866e-05,
+          1.3474951954405662e-05,
+          0.00022437809460367457,
+          9.85848544914828e-06,
+          4.109628155303139e-06,
+          1.3474951954405662e-05,
+          6.775631354316414e-06,
+          0.00423370405187272,
+          2.0870413859622718e-05,
+          6.843145253034067e-05,
+          1.5269120962284584e-05,
+          1.4344011689649208e-05,
+          0.0005382550676521671,
+          4.374676399533015e-06,
+          1.4344011689649208e-05,
+          2.3649277179895938e-05,
+          3.899106632317757e-05,
+          0.0905205839921592,
+          0.0003699369372522439,
+          2.2216439908890882e-05,
+          1.1891603362239238e-05,
+          1.1891603362239238e-05,
+          0.0009446670631154165,
+          3.0366272985279777e-05,
+          2.8526473511331782e-05,
+          5.3294468817342974e-05,
+          4.4182666487534695e-05,
+          0.02019787240289987,
+          7.754299457587147e-05,
+          4.703220365619648e-05,
+          3.662871703701961e-05,
+          2.6798141852547676e-05,
+          0.0016579423283977197,
+          0.0007357074484960506,
+          0.00027065164501839477,
+          0.00013609219374503042,
+          3.899106632317757e-05,
+          0.05490350952633717,
+          0.00022437809460367457,
+          0.00011282439137167875,
+          9.956717592149866e-05,
+          0.00010598870705853503,
+          0.042758896212479726,
+          0.00019801297349557613,
+          7.754299457587147e-05,
+          0.00032646820127673704,
+          7.284490203424817e-05,
+          0.13170667255481744,
+          0.0009446670631154165,
+          0.00012010093944593198,
+          7.754299457587147e-05,
+          0.00021078371307988974,
+          0.02593458152833934,
+          9.35347056881032e-05,
+          0.0005056438416779969,
+          0.0003937958198540575,
+          0.00019801297349557613,
+          0.10257325972142092,
+          0.000347523591271967,
+          0.0006911331875263624,
+          7.284490203424817e-05,
+          0.0001747458357814115,
+          0.07049750169717446,
+          0.0004462291240918078,
+          0.0007357074484960506,
+          0.003977196890415575,
+          0.009540799359660686,
+          0.4056851119182787
+        ],
+        "verbconf_top_score": 100,
+        "verbconf_top_prob": 0.4056851119182787,
+        "step_masks": null
+      },
+      "dropout_confidences": {
+        "answer_probabilities": [],
+        "answer_entropy": [],
+        "indirect_ptrue1_probabilities": [],
+        "indirect_ptrue2_probabilities": [],
+        "indirect_ptrue3_probabilities": [],
+        "verbconf_probabilities": [],
+        "verbconf_distribution": [],
+        "verbconf_top_score": [],
+        "verbconf_top_prob": [],
+        "step_masks": null
+      },
+      "jackknife_confidences": null,
+      "bootstrap_confidences": null,
+      "coinflip_true_confidences": null,
+      "hollow_confidences": null
+    },
+    "confidence_method": "vanilla_only",
+    "confidence_modification": null,
+    "confidence_error": null,
+    "debug_info": {
+      "experimental_modification": null,
+      "modified_assistant_content": "Step 1: The question is asking if the program runs well without the line `_scene.close()`, but it seems like it doesn't move on the screen.\n\nStep 2: The question is inquiring about the functionality of the program without a specific line of code.\n\nStep 3: This is related to the behavior of the program when it is executed.\n\nStep 4: Based on these points, the question falls under the 'usage' category as it pertains to how the program behaves when run in a particular situation.",
+      "modified_step_mappings": [
+        {
+          "original_step": "Step 1: The question is asking if the program runs well without the line `_scene.close()`, but it seems like it doesn't move on the screen.",
+          "modified_step": "Step 1: The question is asking if the program runs well without the line `_scene.close()`, but it seems like it doesn't move on the screen."
+        },
+        {
+          "original_step": "Step 2: The question is inquiring about the functionality of the program without a specific line of code.",
+          "modified_step": "Step 2: The question is inquiring about the functionality of the program without a specific line of code."
+        },
+        {
+          "original_step": "Step 3: This is related to the behavior of the program when it is executed.",
+          "modified_step": "Step 3: This is related to the behavior of the program when it is executed."
+        },
+        {
+          "original_step": "Step 4: Based on these points, the question falls under the 'usage' category as it pertains to how the program behaves when run in a particular situation.",
+          "modified_step": "Step 4: Based on these points, the question falls under the 'usage' category as it pertains to how the program behaves when run in a particular situation."
+        }
+      ],
+      "answer_logits": {
+        "ans_start": 6,
+        "ans_end": 7,
+        "full_answer_text": "usage",
+        "per_token": [
+          {
+            "position": 0,
+            "context_token": "{",
+            "predicted_token": "usage",
+            "token_id": 18168,
+            "prob": 0.995147,
+            "top5": [
+              {
+                "token": "usage",
+                "prob": 0.995147
+              },
+              {
+                "token": "Usage",
+                "prob": 0.001695
+              },
+              {
+                "token": " usage",
+                "prob": 0.00132
+              },
+              {
+                "token": "code",
+                "prob": 0.000202
+              },
+              {
+                "token": "1",
+                "prob": 0.000158
+              }
+            ]
+          }
+        ]
+      },
+      "indirect_logits": {
+        "ptrue1_true_false": {
+          "label": "True/False",
+          "positive_tokens": [
+            {
+              "token": " True",
+              "id": 3082,
+              "logit": 10.375,
+              "prob": 0.009435
+            }
+          ],
+          "negative_tokens": [
+            {
+              "token": " False",
+              "id": 3641,
+              "logit": 10.0625,
+              "prob": 0.006903
+            }
+          ],
+          "p_positive": 0.577495,
+          "p_negative": 0.422505
+        },
+        "ptrue2_yes_no": {
+          "label": "Yes/No",
+          "positive_tokens": [
+            {
+              "token": " Yes",
+              "id": 7566,
+              "logit": 10.5625,
+              "prob": 0.001372
+            },
+            {
+              "token": " yes",
+              "id": 10035,
+              "logit": 8.6875,
+              "prob": 0.00021
+            },
+            {
+              "token": " YES",
+              "id": 14410,
+              "logit": 8.4375,
+              "prob": 0.000164
+            },
+            {
+              "token": " Yeah",
+              "id": 22335,
+              "logit": 7.5938,
+              "prob": 7e-05
+            },
+            {
+              "token": " yeah",
+              "id": 22371,
+              "logit": 6.1562,
+              "prob": 1.7e-05
+            },
+            {
+              "token": " Yep",
+              "id": 85294,
+              "logit": 5.9375,
+              "prob": 1.3e-05
+            }
+          ],
+          "negative_tokens": [
+            {
+              "token": " No",
+              "id": 2360,
+              "logit": 14.875,
+              "prob": 0.102406
+            },
+            {
+              "token": " no",
+              "id": 912,
+              "logit": 13.375,
+              "prob": 0.02285
+            },
+            {
+              "token": " NO",
+              "id": 5782,
+              "logit": 12.625,
+              "prob": 0.010794
+            },
+            {
+              "token": " Nah",
+              "id": 73088,
+              "logit": 5.6562,
+              "prob": 1e-05
+            },
+            {
+              "token": " nah",
+              "id": 70017,
+              "logit": 2.5,
+              "prob": 0.0
+            },
+            {
+              "token": " Nope",
+              "id": 86819,
+              "logit": 11.1875,
+              "prob": 0.002564
+            }
+          ],
+          "p_positive": 3e-06,
+          "p_negative": 0.999997
+        },
+        "ptrue3_yes_no_only": {
+          "label": "Yes/No (no synonyms)",
+          "positive_tokens": [
+            {
+              "token": " Yes",
+              "id": 7566,
+              "logit": 10.5625,
+              "prob": 0.001372
+            }
+          ],
+          "negative_tokens": [
+            {
+              "token": " No",
+              "id": 2360,
+              "logit": 14.875,
+              "prob": 0.102406
+            }
+          ],
+          "p_positive": 0.013223,
+          "p_negative": 0.986777
+        }
+      },
+      "verbconf": {
+        "weighted_score": 0.847939,
+        "top10_numbers": [
+          {
+            "number": 100,
+            "token_ids": [
+              1041
+            ],
+            "token_str": "100",
+            "prob": 0.405685
+          },
+          {
+            "number": 80,
+            "token_ids": [
+              1490
+            ],
+            "token_str": "80",
+            "prob": 0.131707
+          },
+          {
+            "number": 90,
+            "token_ids": [
+              1954
+            ],
+            "token_str": "90",
+            "prob": 0.102573
+          },
+          {
+            "number": 50,
+            "token_ids": [
+              1135
+            ],
+            "token_str": "50",
+            "prob": 0.090521
+          },
+          {
+            "number": 95,
+            "token_ids": [
+              2721
+            ],
+            "token_str": "95",
+            "prob": 0.070498
+          },
+          {
+            "number": 70,
+            "token_ids": [
+              2031
+            ],
+            "token_str": "70",
+            "prob": 0.054904
+          },
+          {
+            "number": 75,
+            "token_ids": [
+              2075
+            ],
+            "token_str": "75",
+            "prob": 0.042759
+          },
+          {
+            "number": 85,
+            "token_ids": [
+              5313
+            ],
+            "token_str": "85",
+            "prob": 0.025935
+          },
+          {
+            "number": 60,
+            "token_ids": [
+              1399
+            ],
+            "token_str": "60",
+            "prob": 0.020198
+          },
+          {
+            "number": 99,
+            "token_ids": [
+              1484
+            ],
+            "token_str": "99",
+            "prob": 0.009541
+          }
+        ]
+      },
+      "all_prompts": {
+        "answer_logits": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nYou are an expert reasoning assistant. For every problem you receive, think carefully and reason step-by-step. Label each reasoning step as 'Step 1:', 'Step 2:', etc. Keep your reasoning concise, and be brief in each step.\n\nDuring your reasoning, do NOT reveal, hint at, or restate the final answer. Do not write lines like 'Answer:', 'Final answer:', any answer strings, or any concluding sentence. Stop immediately after your last numbered reasoning step.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nCode:\n```\nfrom cs1graphics import *\nfrom time import sleep\n\n_scene = None\n_world = None\n\nt = 0.2\n\ndef create_world():\n    global _scene, _world\n    if _scene:\n        raise RuntimeError(\"A world already exists!\")\n    _world = _World(500, 300)\n    _scene = Canvas(_world.width, _world.height)\n    _scene.setTitle(\"Mario World\")\n    _world.draw_scene()\n\nclass _World(object):\n    def __init__(self, width, height):\n        self.width = width\n        self.height = height\n\n    def draw_scene(self):\n        \"\"\"\n        draw background here\n        Don't forget _scene.add(name)\n        \"\"\"\n        grass = Rectangle(1000, 150, Point(250, 250))\n        grass.setFillColor('green')\n        grass.setDepth(100)\n        _scene.add(grass)\n\n        #blocks\n        block = Rectangle(40, 40, Point(200, 100))\n        block.setFillColor('brown')\n\n        qmark = Text(\"?\", 20, Point(200, 100))\n        qmark.setFontColor('Yellow')\n        qmark.setDepth(48)\n        _scene.add(qmark)\n\n        block2 = block.clone()\n        block2.move(40, 0)\n        block.setDepth(50)\n        _scene.add(block)\n        _scene.add(block2)\n\n        #pipe\n        pipe = Polygon(Point(400, 150), Point(400, 160), Point(410, 160), Point(410, 320), Point(470, 320), Point(470, 160), Point(480, 160), Point(480, 150))\n        pipe.setFillColor('lightgreen')\n        pipe.setDepth(10)\n        pipe.move(-10, 0)\n        _scene.add(pipe)\n\n\nclass Mushroom(object):\n    def __init__(self, x=200, y=92):\n        mushroom = Layer()\n        uppermush = Ellipse(38, 18, Point(x, y))\n        uppermush.setFillColor('red')\n        uppermush.setDepth(52)\n        lowermush = Ellipse(35, 25, Point(x, y+8))\n        lowermush.setFillColor('beige')\n        lowermush.setDepth(53)\n        mushroom.add(lowermush)\n        mushroom.add(uppermush)\n        mushroom.setDepth(52)\n\n        self.layer = mushroom\n        _scene.add(self.layer)\n\n    def diappear(self):\n        self.layer.scale(0.001)\n\n    def move(self, x, y):\n        self.layer.move(x, y)\n\n    def arise(self):\n        self.layer.setDepth(45)\n        self.layer.move(0, -20)\n\n\n\nCOLOR = ['Red', 'Blue']\nTYPE = ['super', 'normal']\n\nclass Mario(object):\n    def __init__(self, color='Blue', type='normal'):\n        assert type in TYPE and color in COLOR\n        self.color = color\n        self.type = type\n        self.step_size = 3\n\n    # Constructing Mario\n        mario = Layer()\n        # body\n        body = Rectangle(33, 22, Point(200, 200))\n        body.setFillColor(color)\n        body.setDepth(50)\n        mario.add(body)\n\n        # face\n        face = Ellipse(30, 20, Point(200, 180))\n        face.setFillColor('beige')\n        face.setDepth(40)\n        mario.add(face)\n\n        #hat\n        hat = Polygon(Point(185, 175), Point(220, 175), Point(220, 173), Point(215, 173), Point(212, 168), Point(188, 168))\n        hat.setFillColor(color)\n        hat.setDepth(39)\n        mario.add(hat)\n\n        #beard\n        beard = Polygon(Point(207, 183), Point(217, 183), Point(215, 180), Point(209, 180))\n        beard.setFillColor('Brown')\n        beard.setDepth(38)\n        mario.add(beard)\n\n        shoe = Layer()\n        #left shoe\n        lshoe = Rectangle(15, 6, Point(191, 215))\n        lshoe.setFillColor('black')\n        lshoe.setDepth(52)\n        shoe.add(lshoe)\n\n        #right shoe\n        rshoe = lshoe.clone()\n        rshoe.move(17, 0)\n        shoe.add(rshoe)\n        mario.add(shoe)\n\n        # save alias of moveable parts\n        self.layer = mario\n        self.body = body\n        self.hat = hat\n        self.shoe = shoe\n        _scene.add(self.layer)\n\n        self.moving_part_count = 0\n\n        if type == 'super':\n            self.supermario()\n\n\n    def shoe_move(self):\n\n        if self.moving_part_count % 3 == 0:\n            self.shoe.move(3, 0)\n        elif self.moving_part_count % 3 == 1:\n            self.shoe.move(-5,0)\n        else: self.shoe.move(2,0)\n        self.moving_part_count += 1\n        if self.moving_part_count % 3 == 0: self.moving_part_count = 0\n\n    def move(self,x=10,y=0):\n        self.layer.move(x,y)\n\n\n    def supermario(self):\n        tempPt = self.body.getReferencePoint()\n        self.layer.adjustReference(tempPt.getX(), tempPt.getY())\n        for i in range(3):\n            self.layer.scale(1.3)\n            sleep(t/2)\n            self.layer.scale(0.9)\n            sleep(t/2)\n\n    def walk(self,x=20):\n        assert x > 0\n        total_step = int(x / self.step_size)\n        for i in range(total_step):\n            sleep(t/4)\n            self.move(self.step_size, 0)\n            self.shoe_move()\n\ndef show_animation():\n    sleep(t)\n    mario.move(0, -50)\n    mushroom.arise()\n\n    sleep(t)\n    mario.move(0, 50)\n    mushroom.move(0, 8)\n\n    for i in range(7):\n        sleep(t/2)\n        mushroom.move(10, 0)\n        mario.move(10, 0)\n        mario.shoe_move()\n        sleep(t/2)\n        mario.shoe_move()\n\n    sleep(t/2)\n    mushroom.move(0, 50)\n    mario.move(10, 0)\n    mario.shoe_move()\n    sleep(t/2)\n    mario.shoe_move()\n\n    sleep(t)\n    mushroom.move(0, 50)\n\n    sleep(t/2)\n    mushroom.diappear()\n    sleep(t/2)\n    mario.supermario()\n\n    for i in range(6):\n        sleep(t/2)\n        mario.move(10, 0)\n        mario.shoe_move()\n        sleep(t/2)\n        mario.shoe_move()\n\n    for i in range(2):\n        sleep(t)\n        mario.move(28, -60)\n\n    for i in range(1):\n        sleep(t)\n        mario.move(32, 40)\n\n    sleep(2*t)\n    for i in range(4):\n        sleep(t)\n        mario.move(0, 25)\n        \ndef interactive_example():\n    while True:\n        e = _scene.wait()\n        d = e.getDescription()\n        if d == \"keyboard\":\n            k = e.getKey()\n            if k == \"q\":\n                _scene.close()\n                break\n            elif k == \"w\":\n                mario.walk(20)\n            elif k == \"r\":\n                mario.walk(40)\n            elif k == \"j\":\n                mario.move(0, -50)\n                sleep(t)\n                mario.move(0, 50)\n\ncreate_world()\nmario = Mario('Blue', 'normal')\nmushroom = Mushroom(200, 92)\n\nshow_animation()\n#interactive_example()\n\n```\n\nQuestion:\nSo, does it run well without _scene.close()?!It doesn't move on my screen..!\n\nClassify this question into exactly one of the following types:\ncode_understanding, logical, error, usage, algorithm, task, comparison, reasoning, code_explain, variable, guiding\n\nReason step-by-step about what the question is asking.\n\n\nLet's think step-by-step.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nStep 1: The question is asking if the program runs well without the line `_scene.close()`, but it seems like it doesn't move on the screen.\n\nStep 2: The question is inquiring about the functionality of the program without a specific line of code.\n\nStep 3: This is related to the behavior of the program when it is executed.\n\nStep 4: Based on these points, the question falls under the 'usage' category as it pertains to how the program behaves when run in a particular situation.\nThe answer is \\boxed{usage}.",
+        "indirect_ptrue1": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nYou are an expert reasoning assistant. For every problem you receive, think carefully and reason step-by-step. Label each reasoning step as 'Step 1:', 'Step 2:', etc. Keep your reasoning concise, and be brief in each step.\n\nDuring your reasoning, do NOT reveal, hint at, or restate the final answer. Do not write lines like 'Answer:', 'Final answer:', any answer strings, or any concluding sentence. Stop immediately after your last numbered reasoning step.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nCode:\n```\nfrom cs1graphics import *\nfrom time import sleep\n\n_scene = None\n_world = None\n\nt = 0.2\n\ndef create_world():\n    global _scene, _world\n    if _scene:\n        raise RuntimeError(\"A world already exists!\")\n    _world = _World(500, 300)\n    _scene = Canvas(_world.width, _world.height)\n    _scene.setTitle(\"Mario World\")\n    _world.draw_scene()\n\nclass _World(object):\n    def __init__(self, width, height):\n        self.width = width\n        self.height = height\n\n    def draw_scene(self):\n        \"\"\"\n        draw background here\n        Don't forget _scene.add(name)\n        \"\"\"\n        grass = Rectangle(1000, 150, Point(250, 250))\n        grass.setFillColor('green')\n        grass.setDepth(100)\n        _scene.add(grass)\n\n        #blocks\n        block = Rectangle(40, 40, Point(200, 100))\n        block.setFillColor('brown')\n\n        qmark = Text(\"?\", 20, Point(200, 100))\n        qmark.setFontColor('Yellow')\n        qmark.setDepth(48)\n        _scene.add(qmark)\n\n        block2 = block.clone()\n        block2.move(40, 0)\n        block.setDepth(50)\n        _scene.add(block)\n        _scene.add(block2)\n\n        #pipe\n        pipe = Polygon(Point(400, 150), Point(400, 160), Point(410, 160), Point(410, 320), Point(470, 320), Point(470, 160), Point(480, 160), Point(480, 150))\n        pipe.setFillColor('lightgreen')\n        pipe.setDepth(10)\n        pipe.move(-10, 0)\n        _scene.add(pipe)\n\n\nclass Mushroom(object):\n    def __init__(self, x=200, y=92):\n        mushroom = Layer()\n        uppermush = Ellipse(38, 18, Point(x, y))\n        uppermush.setFillColor('red')\n        uppermush.setDepth(52)\n        lowermush = Ellipse(35, 25, Point(x, y+8))\n        lowermush.setFillColor('beige')\n        lowermush.setDepth(53)\n        mushroom.add(lowermush)\n        mushroom.add(uppermush)\n        mushroom.setDepth(52)\n\n        self.layer = mushroom\n        _scene.add(self.layer)\n\n    def diappear(self):\n        self.layer.scale(0.001)\n\n    def move(self, x, y):\n        self.layer.move(x, y)\n\n    def arise(self):\n        self.layer.setDepth(45)\n        self.layer.move(0, -20)\n\n\n\nCOLOR = ['Red', 'Blue']\nTYPE = ['super', 'normal']\n\nclass Mario(object):\n    def __init__(self, color='Blue', type='normal'):\n        assert type in TYPE and color in COLOR\n        self.color = color\n        self.type = type\n        self.step_size = 3\n\n    # Constructing Mario\n        mario = Layer()\n        # body\n        body = Rectangle(33, 22, Point(200, 200))\n        body.setFillColor(color)\n        body.setDepth(50)\n        mario.add(body)\n\n        # face\n        face = Ellipse(30, 20, Point(200, 180))\n        face.setFillColor('beige')\n        face.setDepth(40)\n        mario.add(face)\n\n        #hat\n        hat = Polygon(Point(185, 175), Point(220, 175), Point(220, 173), Point(215, 173), Point(212, 168), Point(188, 168))\n        hat.setFillColor(color)\n        hat.setDepth(39)\n        mario.add(hat)\n\n        #beard\n        beard = Polygon(Point(207, 183), Point(217, 183), Point(215, 180), Point(209, 180))\n        beard.setFillColor('Brown')\n        beard.setDepth(38)\n        mario.add(beard)\n\n        shoe = Layer()\n        #left shoe\n        lshoe = Rectangle(15, 6, Point(191, 215))\n        lshoe.setFillColor('black')\n        lshoe.setDepth(52)\n        shoe.add(lshoe)\n\n        #right shoe\n        rshoe = lshoe.clone()\n        rshoe.move(17, 0)\n        shoe.add(rshoe)\n        mario.add(shoe)\n\n        # save alias of moveable parts\n        self.layer = mario\n        self.body = body\n        self.hat = hat\n        self.shoe = shoe\n        _scene.add(self.layer)\n\n        self.moving_part_count = 0\n\n        if type == 'super':\n            self.supermario()\n\n\n    def shoe_move(self):\n\n        if self.moving_part_count % 3 == 0:\n            self.shoe.move(3, 0)\n        elif self.moving_part_count % 3 == 1:\n            self.shoe.move(-5,0)\n        else: self.shoe.move(2,0)\n        self.moving_part_count += 1\n        if self.moving_part_count % 3 == 0: self.moving_part_count = 0\n\n    def move(self,x=10,y=0):\n        self.layer.move(x,y)\n\n\n    def supermario(self):\n        tempPt = self.body.getReferencePoint()\n        self.layer.adjustReference(tempPt.getX(), tempPt.getY())\n        for i in range(3):\n            self.layer.scale(1.3)\n            sleep(t/2)\n            self.layer.scale(0.9)\n            sleep(t/2)\n\n    def walk(self,x=20):\n        assert x > 0\n        total_step = int(x / self.step_size)\n        for i in range(total_step):\n            sleep(t/4)\n            self.move(self.step_size, 0)\n            self.shoe_move()\n\ndef show_animation():\n    sleep(t)\n    mario.move(0, -50)\n    mushroom.arise()\n\n    sleep(t)\n    mario.move(0, 50)\n    mushroom.move(0, 8)\n\n    for i in range(7):\n        sleep(t/2)\n        mushroom.move(10, 0)\n        mario.move(10, 0)\n        mario.shoe_move()\n        sleep(t/2)\n        mario.shoe_move()\n\n    sleep(t/2)\n    mushroom.move(0, 50)\n    mario.move(10, 0)\n    mario.shoe_move()\n    sleep(t/2)\n    mario.shoe_move()\n\n    sleep(t)\n    mushroom.move(0, 50)\n\n    sleep(t/2)\n    mushroom.diappear()\n    sleep(t/2)\n    mario.supermario()\n\n    for i in range(6):\n        sleep(t/2)\n        mario.move(10, 0)\n        mario.shoe_move()\n        sleep(t/2)\n        mario.shoe_move()\n\n    for i in range(2):\n        sleep(t)\n        mario.move(28, -60)\n\n    for i in range(1):\n        sleep(t)\n        mario.move(32, 40)\n\n    sleep(2*t)\n    for i in range(4):\n        sleep(t)\n        mario.move(0, 25)\n        \ndef interactive_example():\n    while True:\n        e = _scene.wait()\n        d = e.getDescription()\n        if d == \"keyboard\":\n            k = e.getKey()\n            if k == \"q\":\n                _scene.close()\n                break\n            elif k == \"w\":\n                mario.walk(20)\n            elif k == \"r\":\n                mario.walk(40)\n            elif k == \"j\":\n                mario.move(0, -50)\n                sleep(t)\n                mario.move(0, 50)\n\ncreate_world()\nmario = Mario('Blue', 'normal')\nmushroom = Mushroom(200, 92)\n\nshow_animation()\n#interactive_example()\n\n```\n\nQuestion:\nSo, does it run well without _scene.close()?!It doesn't move on my screen..!\n\nClassify this question into exactly one of the following types:\ncode_understanding, logical, error, usage, algorithm, task, comparison, reasoning, code_explain, variable, guiding\n\nReason step-by-step about what the question is asking.\n\n\nLet's think step-by-step.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nStep 1: The question is asking if the program runs well without the line `_scene.close()`, but it seems like it doesn't move on the screen.\n\nStep 2: The question is inquiring about the functionality of the program without a specific line of code.\n\nStep 3: This is related to the behavior of the program when it is executed.\n\nStep 4: Based on these points, the question falls under the 'usage' category as it pertains to how the program behaves when run in a particular situation.\nThe answer is \\boxed{usage}.\nTrue/False:",
+        "indirect_ptrue2": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nYou are an expert reasoning assistant. For every problem you receive, think carefully and reason step-by-step. Label each reasoning step as 'Step 1:', 'Step 2:', etc. Keep your reasoning concise, and be brief in each step.\n\nDuring your reasoning, do NOT reveal, hint at, or restate the final answer. Do not write lines like 'Answer:', 'Final answer:', any answer strings, or any concluding sentence. Stop immediately after your last numbered reasoning step.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nCode:\n```\nfrom cs1graphics import *\nfrom time import sleep\n\n_scene = None\n_world = None\n\nt = 0.2\n\ndef create_world():\n    global _scene, _world\n    if _scene:\n        raise RuntimeError(\"A world already exists!\")\n    _world = _World(500, 300)\n    _scene = Canvas(_world.width, _world.height)\n    _scene.setTitle(\"Mario World\")\n    _world.draw_scene()\n\nclass _World(object):\n    def __init__(self, width, height):\n        self.width = width\n        self.height = height\n\n    def draw_scene(self):\n        \"\"\"\n        draw background here\n        Don't forget _scene.add(name)\n        \"\"\"\n        grass = Rectangle(1000, 150, Point(250, 250))\n        grass.setFillColor('green')\n        grass.setDepth(100)\n        _scene.add(grass)\n\n        #blocks\n        block = Rectangle(40, 40, Point(200, 100))\n        block.setFillColor('brown')\n\n        qmark = Text(\"?\", 20, Point(200, 100))\n        qmark.setFontColor('Yellow')\n        qmark.setDepth(48)\n        _scene.add(qmark)\n\n        block2 = block.clone()\n        block2.move(40, 0)\n        block.setDepth(50)\n        _scene.add(block)\n        _scene.add(block2)\n\n        #pipe\n        pipe = Polygon(Point(400, 150), Point(400, 160), Point(410, 160), Point(410, 320), Point(470, 320), Point(470, 160), Point(480, 160), Point(480, 150))\n        pipe.setFillColor('lightgreen')\n        pipe.setDepth(10)\n        pipe.move(-10, 0)\n        _scene.add(pipe)\n\n\nclass Mushroom(object):\n    def __init__(self, x=200, y=92):\n        mushroom = Layer()\n        uppermush = Ellipse(38, 18, Point(x, y))\n        uppermush.setFillColor('red')\n        uppermush.setDepth(52)\n        lowermush = Ellipse(35, 25, Point(x, y+8))\n        lowermush.setFillColor('beige')\n        lowermush.setDepth(53)\n        mushroom.add(lowermush)\n        mushroom.add(uppermush)\n        mushroom.setDepth(52)\n\n        self.layer = mushroom\n        _scene.add(self.layer)\n\n    def diappear(self):\n        self.layer.scale(0.001)\n\n    def move(self, x, y):\n        self.layer.move(x, y)\n\n    def arise(self):\n        self.layer.setDepth(45)\n        self.layer.move(0, -20)\n\n\n\nCOLOR = ['Red', 'Blue']\nTYPE = ['super', 'normal']\n\nclass Mario(object):\n    def __init__(self, color='Blue', type='normal'):\n        assert type in TYPE and color in COLOR\n        self.color = color\n        self.type = type\n        self.step_size = 3\n\n    # Constructing Mario\n        mario = Layer()\n        # body\n        body = Rectangle(33, 22, Point(200, 200))\n        body.setFillColor(color)\n        body.setDepth(50)\n        mario.add(body)\n\n        # face\n        face = Ellipse(30, 20, Point(200, 180))\n        face.setFillColor('beige')\n        face.setDepth(40)\n        mario.add(face)\n\n        #hat\n        hat = Polygon(Point(185, 175), Point(220, 175), Point(220, 173), Point(215, 173), Point(212, 168), Point(188, 168))\n        hat.setFillColor(color)\n        hat.setDepth(39)\n        mario.add(hat)\n\n        #beard\n        beard = Polygon(Point(207, 183), Point(217, 183), Point(215, 180), Point(209, 180))\n        beard.setFillColor('Brown')\n        beard.setDepth(38)\n        mario.add(beard)\n\n        shoe = Layer()\n        #left shoe\n        lshoe = Rectangle(15, 6, Point(191, 215))\n        lshoe.setFillColor('black')\n        lshoe.setDepth(52)\n        shoe.add(lshoe)\n\n        #right shoe\n        rshoe = lshoe.clone()\n        rshoe.move(17, 0)\n        shoe.add(rshoe)\n        mario.add(shoe)\n\n        # save alias of moveable parts\n        self.layer = mario\n        self.body = body\n        self.hat = hat\n        self.shoe = shoe\n        _scene.add(self.layer)\n\n        self.moving_part_count = 0\n\n        if type == 'super':\n            self.supermario()\n\n\n    def shoe_move(self):\n\n        if self.moving_part_count % 3 == 0:\n            self.shoe.move(3, 0)\n        elif self.moving_part_count % 3 == 1:\n            self.shoe.move(-5,0)\n        else: self.shoe.move(2,0)\n        self.moving_part_count += 1\n        if self.moving_part_count % 3 == 0: self.moving_part_count = 0\n\n    def move(self,x=10,y=0):\n        self.layer.move(x,y)\n\n\n    def supermario(self):\n        tempPt = self.body.getReferencePoint()\n        self.layer.adjustReference(tempPt.getX(), tempPt.getY())\n        for i in range(3):\n            self.layer.scale(1.3)\n            sleep(t/2)\n            self.layer.scale(0.9)\n            sleep(t/2)\n\n    def walk(self,x=20):\n        assert x > 0\n        total_step = int(x / self.step_size)\n        for i in range(total_step):\n            sleep(t/4)\n            self.move(self.step_size, 0)\n            self.shoe_move()\n\ndef show_animation():\n    sleep(t)\n    mario.move(0, -50)\n    mushroom.arise()\n\n    sleep(t)\n    mario.move(0, 50)\n    mushroom.move(0, 8)\n\n    for i in range(7):\n        sleep(t/2)\n        mushroom.move(10, 0)\n        mario.move(10, 0)\n        mario.shoe_move()\n        sleep(t/2)\n        mario.shoe_move()\n\n    sleep(t/2)\n    mushroom.move(0, 50)\n    mario.move(10, 0)\n    mario.shoe_move()\n    sleep(t/2)\n    mario.shoe_move()\n\n    sleep(t)\n    mushroom.move(0, 50)\n\n    sleep(t/2)\n    mushroom.diappear()\n    sleep(t/2)\n    mario.supermario()\n\n    for i in range(6):\n        sleep(t/2)\n        mario.move(10, 0)\n        mario.shoe_move()\n        sleep(t/2)\n        mario.shoe_move()\n\n    for i in range(2):\n        sleep(t)\n        mario.move(28, -60)\n\n    for i in range(1):\n        sleep(t)\n        mario.move(32, 40)\n\n    sleep(2*t)\n    for i in range(4):\n        sleep(t)\n        mario.move(0, 25)\n        \ndef interactive_example():\n    while True:\n        e = _scene.wait()\n        d = e.getDescription()\n        if d == \"keyboard\":\n            k = e.getKey()\n            if k == \"q\":\n                _scene.close()\n                break\n            elif k == \"w\":\n                mario.walk(20)\n            elif k == \"r\":\n                mario.walk(40)\n            elif k == \"j\":\n                mario.move(0, -50)\n                sleep(t)\n                mario.move(0, 50)\n\ncreate_world()\nmario = Mario('Blue', 'normal')\nmushroom = Mushroom(200, 92)\n\nshow_animation()\n#interactive_example()\n\n```\n\nQuestion:\nSo, does it run well without _scene.close()?!It doesn't move on my screen..!\n\nClassify this question into exactly one of the following types:\ncode_understanding, logical, error, usage, algorithm, task, comparison, reasoning, code_explain, variable, guiding\n\nReason step-by-step about what the question is asking.\n\n\nLet's think step-by-step.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nStep 1: The question is asking if the program runs well without the line `_scene.close()`, but it seems like it doesn't move on the screen.\n\nStep 2: The question is inquiring about the functionality of the program without a specific line of code.\n\nStep 3: This is related to the behavior of the program when it is executed.\n\nStep 4: Based on these points, the question falls under the 'usage' category as it pertains to how the program behaves when run in a particular situation.\nIs the answer \\boxed{usage}?",
+        "verbconf": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024\n\nYou are an expert reasoning assistant. For every problem you receive, think carefully and reason step-by-step. Label each reasoning step as 'Step 1:', 'Step 2:', etc. Keep your reasoning concise, and be brief in each step.\n\nDuring your reasoning, do NOT reveal, hint at, or restate the final answer. Do not write lines like 'Answer:', 'Final answer:', any answer strings, or any concluding sentence. Stop immediately after your last numbered reasoning step.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nCode:\n```\nfrom cs1graphics import *\nfrom time import sleep\n\n_scene = None\n_world = None\n\nt = 0.2\n\ndef create_world():\n    global _scene, _world\n    if _scene:\n        raise RuntimeError(\"A world already exists!\")\n    _world = _World(500, 300)\n    _scene = Canvas(_world.width, _world.height)\n    _scene.setTitle(\"Mario World\")\n    _world.draw_scene()\n\nclass _World(object):\n    def __init__(self, width, height):\n        self.width = width\n        self.height = height\n\n    def draw_scene(self):\n        \"\"\"\n        draw background here\n        Don't forget _scene.add(name)\n        \"\"\"\n        grass = Rectangle(1000, 150, Point(250, 250))\n        grass.setFillColor('green')\n        grass.setDepth(100)\n        _scene.add(grass)\n\n        #blocks\n        block = Rectangle(40, 40, Point(200, 100))\n        block.setFillColor('brown')\n\n        qmark = Text(\"?\", 20, Point(200, 100))\n        qmark.setFontColor('Yellow')\n        qmark.setDepth(48)\n        _scene.add(qmark)\n\n        block2 = block.clone()\n        block2.move(40, 0)\n        block.setDepth(50)\n        _scene.add(block)\n        _scene.add(block2)\n\n        #pipe\n        pipe = Polygon(Point(400, 150), Point(400, 160), Point(410, 160), Point(410, 320), Point(470, 320), Point(470, 160), Point(480, 160), Point(480, 150))\n        pipe.setFillColor('lightgreen')\n        pipe.setDepth(10)\n        pipe.move(-10, 0)\n        _scene.add(pipe)\n\n\nclass Mushroom(object):\n    def __init__(self, x=200, y=92):\n        mushroom = Layer()\n        uppermush = Ellipse(38, 18, Point(x, y))\n        uppermush.setFillColor('red')\n        uppermush.setDepth(52)\n        lowermush = Ellipse(35, 25, Point(x, y+8))\n        lowermush.setFillColor('beige')\n        lowermush.setDepth(53)\n        mushroom.add(lowermush)\n        mushroom.add(uppermush)\n        mushroom.setDepth(52)\n\n        self.layer = mushroom\n        _scene.add(self.layer)\n\n    def diappear(self):\n        self.layer.scale(0.001)\n\n    def move(self, x, y):\n        self.layer.move(x, y)\n\n    def arise(self):\n        self.layer.setDepth(45)\n        self.layer.move(0, -20)\n\n\n\nCOLOR = ['Red', 'Blue']\nTYPE = ['super', 'normal']\n\nclass Mario(object):\n    def __init__(self, color='Blue', type='normal'):\n        assert type in TYPE and color in COLOR\n        self.color = color\n        self.type = type\n        self.step_size = 3\n\n    # Constructing Mario\n        mario = Layer()\n        # body\n        body = Rectangle(33, 22, Point(200, 200))\n        body.setFillColor(color)\n        body.setDepth(50)\n        mario.add(body)\n\n        # face\n        face = Ellipse(30, 20, Point(200, 180))\n        face.setFillColor('beige')\n        face.setDepth(40)\n        mario.add(face)\n\n        #hat\n        hat = Polygon(Point(185, 175), Point(220, 175), Point(220, 173), Point(215, 173), Point(212, 168), Point(188, 168))\n        hat.setFillColor(color)\n        hat.setDepth(39)\n        mario.add(hat)\n\n        #beard\n        beard = Polygon(Point(207, 183), Point(217, 183), Point(215, 180), Point(209, 180))\n        beard.setFillColor('Brown')\n        beard.setDepth(38)\n        mario.add(beard)\n\n        shoe = Layer()\n        #left shoe\n        lshoe = Rectangle(15, 6, Point(191, 215))\n        lshoe.setFillColor('black')\n        lshoe.setDepth(52)\n        shoe.add(lshoe)\n\n        #right shoe\n        rshoe = lshoe.clone()\n        rshoe.move(17, 0)\n        shoe.add(rshoe)\n        mario.add(shoe)\n\n        # save alias of moveable parts\n        self.layer = mario\n        self.body = body\n        self.hat = hat\n        self.shoe = shoe\n        _scene.add(self.layer)\n\n        self.moving_part_count = 0\n\n        if type == 'super':\n            self.supermario()\n\n\n    def shoe_move(self):\n\n        if self.moving_part_count % 3 == 0:\n            self.shoe.move(3, 0)\n        elif self.moving_part_count % 3 == 1:\n            self.shoe.move(-5,0)\n        else: self.shoe.move(2,0)\n        self.moving_part_count += 1\n        if self.moving_part_count % 3 == 0: self.moving_part_count = 0\n\n    def move(self,x=10,y=0):\n        self.layer.move(x,y)\n\n\n    def supermario(self):\n        tempPt = self.body.getReferencePoint()\n        self.layer.adjustReference(tempPt.getX(), tempPt.getY())\n        for i in range(3):\n            self.layer.scale(1.3)\n            sleep(t/2)\n            self.layer.scale(0.9)\n            sleep(t/2)\n\n    def walk(self,x=20):\n        assert x > 0\n        total_step = int(x / self.step_size)\n        for i in range(total_step):\n            sleep(t/4)\n            self.move(self.step_size, 0)\n            self.shoe_move()\n\ndef show_animation():\n    sleep(t)\n    mario.move(0, -50)\n    mushroom.arise()\n\n    sleep(t)\n    mario.move(0, 50)\n    mushroom.move(0, 8)\n\n    for i in range(7):\n        sleep(t/2)\n        mushroom.move(10, 0)\n        mario.move(10, 0)\n        mario.shoe_move()\n        sleep(t/2)\n        mario.shoe_move()\n\n    sleep(t/2)\n    mushroom.move(0, 50)\n    mario.move(10, 0)\n    mario.shoe_move()\n    sleep(t/2)\n    mario.shoe_move()\n\n    sleep(t)\n    mushroom.move(0, 50)\n\n    sleep(t/2)\n    mushroom.diappear()\n    sleep(t/2)\n    mario.supermario()\n\n    for i in range(6):\n        sleep(t/2)\n        mario.move(10, 0)\n        mario.shoe_move()\n        sleep(t/2)\n        mario.shoe_move()\n\n    for i in range(2):\n        sleep(t)\n        mario.move(28, -60)\n\n    for i in range(1):\n        sleep(t)\n        mario.move(32, 40)\n\n    sleep(2*t)\n    for i in range(4):\n        sleep(t)\n        mario.move(0, 25)\n        \ndef interactive_example():\n    while True:\n        e = _scene.wait()\n        d = e.getDescription()\n        if d == \"keyboard\":\n            k = e.getKey()\n            if k == \"q\":\n                _scene.close()\n                break\n            elif k == \"w\":\n                mario.walk(20)\n            elif k == \"r\":\n                mario.walk(40)\n            elif k == \"j\":\n                mario.move(0, -50)\n                sleep(t)\n                mario.move(0, 50)\n\ncreate_world()\nmario = Mario('Blue', 'normal')\nmushroom = Mushroom(200, 92)\n\nshow_animation()\n#interactive_example()\n\n```\n\nQuestion:\nSo, does it run well without _scene.close()?!It doesn't move on my screen..!\n\nClassify this question into exactly one of the following types:\ncode_understanding, logical, error, usage, algorithm, task, comparison, reasoning, code_explain, variable, guiding\n\nReason step-by-step about what the question is asking.\n\n\nLet's think step-by-step.<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nStep 1: The question is asking if the program runs well without the line `_scene.close()`, but it seems like it doesn't move on the screen.\n\nStep 2: The question is inquiring about the functionality of the program without a specific line of code.\n\nStep 3: This is related to the behavior of the program when it is executed.\n\nStep 4: Based on these points, the question falls under the 'usage' category as it pertains to how the program behaves when run in a particular situation.\nThe answer is \\boxed{usage}.\nPlease respond with a score from 0 to 100 in <confidence> </confidence> tags.\nHow confident are you in your previous answer?\n<confidence>"
+      }
+    },
+    "runtime_seconds": 5.716405391693115,
+    "correct": false,
+    "sample_idx": 28
+  }
+}
