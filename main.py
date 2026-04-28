@@ -216,6 +216,26 @@ def parse():
         ),
     )
     args.add_argument(
+        "--experimental_fake_bootstrap",
+        action="store_true",
+        default=False,
+        help=(
+            "Fake bootstrap confidence scoring: sample n-1 steps with replacement, "
+            "use attention mask weighting (weight k for steps sampled k times, 0 otherwise). "
+            "Mutually exclusive with --experimental_jackknife, --experimental_grid, --vanilla_only, --experimental_bootstrap."
+        ),
+    )
+    args.add_argument(
+        "--experimental_fake_bootstrap_hook",
+        action="store_true",
+        default=False,
+        help=(
+            "Fake bootstrap with forward hooks: sample n-1 steps with replacement, "
+            "use forward hooks to directly scale attention weights (multiply by k for steps sampled k times). "
+            "Mutually exclusive with --experimental_jackknife, --experimental_grid, --vanilla_only, --experimental_bootstrap, --experimental_fake_bootstrap."
+        ),
+    )
+    args.add_argument(
         "--experimental_coinflip_true",
         action="store_true",
         default=False,
@@ -243,6 +263,29 @@ def parse():
         help=(
             "Confidence-only prompt modification mode. Supported values: "
             "'no-cots' and 'gibberish'."
+        ),
+    )
+    args.add_argument(
+        "--experimental_hollow",
+        type=int,
+        default=None,
+        choices=[1, 2],
+        help=(
+            "Hollow confidence run: drop every step except the last at the "
+            "token level (prompt reconstruction, no attention-mask edits). "
+            "Mode 1: keep last step as-is. "
+            "Mode 2: replace last step with "
+            "'Considering the question, {final_answer} seems to be the most appropriate answer.'. "
+            "The retained step is always renumbered as Step 1."
+        ),
+    )
+    args.add_argument(
+        "--cot_sample_idx",
+        type=int,
+        default=None,
+        help=(
+            "Run only this sample index per datapoint instead of iterating "
+            "0..nb_cot_samples-1. Useful for parallelising multi-sample runs."
         ),
     )
     args.add_argument(
@@ -295,6 +338,28 @@ def parse():
             args.error("--experimental_bootstrap is mutually exclusive with --experimental_grid.")
         if parsed.vanilla_only:
             args.error("--experimental_bootstrap is mutually exclusive with --vanilla_only.")
+        if parsed.experimental_fake_bootstrap:
+            args.error("--experimental_bootstrap is mutually exclusive with --experimental_fake_bootstrap.")
+        if parsed.nb_dropout_samples == 3:
+            parsed.nb_dropout_samples = 100
+    if parsed.experimental_fake_bootstrap:
+        if parsed.experimental_jackknife is not None:
+            args.error("--experimental_fake_bootstrap is mutually exclusive with --experimental_jackknife.")
+        if parsed.experimental_grid:
+            args.error("--experimental_fake_bootstrap is mutually exclusive with --experimental_grid.")
+        if parsed.vanilla_only:
+            args.error("--experimental_fake_bootstrap is mutually exclusive with --vanilla_only.")
+        if parsed.nb_dropout_samples == 3:
+            parsed.nb_dropout_samples = 100
+    if parsed.experimental_fake_bootstrap_hook:
+        if parsed.experimental_jackknife is not None:
+            args.error("--experimental_fake_bootstrap_hook is mutually exclusive with --experimental_jackknife.")
+        if parsed.experimental_grid:
+            args.error("--experimental_fake_bootstrap_hook is mutually exclusive with --experimental_grid.")
+        if parsed.vanilla_only:
+            args.error("--experimental_fake_bootstrap_hook is mutually exclusive with --vanilla_only.")
+        if parsed.experimental_fake_bootstrap:
+            args.error("--experimental_fake_bootstrap_hook is mutually exclusive with --experimental_fake_bootstrap.")
         if parsed.nb_dropout_samples == 3:
             parsed.nb_dropout_samples = 100
     if parsed.experimental_coinflip_true:
@@ -302,6 +367,10 @@ def parse():
             args.error("--experimental_coinflip_true is mutually exclusive with --experimental_jackknife.")
         if parsed.experimental_bootstrap:
             args.error("--experimental_coinflip_true is mutually exclusive with --experimental_bootstrap.")
+        if parsed.experimental_fake_bootstrap:
+            args.error("--experimental_coinflip_true is mutually exclusive with --experimental_fake_bootstrap.")
+        if parsed.experimental_fake_bootstrap_hook:
+            args.error("--experimental_coinflip_true is mutually exclusive with --experimental_fake_bootstrap_hook.")
         if parsed.vanilla_only:
             args.error("--experimental_coinflip_true is mutually exclusive with --vanilla_only.")
     if parsed.from_pregenerated is not None:
@@ -313,6 +382,15 @@ def parse():
 
 
 
+
+
+def _available_pregenerated_indices(pregen_dir: str) -> set[int]:
+    indices: set[int] = set()
+    for fname in os.listdir(pregen_dir):
+        m = re.match(r"traj_(\d+)(?:_sample_0)?\.json$", fname)
+        if m:
+            indices.add(int(m.group(1)))
+    return indices
 
 
 def _load_pregenerated_traj(pregen_dir: str, index: int) -> dict:
@@ -381,7 +459,7 @@ def generate_continuation(llm, messages, max_new_tokens, temperature=0.0, suffix
     return gen2, assistant_prefill, full_generated_text
 
 
-def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=None, discord=False, nb_dropout_samples=3, experimental_extra_box=False, experimental_modification=None, experimental_grid=False, tag=None, cot_dir=None, temperature=0.0, nb_cot_samples=1, vanilla_only=False, from_pregenerated=None, experimental_preserve_final_step=False, experimental_bootstrap=False, experimental_coinflip_true=False):
+def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=None, discord=False, nb_dropout_samples=3, experimental_extra_box=False, experimental_modification=None, experimental_grid=False, tag=None, cot_dir=None, temperature=0.0, nb_cot_samples=1, vanilla_only=False, from_pregenerated=None, experimental_preserve_final_step=False, experimental_bootstrap=False, experimental_coinflip_true=False, experimental_hollow=None, cot_sample_idx=None, experimental_fake_bootstrap=False, experimental_fake_bootstrap_hook=False):
 
     debug_dir = "debug_cache"
 
@@ -404,9 +482,18 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
 
     errors = []
 
+    if from_pregenerated:
+        _pregen_indices = _available_pregenerated_indices(from_pregenerated)
+        logger.info(f"Pregenerated dir has {len(_pregen_indices)} indices available")
+    else:
+        _pregen_indices = None
+
     progress = tqdm_discord if discord else tqdm
     desc = f"Generating [{tag}]" if tag else "Generating"
-    for i, entry in enumerate(progress(dataloader, desc=desc, unit="sample")):
+    total = min(len(_pregen_indices), len(dataloader)) if _pregen_indices is not None else len(dataloader)
+    for i, entry in enumerate(progress(dataloader, desc=desc, unit="sample", total=total)):
+        if _pregen_indices is not None and i not in _pregen_indices:
+            continue
         logger.info(f"Generating {i}/{len(dataloader)}")
         t0 = time.time()
 
@@ -421,7 +508,8 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                 messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type, experimental_extra_box=experimental_extra_box)
                 nb_samples_for_entry = nb_cot_samples
 
-            for sample_idx in range(nb_samples_for_entry):
+            sample_indices = [cot_sample_idx] if cot_sample_idx is not None else range(nb_samples_for_entry)
+            for sample_idx in sample_indices:
               try:
                 t_sample = time.time()
 
@@ -547,6 +635,9 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                                 preserve_final_step=experimental_preserve_final_step,
                                 experimental_bootstrap=experimental_bootstrap,
                                 experimental_coinflip_true=experimental_coinflip_true,
+                                experimental_hollow=experimental_hollow,
+                                experimental_fake_bootstrap=experimental_fake_bootstrap,
+                                experimental_fake_bootstrap_hook=experimental_fake_bootstrap_hook,
                             )
                         except ConfidenceAlignmentError as exc:
                             confidence_error = str(exc)
@@ -641,7 +732,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                     "generated_end_position":       gen.generated_end_position,
                     "answer_token_start_position":  answer_token_start_position,
                     "confidence_score": confidence_score,
-                    "confidence_method": ("vanilla_only" if vanilla_only else "bootstrap" if experimental_bootstrap else "coinflip_true" if experimental_coinflip_true else {None: "coin_flip", "default": f"jackknife{'_grid' if experimental_grid else ''}_default", "true": f"coin_flip+jackknife{'_grid' if experimental_grid else ''}_true"}[experimental_jackknife]) if confidence_score else None,
+                    "confidence_method": ("vanilla_only" if vanilla_only else "bootstrap" if experimental_bootstrap else "fake_bootstrap" if experimental_fake_bootstrap else "fake_bootstrap_hook" if experimental_fake_bootstrap_hook else "coinflip_true" if experimental_coinflip_true else {None: "coin_flip", "default": f"jackknife{'_grid' if experimental_grid else ''}_default", "true": f"coin_flip+jackknife{'_grid' if experimental_grid else ''}_true"}[experimental_jackknife]) if confidence_score else None,
                     "confidence_modification": experimental_modification if confidence_score else None,
                     "confidence_error":            confidence_error,
                     "debug_info":                   debug_info if debug_conf else None,
@@ -800,6 +891,10 @@ def main(args):
         _jk_suffix = "vanillaonly"
     elif args.experimental_bootstrap:
         _jk_suffix = "bootstrap"
+    elif args.experimental_fake_bootstrap:
+        _jk_suffix = "fake_bootstrap"
+    elif args.experimental_fake_bootstrap_hook:
+        _jk_suffix = "fake_bootstrap_hook"
     elif args.experimental_coinflip_true:
         _jk_suffix = "coinflip_true"
     elif args.experimental_grid:
@@ -808,8 +903,12 @@ def main(args):
         _jk_suffix = {None: "coinflip", "default": "jackknife_default", "true": "jackknife_true"}[args.experimental_jackknife]
     mod_suffix = args.experimental_modification or "none"
     dir_name = f"{args.model}_{'thinking' if args.thinking else 'regular'}_{args.dataset}_{args.shot_mode}_{start}_{end}_type{args.type}_{'conf' if args.confidence else 'vanilla'}_{_jk_suffix}_mod-{mod_suffix}"
+    if args.experimental_hollow is not None:
+        dir_name += f"_hollow{args.experimental_hollow}"
     if args.nb_cot_samples > 1:
         dir_name += f"_samples{args.nb_cot_samples}"
+    if args.cot_sample_idx is not None:
+        dir_name += f"_sidx{args.cot_sample_idx}"
     if args.tag:
         dir_name = f"{args.tag}_{dir_name}"
     out_dir = f"trajectories/{dir_name}"
@@ -845,6 +944,10 @@ def main(args):
         experimental_preserve_final_step=args.experimental_preserve_final_step,
         experimental_bootstrap=args.experimental_bootstrap,
         experimental_coinflip_true=args.experimental_coinflip_true,
+        experimental_hollow=args.experimental_hollow,
+        cot_sample_idx=args.cot_sample_idx,
+        experimental_fake_bootstrap=args.experimental_fake_bootstrap,
+        experimental_fake_bootstrap_hook=args.experimental_fake_bootstrap_hook,
     )
 
     if errors:
