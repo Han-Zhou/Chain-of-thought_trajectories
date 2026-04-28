@@ -160,6 +160,37 @@ def _bootstrap_sample_steps(cot_steps: list[str], nb_samples: int = 100):
     return kept_indices, step_counts
 
 
+def _fake_bootstrap_sample_steps(cot_steps: list[str], nb_samples: int = 100):
+    """Sample fake bootstrap replicates: bootstrap sampling with attention mask weighting.
+
+    Like _bootstrap_sample_steps, samples (n-1) steps with replacement and always
+    keeps the final step. Returns step counts (how many times each step was sampled)
+    for use with weighted attention masks.
+
+    Returns:
+        step_counts: list[list[int]] — per-sample count of how many times each
+            eligible step was sampled (0 = masked, k>0 = weighted by k)
+    """
+    steps, first_is_reasoning = _dropout_eligible_steps(cot_steps)
+    n = len(steps)
+    if n <= 1:
+        return []
+
+    pool_size = n - 1
+
+    step_counts = []
+    for _ in range(nb_samples):
+        sampled = np.random.choice(pool_size, size=pool_size, replace=True)
+        counts = np.zeros(n, dtype=int)
+        for idx in sampled:
+            counts[idx] += 1
+        counts[n - 1] += 1  # Always keep final step
+
+        step_counts.append(counts.tolist())
+
+    return step_counts
+
+
 def _coinflip_sample_steps(cot_steps: list[str], nb_dropout_samples: int, threshold: float = 0.5, preserve_final_step: bool = False):
     """Sample coin-flip keep/drop masks for token-level dropout.
 
@@ -266,6 +297,9 @@ def compute_all_confidence_scores(
     preserve_final_step: bool = False,
     experimental_bootstrap: bool = False,
     experimental_coinflip_true: bool = False,
+    experimental_hollow: int | None = None,
+    experimental_fake_bootstrap: bool = False,
+    experimental_fake_bootstrap_hook: bool = False,
 ) -> AllConfidenceData:
     debug_info = {}
 
@@ -503,6 +537,42 @@ def compute_all_confidence_scores(
         else:
             bootstrap_scores = _empty_sampled_confidence_scores()
 
+    # --- Fake Bootstrap (only when flag is set) ---
+    fake_bootstrap_scores = None
+    if experimental_fake_bootstrap:
+        if can_run_step_dropout:
+            fake_bootstrap_scores = _fake_bootstrap_forward(
+                llm, messages, cot_only_text, parsed_output,
+                nb_dropout_samples=nb_dropout_samples,
+                assistant_prefill=assistant_prefill,
+                debug_conf=debug_conf,
+                debug_info=debug_info,
+                normalized_content=normalized_content,
+                gen_cache=gen_cache,
+                base_tokens=base_tokens,
+                precomputed_early_cache=precomputed_early_cache,
+            )
+        else:
+            fake_bootstrap_scores = _empty_sampled_confidence_scores()
+
+    # --- Fake Bootstrap Hook (only when flag is set) ---
+    fake_bootstrap_hook_scores = None
+    if experimental_fake_bootstrap_hook:
+        if can_run_step_dropout:
+            fake_bootstrap_hook_scores = _fake_bootstrap_hook_forward(
+                llm, messages, cot_only_text, parsed_output,
+                nb_dropout_samples=nb_dropout_samples,
+                assistant_prefill=assistant_prefill,
+                debug_conf=debug_conf,
+                debug_info=debug_info,
+                normalized_content=normalized_content,
+                gen_cache=gen_cache,
+                base_tokens=base_tokens,
+                precomputed_early_cache=precomputed_early_cache,
+            )
+        else:
+            fake_bootstrap_hook_scores = _empty_sampled_confidence_scores()
+
     # --- Coinflip-true (only when flag is set) ---
     coinflip_true_scores = None
     if experimental_coinflip_true:
@@ -518,6 +588,21 @@ def compute_all_confidence_scores(
             )
         else:
             coinflip_true_scores = _empty_sampled_confidence_scores()
+
+    # --- Hollow (only when flag is set) ---
+    hollow_scores = None
+    if experimental_hollow is not None:
+        if len(parsed_output.cot_steps) >= 1:
+            hollow_scores = _hollow_forward(
+                llm, messages, cot_only_text, parsed_output,
+                assistant_prefill=assistant_prefill,
+                debug_conf=debug_conf,
+                debug_info=debug_info,
+                normalized_content=normalized_content,
+                hollow_mode=experimental_hollow,
+            )
+        else:
+            hollow_scores = _empty_sampled_confidence_scores()
 
     return AllConfidenceData(
         vanilla_confidences=ConfidenceScores(
@@ -545,7 +630,10 @@ def compute_all_confidence_scores(
         ),
         jackknife_confidences=jackknife_scores,
         bootstrap_confidences=bootstrap_scores,
+        fake_bootstrap_confidences=fake_bootstrap_scores,
+        fake_bootstrap_hook_confidences=fake_bootstrap_hook_scores,
         coinflip_true_confidences=coinflip_true_scores,
+        hollow_confidences=hollow_scores,
         debug_info=debug_info,
     )
 
@@ -1009,6 +1097,176 @@ def _coinflip_true_forward(
     return scores, step_masks
 
 
+def _hollow_forward(
+    llm: LLM,
+    messages: list[dict],
+    cot_only_text: str,
+    parsed_output: ParsedOutput,
+    assistant_prefill: str,
+    debug_conf: bool,
+    debug_info: dict,
+    normalized_content: str,
+    hollow_mode: int,
+) -> ConfidenceScores:
+    """Hollow confidence: drop every step except the last, run fresh forward passes.
+
+    hollow_mode == 1: keep the last step text as-is.
+    hollow_mode == 2: replace the last step with a canned sentence that
+        references the final answer.
+
+    In both modes the retained step is renumbered to "Step 1" via
+    `_reconstruct_cot_text` (which renumbers kept steps consecutively).
+
+    Returns a ConfidenceScores with a single sample per method (placed in the
+    "dropout"-style list fields so downstream code can treat it uniformly).
+    """
+    device = next(llm.model.parameters()).device
+
+    cot_steps = list(parsed_output.cot_steps)
+    eligible_steps, first_is_reasoning = _dropout_eligible_steps(cot_steps)
+    if not eligible_steps:
+        return _empty_sampled_confidence_scores()
+
+    # Index (in original cot_steps) of the last eligible step
+    last_eligible_idx = len(cot_steps) - 1
+
+    # For mode 2, splice a replacement step string into cot_steps at that index
+    local_cot_steps = list(cot_steps)
+    if hollow_mode == 2:
+        replacement = (
+            f"Step {last_eligible_idx + 1}: Considering the question, "
+            f"{parsed_output.final_answer} seems to be the most appropriate answer."
+        )
+        local_cot_steps[last_eligible_idx] = replacement
+
+    # Build kept_indices: preamble (if any) + last eligible step
+    kept_indices = [last_eligible_idx]
+
+    reconstructed_cot = _reconstruct_cot_text(
+        normalized_content, local_cot_steps, kept_indices)
+    reconstructed_base = (
+        (assistant_prefill + reconstructed_cot).strip()
+        if assistant_prefill else reconstructed_cot.strip()
+    )
+
+    ans_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
+    ptrue1_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}.\nTrue/False:"
+    ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"
+    verbconf_suffix = (
+        f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
+        "\nPlease respond with a score from 0 to 100 in <confidence> </confidence> tags."
+        "\nHow confident are you in your previous answer?"
+        "\n<confidence>"
+    )
+
+    positive_true_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' True'])
+    negative_false_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' False'])
+    positive_yes_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' Yes'])
+    negative_no_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' No'])
+    yes_only_id = llm.tokenizer.encode(' Yes', add_special_tokens=False)
+    no_only_id = llm.tokenizer.encode(' No', add_special_tokens=False)
+
+    verbconf_strings = ANSWER_TOKENS['VERBCONF']
+    token_seqs = [llm.tokenizer.encode(s, add_special_tokens=False) for s in verbconf_strings]
+    score_values = torch.tensor([int(s) / 100 for s in verbconf_strings], dtype=torch.float64)
+
+    # --- answer_logits ---
+    ans_content = (reconstructed_base + ans_suffix).strip()
+    ans_prompt = _build_prompt_text(llm, messages, ans_content)
+    ans_tokens = llm.tokenizer(ans_prompt, return_tensors="pt")["input_ids"].to(device)
+
+    boxed_string = f"\\boxed{{{parsed_output.final_answer}}}"
+    with torch.no_grad():
+        ans_output = llm.model.forward(input_ids=ans_tokens)
+
+    ans_token_ids = ans_tokens[0]
+    boxed_start, boxed_end = find_token_indices_from_end(
+        llm.tokenizer, ans_token_ids, boxed_string, llm.model_name)
+    a_start, a_end = find_token_indices_from_end(
+        llm.tokenizer, ans_token_ids[boxed_start:boxed_end],
+        parsed_output.final_answer, llm.model_name)
+    a_start += boxed_start
+    a_end += boxed_start
+
+    answer_toks = ans_token_ids[a_start:a_end]
+    nb_answer_tokens = len(answer_toks)
+    token_strings = [llm.tokenizer.decode([answer_toks[t].item()]) for t in range(nb_answer_tokens)]
+
+    v_logits = ans_output.logits[0, a_start - 1:a_end - 1, :]
+    v_probs = v_logits.double().softmax(dim=-1)
+    sample_answer_probs = [{token_strings[t]: v_probs[t, answer_toks[t]].item()} for t in range(nb_answer_tokens)]
+
+    v_logprobs = torch.nan_to_num(v_probs.log(), neginf=-99)
+    entropy_values = (-(v_probs * v_logprobs).sum(dim=-1)).cpu().numpy().tolist()
+    sample_entropy = [{token_strings[t]: entropy_values[t]} for t in range(nb_answer_tokens)]
+
+    # --- indirect_ptrue1 ---
+    ptrue1_content = (reconstructed_base + ptrue1_suffix).strip()
+    ptrue1_prompt = _build_prompt_text(llm, messages, ptrue1_content)
+    ptrue1_tokens = llm.tokenizer(ptrue1_prompt, return_tensors="pt")["input_ids"].to(device)
+    with torch.no_grad():
+        ptrue1_output = llm.model.forward(input_ids=ptrue1_tokens)
+    p1_pos = ptrue1_output.logits[0, -1, positive_true_ids].sum()
+    p1_neg = ptrue1_output.logits[0, -1, negative_false_ids].sum()
+    p1_sm = torch.softmax(torch.stack([p1_pos.double(), p1_neg.double()]), dim=0)
+    sample_ptrue1 = {"True": p1_sm[0].item(), "False": p1_sm[1].item()}
+
+    # --- indirect_ptrue2 / ptrue3 ---
+    ptrue2_content = (reconstructed_base + ptrue2_suffix).strip()
+    ptrue2_prompt = _build_prompt_text(llm, messages, ptrue2_content)
+    ptrue2_tokens = llm.tokenizer(ptrue2_prompt, return_tensors="pt")["input_ids"].to(device)
+    with torch.no_grad():
+        ptrue2_output = llm.model.forward(input_ids=ptrue2_tokens)
+    p2_pos = ptrue2_output.logits[0, -1, positive_yes_ids].sum()
+    p2_neg = ptrue2_output.logits[0, -1, negative_no_ids].sum()
+    p2_sm = torch.softmax(torch.stack([p2_pos.double(), p2_neg.double()]), dim=0)
+    sample_ptrue2 = {"Yes": p2_sm[0].item(), "No": p2_sm[1].item()}
+
+    p3_pos = ptrue2_output.logits[0, -1, yes_only_id[0]]
+    p3_neg = ptrue2_output.logits[0, -1, no_only_id[0]]
+    p3_sm = torch.softmax(torch.stack([p3_pos.double(), p3_neg.double()]), dim=0)
+    sample_ptrue3 = {"Yes": p3_sm[0].item(), "No": p3_sm[1].item()}
+
+    # --- verbconf ---
+    verbconf_content = (reconstructed_base + verbconf_suffix).strip()
+    verbconf_prompt = _build_prompt_text(llm, messages, verbconf_content)
+    verbconf_tokens = llm.tokenizer(verbconf_prompt, return_tensors="pt")["input_ids"].to(device)
+    with torch.no_grad():
+        verbconf_output = llm.model.forward(input_ids=verbconf_tokens)
+    vc_probs = _compute_verbconf_joint_probs(llm, verbconf_output, token_seqs, device)
+    vc_probs_1d = vc_probs[0] if vc_probs.dim() > 1 else vc_probs
+    sample_verbconf = (score_values * vc_probs_1d).sum().item()
+    sample_verbconf_dist = vc_probs_1d.tolist()
+    top_idx = vc_probs_1d.argmax().item()
+    sample_verbconf_top_score = top_idx
+    sample_verbconf_top_prob = vc_probs_1d[top_idx].item()
+
+    torch.cuda.empty_cache()
+
+    if debug_conf:
+        debug_info["hollow_mode"] = hollow_mode
+        debug_info["hollow_prompts"] = {
+            "answer_logits": ans_prompt,
+            "indirect_ptrue1": ptrue1_prompt,
+            "indirect_ptrue2": ptrue2_prompt,
+            "verbconf": verbconf_prompt,
+        }
+        debug_info["hollow_kept_step"] = local_cot_steps[last_eligible_idx]
+
+    return ConfidenceScores(
+        answer_probabilities=[sample_answer_probs],
+        answer_entropy=[sample_entropy],
+        indirect_ptrue1_probabilities=[sample_ptrue1],
+        indirect_ptrue2_probabilities=[sample_ptrue2],
+        indirect_ptrue3_probabilities=[sample_ptrue3],
+        verbconf_probabilities=[sample_verbconf],
+        verbconf_distribution=[sample_verbconf_dist],
+        verbconf_top_score=[sample_verbconf_top_score],
+        verbconf_top_prob=[sample_verbconf_top_prob],
+        step_masks=None,
+    )
+
+
 def _bootstrap_forward(
     llm: LLM,
     messages: list[dict],
@@ -1206,7 +1464,138 @@ def _bootstrap_forward(
     return scores, step_counts
 
 
-def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None, vanilla_only=False, recrop_early_cache_len=None, preserve_final_step=False):
+def _fake_bootstrap_forward(
+    llm: LLM,
+    messages: list[dict],
+    cot_only_text: str,
+    parsed_output: ParsedOutput,
+    nb_dropout_samples: int,
+    assistant_prefill: str,
+    debug_conf: bool,
+    debug_info: dict,
+    normalized_content: str,
+    gen_cache=None,
+    base_tokens=None,
+    precomputed_early_cache=None,
+) -> ConfidenceScores:
+    """Fake bootstrap: bootstrap sampling with attention mask weighting.
+
+    Samples (n-1) steps with replacement, always keeps final step. Uses
+    attention mask trick with weights (0 for unsampled, k for steps sampled k times).
+    """
+    step_counts = _fake_bootstrap_sample_steps(parsed_output.cot_steps, nb_dropout_samples)
+    effective_nb_samples = len(step_counts)
+
+    _, _, fb_answer_probs, fb_answer_entropy, dbg, _, fb_masked_steps_dbg = \
+        dropout_answerlogits(llm, messages, cot_only_text, parsed_output, effective_nb_samples, False, assistant_prefill, debug_conf=debug_conf,
+                             gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
+                             precomputed_early_cache=precomputed_early_cache,
+                             jk_kept_indices=None, jk_step_masks=step_counts)
+    if dbg:
+        debug_info["fake_bootstrap_answer_logits"] = dbg
+    if fb_masked_steps_dbg:
+        debug_info["fake_bootstrap_masked_steps"] = fb_masked_steps_dbg
+
+    _, _, _, fb_ptrue1, fb_ptrue2, fb_ptrue3, dbg, _ = \
+        dropout_indirectlogits(llm, messages, cot_only_text, parsed_output, effective_nb_samples, False, assistant_prefill, debug_conf=debug_conf,
+                               gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
+                               precomputed_early_cache=precomputed_early_cache,
+                               jk_kept_indices=None, jk_step_masks=step_counts)
+    if dbg:
+        debug_info["fake_bootstrap_indirect_logits"] = dbg
+
+    (_, fb_verbconf,
+     _, _, _,
+     fb_verbconf_dist, fb_verbconf_top_scores, fb_verbconf_top_probs,
+     dbg, _) = \
+        dropout_verbalconf(llm, messages, cot_only_text, parsed_output, effective_nb_samples, False, assistant_prefill, debug_conf=debug_conf,
+                           gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
+                           precomputed_early_cache=precomputed_early_cache,
+                           consume_early_cache=True,
+                           jk_kept_indices=None, jk_step_masks=step_counts)
+    if dbg:
+        debug_info["fake_bootstrap_verbconf"] = dbg
+
+    return ConfidenceScores(
+        answer_probabilities=fb_answer_probs,
+        answer_entropy=fb_answer_entropy,
+        indirect_ptrue1_probabilities=fb_ptrue1,
+        indirect_ptrue2_probabilities=fb_ptrue2,
+        indirect_ptrue3_probabilities=fb_ptrue3,
+        verbconf_probabilities=fb_verbconf,
+        verbconf_distribution=fb_verbconf_dist,
+        verbconf_top_score=fb_verbconf_top_scores,
+        verbconf_top_prob=fb_verbconf_top_probs,
+        step_masks=step_counts,
+    )
+
+
+def _fake_bootstrap_hook_forward(
+    llm: LLM,
+    messages: list[dict],
+    cot_only_text: str,
+    parsed_output: ParsedOutput,
+    nb_dropout_samples: int,
+    assistant_prefill: str,
+    debug_conf: bool,
+    debug_info: dict,
+    normalized_content: str,
+    gen_cache=None,
+    base_tokens=None,
+    precomputed_early_cache=None,
+) -> ConfidenceScores:
+    """Fake bootstrap with forward hooks: directly scale attention weights.
+
+    Uses forward hooks to multiply attention weights by k for steps sampled k times.
+    """
+    step_counts = _fake_bootstrap_sample_steps(parsed_output.cot_steps, nb_dropout_samples)
+    effective_nb_samples = len(step_counts)
+
+    _, _, fbh_answer_probs, fbh_answer_entropy, dbg, _, fbh_masked_steps_dbg = \
+        dropout_answerlogits(llm, messages, cot_only_text, parsed_output, effective_nb_samples, False, assistant_prefill, debug_conf=debug_conf,
+                             gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
+                             precomputed_early_cache=precomputed_early_cache,
+                             jk_kept_indices=None, jk_step_masks=step_counts, use_hooks=True)
+    if dbg:
+        debug_info["fake_bootstrap_hook_answer_logits"] = dbg
+    if fbh_masked_steps_dbg:
+        debug_info["fake_bootstrap_hook_masked_steps"] = fbh_masked_steps_dbg
+
+    _, _, _, fbh_ptrue1, fbh_ptrue2, fbh_ptrue3, dbg, _ = \
+        dropout_indirectlogits(llm, messages, cot_only_text, parsed_output, effective_nb_samples, False, assistant_prefill, debug_conf=debug_conf,
+                               gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
+                               precomputed_early_cache=precomputed_early_cache,
+                               jk_kept_indices=None, jk_step_masks=step_counts, use_hooks=True)
+    if dbg:
+        debug_info["fake_bootstrap_hook_indirect_logits"] = dbg
+
+    (_, fbh_verbconf,
+     _, _, _,
+     fbh_verbconf_dist, fbh_verbconf_top_scores, fbh_verbconf_top_probs,
+     dbg, _) = \
+        dropout_verbalconf(llm, messages, cot_only_text, parsed_output, effective_nb_samples, False, assistant_prefill, debug_conf=debug_conf,
+                           gen_cache=gen_cache, base_tokens=base_tokens, use_jackknife=True,
+                           precomputed_early_cache=precomputed_early_cache,
+                           consume_early_cache=True,
+                           jk_kept_indices=None, jk_step_masks=step_counts, use_hooks=True)
+    if dbg:
+        debug_info["fake_bootstrap_hook_verbconf"] = dbg
+
+    return ConfidenceScores(
+        answer_probabilities=fbh_answer_probs,
+        answer_entropy=fbh_answer_entropy,
+        indirect_ptrue1_probabilities=fbh_ptrue1,
+        indirect_ptrue2_probabilities=fbh_ptrue2,
+        indirect_ptrue3_probabilities=fbh_ptrue3,
+        verbconf_probabilities=fbh_verbconf,
+        verbconf_distribution=fbh_verbconf_dist,
+        verbconf_top_score=fbh_verbconf_top_scores,
+        verbconf_top_prob=fbh_verbconf_top_probs,
+        step_masks=step_counts,
+    )
+
+
+def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None, vanilla_only=False, recrop_early_cache_len=None, preserve_final_step=False, use_hooks=False):
     """Logit-based confidence on the answer tokens themselves."""
     suffix_text = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
     # logger.info("dropout_answerlogits: generated_text='%s', suffix='%s'", generated_text[:100], suffix_text)
@@ -1222,7 +1611,8 @@ def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropou
                         jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks,
                         vanilla_only=vanilla_only,
                         recrop_early_cache_len=recrop_early_cache_len,
-                        preserve_final_step=preserve_final_step)
+                        preserve_final_step=preserve_final_step,
+                        use_hooks=use_hooks)
 
     answer_tokens = late_tokens[0, ans_start:ans_end]
     nb_answer_tokens = len(answer_tokens)
@@ -1261,7 +1651,7 @@ def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropou
     return vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks, masked_steps_debug
 
 
-def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None, vanilla_only=False, recrop_early_cache_len=None, preserve_final_step=False):
+def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None, vanilla_only=False, recrop_early_cache_len=None, preserve_final_step=False, use_hooks=False):
     """P(True) and P(Yes) probing after the answer."""
     # logger.info("dropout_indirectlogits: generated_text='%s'", generated_text[:100])
 
@@ -1284,7 +1674,8 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
                         vanilla_only=vanilla_only,
                         consume_early_cache=vanilla_only,
                         recrop_early_cache_len=recrop_early_cache_len,
-                        preserve_final_step=preserve_final_step)
+                        preserve_final_step=preserve_final_step,
+                        use_hooks=use_hooks)
 
     # ptrue2: "Is the answer \boxed{<X>}?"
     ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"
@@ -1300,7 +1691,8 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
                         jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks,
                         vanilla_only=vanilla_only,
                         recrop_early_cache_len=recrop_early_cache_len,
-                        preserve_final_step=preserve_final_step)
+                        preserve_final_step=preserve_final_step,
+                        use_hooks=use_hooks)
 
     # Vanilla ptrue1
     v_pos1 = vanilla1.logits[0, -1, positive_true_ids].sum()
@@ -1484,7 +1876,7 @@ def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
     return joint_logprobs.softmax(-1)
 
 
-def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None, vanilla_only=False, recrop_early_cache_len=None, preserve_final_step=False):
+def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None, vanilla_only=False, recrop_early_cache_len=None, preserve_final_step=False, use_hooks=False):
     """Verbalized confidence (0-100 score)."""
     suffix = (
         f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
@@ -1505,7 +1897,8 @@ def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_
                         jk_kept_indices=jk_kept_indices, jk_step_masks=jk_step_masks,
                         vanilla_only=vanilla_only,
                         recrop_early_cache_len=None,
-                        preserve_final_step=preserve_final_step)
+                        preserve_final_step=preserve_final_step,
+                        use_hooks=use_hooks)
 
     verbconf_strings = ANSWER_TOKENS['VERBCONF']
     token_seqs = [llm.tokenizer.encode(s, add_special_tokens=False) for s in verbconf_strings]
@@ -1664,6 +2057,7 @@ def dropout_forward(
     vanilla_only: bool = False,
     recrop_early_cache_len: int | None = None,
     preserve_final_step: bool = False,
+    use_hooks: bool = False,
 ):
     """Core forward pass for dropout experiment.
 
@@ -1850,6 +2244,7 @@ def dropout_forward(
             jk_kept_indices=jk_kept_indices,
             jk_step_masks=jk_step_masks,
             preserve_final_step=preserve_final_step,
+            use_hooks=use_hooks,
         )
 
     # In vanilla_only mode the early_cache was mutated in place by the vanilla
@@ -1877,11 +2272,15 @@ def dropout_late_forward(
     jk_kept_indices=None,
     jk_step_masks=None,
     preserve_final_step=False,
+    use_hooks=False,
 ):
-    """Batched forward with per-sample dropout attention masks.
+    """Batched forward with per-sample dropout attention masks or hooks.
 
     For each sample, a random subset of reasoning steps is masked so that
     the answer-region tokens cannot attend to those steps.
+
+    When use_hooks=True, uses forward hooks to directly scale attention weights
+    instead of attention masks.
     """
     steps, _ = _dropout_eligible_steps(cot_steps)
     nb_late = late_tokens.shape[1]
@@ -1900,27 +2299,37 @@ def dropout_late_forward(
     if use_jackknife:
         # Jackknife: reuse pre-sampled step masks if provided, otherwise sample once
         if jk_step_masks is not None:
-            is_step_selected = np.array(jk_step_masks, dtype=bool)
+            step_weights = np.array(jk_step_masks)
             expected_shape = (nb_dropout_samples, len(steps))
-            if is_step_selected.shape != expected_shape:
+            if step_weights.shape != expected_shape:
                 raise ValueError(
                     "Jackknife step mask shape mismatch: "
-                    f"expected {expected_shape}, got {is_step_selected.shape}"
+                    f"expected {expected_shape}, got {step_weights.shape}"
                 )
+            # Check if weights are binary (0/1) or counts (0/1/2/...)
+            is_binary = np.all((step_weights == 0) | (step_weights == 1))
+            if is_binary:
+                is_step_selected = step_weights.astype(bool)
+            else:
+                # Fake bootstrap: step_weights are counts (0, 1, 2, ...)
+                is_step_selected = step_weights > 0
         else:
             # Sample jackknife masks
             k = len(steps)
             nb_keep = _jackknife_nb_keep(k)
             nb_mask = k - nb_keep
             is_step_selected = np.ones((nb_dropout_samples, k), dtype=bool)
+            step_weights = np.ones((nb_dropout_samples, k), dtype=int)
             for i in range(nb_dropout_samples):
                 masked_indices = np.random.choice(k, size=nb_mask, replace=False)
                 is_step_selected[i, masked_indices] = False
+                step_weights[i, masked_indices] = 0
     else:
         # Coin-flip: each step independently kept with probability = threshold
         is_step_selected = (np.random.random((nb_dropout_samples, len(steps))) <= threshold)
         if preserve_final_step and len(steps) > 0:
             is_step_selected[:, -1] = True
+        step_weights = is_step_selected.astype(int)
 
     # Walk backwards through steps, finding each one's token range and masking.
     # Positions in early_token_ids directly correspond to early cache columns.
@@ -1950,9 +2359,22 @@ def dropout_late_forward(
             ) from exc
 
         for i in range(nb_dropout_samples):
-            late_mask[i, 0,
-                      modify_start_late - 1:modify_end_late - 1,
-                      step_start:step_end] = 0. if is_step_selected[i, step_id] else -10000.
+            weight = step_weights[i, step_id]
+            if weight == 0:
+                # Step not sampled: mask it out completely
+                late_mask[i, 0,
+                          modify_start_late - 1:modify_end_late - 1,
+                          step_start:step_end] = -10000.
+            else:
+                # Step sampled weight times: scale attention by weight
+                # Attention mask is additive bias before softmax: attn = softmax(QK^T / sqrt(d) + mask)
+                # To multiply attention weights by k, we add log(k) to the mask
+                # This makes exp(score + log(k)) = k * exp(score)
+                # So after softmax, this step's contribution is scaled by k relative to others
+                scale_bias = np.log(weight) if weight > 0 else 0.
+                late_mask[i, 0,
+                          modify_start_late - 1:modify_end_late - 1,
+                          step_start:step_end] = scale_bias
 
         remaining_ids = remaining_ids[:step_start + 1]
 
@@ -1962,6 +2384,82 @@ def dropout_late_forward(
         masked_steps_debug = _debug_masked_text(
             llm, early_token_ids, late_mask, modify_start_late,
             nb_early_tokens, is_step_selected, steps, nb_dropout_samples, use_jackknife)
+
+    # Hook-based implementation: directly scale attention weights
+    if use_hooks:
+        # Build step token ranges for hook
+        step_ranges = []
+        remaining_ids_temp = early_token_ids.clone()
+        for step_id, step in reversed(list(enumerate(steps))):
+            try:
+                step_start, step_end = find_token_indices_from_end(
+                    llm.tokenizer, remaining_ids_temp, step, llm.model_name)
+                step_ranges.insert(0, (step_start, step_end))
+                remaining_ids_temp = remaining_ids_temp[:step_start + 1]
+            except (ConfidenceAlignmentError, ValueError):
+                step_ranges.insert(0, None)
+
+        # Process each sample individually with hooks
+        all_logits = []
+        all_input_ids = []
+
+        for sample_idx in range(nb_dropout_samples):
+            sample_weights = step_weights[sample_idx]
+
+            def make_hook(weights, ranges, modify_start, modify_end):
+                def boost_attention_hook(module, input, output):
+                    attn_weights = output[1]  # (batch, heads, seq_len, seq_len)
+                    if attn_weights is None:
+                        return output
+
+                    # Scale attention TO each step (column-wise)
+                    for step_id, (start, end) in enumerate(ranges):
+                        if start is not None and weights[step_id] > 0:
+                            weight = weights[step_id]
+                            attn_weights[:, :, modify_start-1:modify_end-1, start:end] *= weight
+
+                    # Re-normalize rows
+                    attn_weights = attn_weights / attn_weights.sum(dim=-1, keepdim=True)
+                    return (output[0], attn_weights) + output[2:]
+                return boost_attention_hook
+
+            # Register hooks on all attention layers (Llama/Qwen)
+            hooks = []
+            for layer in llm.model.model.layers:
+                hook = layer.self_attn.register_forward_hook(
+                    make_hook(sample_weights, step_ranges, modify_start_late, modify_end_late)
+                )
+                hooks.append(hook)
+
+            # Run forward pass for this sample
+            sample_tokens = late_tokens
+            sample_cache = copy.deepcopy(early_cache)
+
+            with torch.no_grad():
+                sample_output = llm.model.forward(
+                    input_ids=sample_tokens,
+                    past_key_values=sample_cache,
+                    output_attentions=True,
+                )
+
+            all_logits.append(sample_output.logits)
+            all_input_ids.append(sample_tokens)
+
+            # Remove hooks
+            for hook in hooks:
+                hook.remove()
+
+            del sample_cache
+            torch.cuda.empty_cache()
+
+        # Concatenate all samples
+        late_output = type(sample_output)(
+            logits=torch.cat(all_logits, dim=0),
+        )
+        late_output['input_ids'] = torch.cat(all_input_ids, dim=0)
+
+        step_masks = is_step_selected.astype(int).tolist()
+        return late_output, step_masks, masked_steps_debug
 
     # Chunk processing to reduce memory: process 10 samples at a time
     CHUNK_SIZE = 10
