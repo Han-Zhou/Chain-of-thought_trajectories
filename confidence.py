@@ -5,10 +5,13 @@ import math
 import time
 import numpy as np
 import torch
+import torch.nn as nn
 import copy
 from collections import defaultdict
 from transformers import DynamicCache
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+from transformers.models.llama.modeling_llama import eager_attention_forward, repeat_kv
 from llm import LLM
 from utils.confidence_modification import apply_confidence_modification
 from utils.text_utils import find_token_indices_from_end, find_token_overlap
@@ -134,8 +137,15 @@ def _bootstrap_sample_steps(cot_steps: list[str], nb_samples: int = 100):
     """
     steps, first_is_reasoning = _dropout_eligible_steps(cot_steps)
     n = len(steps)
-    if n <= 1:
+    if n == 0:
         return [], []
+    if n == 1:
+        counts = [1]
+        if first_is_reasoning:
+            kept = [0]
+        else:
+            kept = [0, 1]
+        return [kept for _ in range(nb_samples)], [counts for _ in range(nb_samples)]
 
     pool_size = n - 1
 
@@ -525,7 +535,7 @@ def compute_all_confidence_scores(
     # --- Bootstrap (only when flag is set) ---
     bootstrap_scores = None
     if experimental_bootstrap:
-        if can_run_step_dropout:
+        if len(parsed_output.cot_steps) >= 1:
             bootstrap_scores, bs_step_counts = _bootstrap_forward(
                 llm, messages, cot_only_text, parsed_output,
                 nb_dropout_samples=nb_dropout_samples,
@@ -1994,29 +2004,22 @@ def _build_prompt_text(llm, messages, full_assistant_content):
     # breakpoint()
 
     # For Qwen models with <think> tags, handle separately
-    if "qwen" in llm.model_name.lower() and "<think>" in full_assistant_content:
-        think_match = re.search(r"(.*?</think>)(.*)", full_assistant_content, re.DOTALL)
-        if think_match and think_match.group(2).strip():  # Only if there's content after </think>
-            think_part = think_match.group(1)
-            rest_part = think_match.group(2)
-
-            # Apply chat template to everything up to </think>
-            conf_messages[-1]["content"] = think_part
-            prompt_text = llm.tokenizer.apply_chat_template(
-                conf_messages,
-                tokenize=False,
-                add_generation_prompt=False,
-                continue_final_message=True,
-            )
-            # Append the rest directly
-            prompt_text += rest_part
-
-            # Still apply the empty <think></think> cleanup
-            prompt_text = re.sub(r"<think>\s*</think>\s*", "", prompt_text)
-            return prompt_text
+    # Qwen's template auto-injects <think></think> which breaks continue_final_message.
+    # Instead: render without assistant message, strip empty think block, append content directly.
+    if "qwen" in llm.model_name.lower() and ("<think>" in full_assistant_content or "</think>" in full_assistant_content):
+        base_messages = [m for m in conf_messages if m["role"] != "assistant"]
+        prompt_text = llm.tokenizer.apply_chat_template(
+            base_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            continue_final_message=False,
+        )
+        prompt_text = re.sub(r"<think>\s*</think>\s*", "", prompt_text)
+        prompt_text += full_assistant_content
+        return prompt_text
 
 
-    # Apply chat template to everything up to </think> 
+    # Apply chat template to everything up to </think>
     prompt_text = llm.tokenizer.apply_chat_template(
         conf_messages,
         tokenize=False,
@@ -2385,80 +2388,98 @@ def dropout_late_forward(
             llm, early_token_ids, late_mask, modify_start_late,
             nb_early_tokens, is_step_selected, steps, nb_dropout_samples, use_jackknife)
 
-    # Hook-based implementation: directly scale attention weights
+    # Hook-based implementation: register custom attention function that scales post-softmax weights
     if use_hooks:
-        # Build step token ranges for hook
-        step_ranges = []
+        # Save current attn implementation to restore later
+        _orig_attn_impl = llm.model.config._attn_implementation
+
+        # Build step token ranges
+        step_token_ranges = []
         remaining_ids_temp = early_token_ids.clone()
         for step_id, step in reversed(list(enumerate(steps))):
             try:
-                step_start, step_end = find_token_indices_from_end(
+                s_start, s_end = find_token_indices_from_end(
                     llm.tokenizer, remaining_ids_temp, step, llm.model_name)
-                step_ranges.insert(0, (step_start, step_end))
-                remaining_ids_temp = remaining_ids_temp[:step_start + 1]
+                step_token_ranges.insert(0, (s_start, s_end))
+                remaining_ids_temp = remaining_ids_temp[:s_start + 1]
             except (ConfidenceAlignmentError, ValueError):
-                step_ranges.insert(0, None)
+                step_token_ranges.insert(0, None)
 
-        # Process each sample individually with hooks
         all_logits = []
         all_input_ids = []
+
+        # Build causal attention mask for late tokens attending to early (cache) + late
+        nb_late = late_tokens.shape[1]
+        hook_mask = torch.cat([
+            torch.ones(nb_late, nb_early_tokens),
+            torch.ones(nb_late, nb_late).tril(),
+        ], dim=1)
+        hook_mask[hook_mask == 0] = -10000.
+        hook_mask[hook_mask == 1] = 0.
+        hook_mask = hook_mask.unsqueeze(0).unsqueeze(0).to(device=device, dtype=next(llm.model.parameters()).dtype)
 
         for sample_idx in range(nb_dropout_samples):
             sample_weights = step_weights[sample_idx]
 
-            def make_hook(weights, ranges, modify_start, modify_end):
-                def boost_attention_hook(module, input, output):
-                    attn_weights = output[1]  # (batch, heads, seq_len, seq_len)
-                    if attn_weights is None:
-                        return output
+            def _make_patched_eager(weights, ranges, m_start, m_end):
+                def patched_eager(module, query, key, value, attention_mask, scaling, dropout=0.0, **kwargs):
+                    key_states = repeat_kv(key, module.num_key_value_groups)
+                    value_states = repeat_kv(value, module.num_key_value_groups)
 
-                    # Scale attention TO each step (column-wise)
-                    for step_id, (start, end) in enumerate(ranges):
-                        if start is not None and weights[step_id] > 0:
-                            weight = weights[step_id]
-                            attn_weights[:, :, modify_start-1:modify_end-1, start:end] *= weight
+                    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+                    if attention_mask is not None:
+                        attn_weights = attn_weights + attention_mask
 
-                    # Re-normalize rows
-                    attn_weights = attn_weights / attn_weights.sum(dim=-1, keepdim=True)
-                    return (output[0], attn_weights) + output[2:]
-                return boost_attention_hook
+                    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+                    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
 
-            # Register hooks on all attention layers (Llama/Qwen)
-            hooks = []
-            for layer in llm.model.model.layers:
-                hook = layer.self_attn.register_forward_hook(
-                    make_hook(sample_weights, step_ranges, modify_start_late, modify_end_late)
-                )
-                hooks.append(hook)
+                    # Scale post-softmax attention weights for bootstrap-sampled steps
+                    for sid, rng in enumerate(ranges):
+                        if rng is None:
+                            continue
+                        w = weights[sid]
+                        s, e = rng
+                        if w == 0:
+                            attn_weights[:, :, m_start-1:m_end-1, s:e] = 0.0
+                        elif w > 1:
+                            attn_weights[:, :, m_start-1:m_end-1, s:e] *= float(w)
 
-            # Run forward pass for this sample
-            sample_tokens = late_tokens
+                    # Re-normalize answer rows
+                    row_sums = attn_weights[:, :, m_start-1:m_end-1, :].sum(dim=-1, keepdim=True).clamp(min=1e-9)
+                    attn_weights[:, :, m_start-1:m_end-1, :] = attn_weights[:, :, m_start-1:m_end-1, :] / row_sums
+
+                    attn_output = torch.matmul(attn_weights, value_states)
+                    attn_output = attn_output.transpose(1, 2).contiguous()
+                    return attn_output, attn_weights
+                return patched_eager
+
+            patched_fn = _make_patched_eager(sample_weights, step_token_ranges, modify_start_late, modify_end_late)
+            ALL_ATTENTION_FUNCTIONS["bootstrap_hook"] = patched_fn
+            llm.model.set_attn_implementation("bootstrap_hook")
+
             sample_cache = copy.deepcopy(early_cache)
 
             with torch.no_grad():
                 sample_output = llm.model.forward(
-                    input_ids=sample_tokens,
+                    input_ids=late_tokens,
+                    attention_mask=hook_mask,
                     past_key_values=sample_cache,
-                    output_attentions=True,
                 )
 
             all_logits.append(sample_output.logits)
-            all_input_ids.append(sample_tokens)
+            all_input_ids.append(late_tokens)
 
-            # Remove hooks
-            for hook in hooks:
-                hook.remove()
+            llm.model.set_attn_implementation(_orig_attn_impl)
 
             del sample_cache
             torch.cuda.empty_cache()
 
-        # Concatenate all samples
         late_output = type(sample_output)(
             logits=torch.cat(all_logits, dim=0),
         )
         late_output['input_ids'] = torch.cat(all_input_ids, dim=0)
 
-        step_masks = is_step_selected.astype(int).tolist()
+        step_masks = step_weights.tolist() if hasattr(step_weights, 'tolist') else is_step_selected.astype(int).tolist()
         return late_output, step_masks, masked_steps_debug
 
     # Chunk processing to reduce memory: process 10 samples at a time
