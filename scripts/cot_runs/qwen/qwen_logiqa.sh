@@ -16,7 +16,7 @@ python3 main.py \
     --vanilla_only \
     --temperature 0.9 \
     --debug_conf \
-    --tag cots-422-qwen-logiqa-8 \
+    --tag cots-429-qwen-logiqa-8 \
     --experimental_extra_box \
     --nb_cot_samples 8 \
     --discord

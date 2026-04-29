@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=run-cot-qwen-bc-8
+#SBATCH --job-name=cot-qwen-bc-8
 #SBATCH --qos=high
 #SBATCH --partition=compute
 #SBATCH --nodes=1
@@ -25,7 +25,7 @@ set -euo pipefail
 
 module load cuda/12.4
 module load conda
-conda activate cot
+conda activate /pm/miniconda3/envs/users/han/cot
 
 ./scripts/cot_runs/qwen/qwen_bc.sh
 

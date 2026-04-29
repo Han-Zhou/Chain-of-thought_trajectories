@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=run-cot-sup-qwen-bm-p4-8
+#SBATCH --job-name=cot-sup-p4-qwen-bm-8
 #SBATCH --qos=high
 #SBATCH --partition=compute
 #SBATCH --nodes=1
@@ -27,6 +27,6 @@ module load cuda/12.4
 module load conda
 conda activate cot
 
-./scripts/cot_runs_supplement/qwen_bm_p4.sh
+./scripts/cot_runs_supplement/bm/qwen_bm_p4.sh
 
 notify_discord "✅ **qwen-cot-bm-p4-8** completed successfully (Job $SLURM_JOB_ID)"

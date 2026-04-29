@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=run-cot-qwen-bm-32
+#SBATCH --job-name=cot-bm-qwen-32
 #SBATCH --qos=high
 #SBATCH --partition=compute
 #SBATCH --nodes=1

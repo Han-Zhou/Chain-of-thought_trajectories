@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=run-cot-qwen-cs1qa_span-32
+#SBATCH --job-name=run-cot-qwen-cs1qa_span-8
 #SBATCH --qos=high
 #SBATCH --partition=compute
 #SBATCH --nodes=1
@@ -19,7 +19,7 @@ notify_discord() {
     "$DISCORD_WEBHOOK" > /dev/null 2>&1
 }
 
-trap 'notify_discord "❌ **qwen-cot-cs1qa_span-32** failed on $(hostname) (Job $SLURM_JOB_ID) at line $LINENO with exit code $?"' ERR
+trap 'notify_discord "❌ **qwen-cot-cs1qa_span-8** failed on $(hostname) (Job $SLURM_JOB_ID) at line $LINENO with exit code $?"' ERR
 
 set -euo pipefail
 
@@ -29,4 +29,4 @@ conda activate cot
 
 ./scripts/cot_runs/qwen/qwen_cs1qa_span.sh
 
-notify_discord "✅ **qwen-cot-cs1qa_span-32** completed successfully (Job $SLURM_JOB_ID)"
+notify_discord "✅ **qwen-cot-cs1qa_span-8** completed successfully (Job $SLURM_JOB_ID)"

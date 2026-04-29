@@ -15,6 +15,7 @@ python3 main.py \
     --vanilla_only \
     --temperature 0.9 \
     --debug_conf \
-    --tag cots-422-llama-cs1qa_type-32 \
+    --tag cots-427-llama-cs1qa_type-32 \
+    --experimental_extra_box \
     --nb_cot_samples 32 \
     --discord
