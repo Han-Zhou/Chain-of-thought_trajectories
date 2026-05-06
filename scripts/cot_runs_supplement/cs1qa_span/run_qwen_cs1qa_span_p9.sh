@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=run-cot-sup-cs1qa_span-p9-qwen-8
+#SBATCH --job-name=cot-sup-cs1qa_span-p9-qwen-8
 #SBATCH --qos=high
 #SBATCH --partition=compute
 #SBATCH --nodes=1

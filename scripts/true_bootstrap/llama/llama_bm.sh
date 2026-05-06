@@ -14,7 +14,7 @@ python3 main.py \
     --type 2 \
     --confidence \
     --debug_conf \
-    --tag bootstrap-bm-428-llama \
+    --tag bootstrap-bm-504-llama \
     --nb_dropout_samples 100 \
     --experimental_extra_box \
     --experimental_preserve_final_step \

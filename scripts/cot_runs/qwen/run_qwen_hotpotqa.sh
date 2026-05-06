@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=run-cot-qwen-hotpotqa-8
+#SBATCH --job-name=cot-qwen-hotpotqa-8
 #SBATCH --qos=high
 #SBATCH --partition=compute
 #SBATCH --nodes=1

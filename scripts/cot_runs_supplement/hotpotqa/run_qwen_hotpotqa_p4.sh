@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=run-cot-sup-hotpotqa-p4-qwen-8
+#SBATCH --job-name=cot-sup-hotpotqa-p4-qwen-8
 #SBATCH --qos=high
 #SBATCH --partition=compute
 #SBATCH --nodes=1
@@ -19,14 +19,14 @@ notify_discord() {
     "$DISCORD_WEBHOOK" > /dev/null 2>&1
 }
 
-trap 'notify_discord "❌ **run-cot-sup-hotpotqa-p4-qwen-8** failed on $(hostname) (Job $SLURM_JOB_ID) at line $LINENO with exit code $?"' ERR
+trap 'notify_discord "❌ **cot-sup-hotpotqa-p4-qwen-8** failed on $(hostname) (Job $SLURM_JOB_ID) at line $LINENO with exit code $?"' ERR
 
 set -euo pipefail
 
 module load cuda/12.4
 module load conda
-conda activate cot
+conda activate /pm/miniconda3/envs/users/han/cot
 
-./scripts/cot_runs_supplement/qwen_hotpotqa_p4.sh
+./scripts/cot_runs_supplement/hotpotqa/qwen_hotpotqa_p4.sh
 
-notify_discord "✅ **run-cot-sup-hotpotqa-p4-qwen-8** completed successfully (Job $SLURM_JOB_ID)"
+notify_discord "✅ **cot-sup-hotpotqa-p4-qwen-8** completed successfully (Job $SLURM_JOB_ID)"

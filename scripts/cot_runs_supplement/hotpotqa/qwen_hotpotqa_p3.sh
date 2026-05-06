@@ -16,8 +16,8 @@ python3 main.py \
     --vanilla_only \
     --temperature 0.9 \
     --debug_conf \
-    --tag cots-sup-425-p3-qwen-hotpotqa-8 \
+    --tag cots-sup-430-p3-qwen-hotpotqa-8 \
     --experimental_extra_box \
     --nb_cot_samples 8 \
-    --sample_range 247 331 \
+    --sample_range 143 214 \
     --discord

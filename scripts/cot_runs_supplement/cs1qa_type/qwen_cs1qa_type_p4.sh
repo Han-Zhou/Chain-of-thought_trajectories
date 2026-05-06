@@ -19,6 +19,6 @@ python3 main.py \
     --tag cots-sup-428-qwen-cs1qa_type_p4-8 \
     --experimental_extra_box \
     --nb_cot_samples 8 \
-    --sample_range 238 303 \
+    --sample_range 150 200 \
     --discord
 

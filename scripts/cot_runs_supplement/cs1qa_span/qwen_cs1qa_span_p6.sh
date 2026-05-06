@@ -16,9 +16,9 @@ python3 main.py \
     --vanilla_only \
     --temperature 0.9 \
     --debug_conf \
-    --tag cots-sup-428-qwen-cs1qa_span_p6-8 \
+    --tag cots-sup-501-qwen-cs1qa_span_p6-8 \
     --experimental_extra_box \
     --nb_cot_samples 8 \
-    --sample_range 291 343 \
+    --sample_range 250 300 \
     --discord
 

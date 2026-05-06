@@ -16,9 +16,10 @@ python3 main.py \
     --vanilla_only \
     --temperature 0.9 \
     --debug_conf \
-    --tag cots-427-qwen-cs1qa_type-8 \
+    --tag cots-502-qwen-cs1qa_type-8 \
     --experimental_extra_box \
     --nb_cot_samples 8 \
+    --sample_range 0 50 \
     --discord
 
 
