@@ -24,6 +24,14 @@ SYSTEM_QWEN_THINKING = (
     "Label each reasoning step between <think> and </think> as 'Step 1:', 'Step 2:', etc. "
     "After all steps, write your final answer on a new line in "
     "\\boxed{your answer} format. You must double-escape all LaTeX backslashes. For example, output \\boxed instead of \boxed."
+    "Keep your reasoning concise, and be brief in each step. "
+    "Be thorough, and don't skip any steps."
+)
+
+SYSTEM_QWEN_THINKING_OUTSIDE = (
+    "You are an expert reasoning assistant. For every problem you receive, "
+    "think carefully and reason step-by-step. "
+    "After </think>, label each reasoning step as 'Step 1:', 'Step 2:', etc. "
     "Keep your reasoning concise, and be brief in each step."
 )
 

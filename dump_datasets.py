@@ -20,7 +20,10 @@ DATASETS = [
     # "math500",
     # "olympiadbench",
     # "bfcl",
-    "hle",
+    # "hle",
+    "cs1qa_type",
+    "cs1qa_span",
+    "codeqa"
 ]
 
 MAX_SIZE = 1000

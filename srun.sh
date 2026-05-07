@@ -1,7 +1,7 @@
 #!/bin/bash
 
 srun \
-    --job-name=trial_cot_trajectories \
+    --job-name=debug_conf-llama \
     --qos=high \
     --partition=compute \
     --nodes=1 \

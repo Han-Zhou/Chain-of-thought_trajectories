@@ -162,7 +162,7 @@ def _bootstrap_sample_steps(cot_steps: list[str], nb_samples: int = 100):
         if first_is_reasoning:
             sample_kept = sampled.tolist()
         else:
-            sample_kept = [0] + [1 + j for j in sampled]
+            sample_kept = [0] + [int(1 + j) for j in sampled]
 
         kept_indices.append(sample_kept)
         step_counts.append(counts.tolist())
@@ -312,6 +312,9 @@ def compute_all_confidence_scores(
     experimental_fake_bootstrap_hook: bool = False,
 ) -> AllConfidenceData:
     debug_info = {}
+    timings: dict[str, float] = {}
+    _t_total_start = time.perf_counter()
+    _t_setup_start = time.perf_counter()
 
     # Truncate generated_text to only include CoT steps (before the answer sentence)
     if parsed_output.answer_sentence_start is not None:
@@ -325,6 +328,19 @@ def compute_all_confidence_scores(
     else:
         # No answer found, use full text
         cot_only_text = generated_text
+
+    # Strip <think>...</think> blocks from the trajectory once, up front. All
+    # downstream tokenization, re-parsing, modification, dropout, and
+    # reconstruction-based passes then operate on the thinking-free text.
+    pre_strip_cot = cot_only_text
+    pre_strip_prefill = assistant_prefill
+    cot_only_text = _strip_thinking(cot_only_text)
+    if assistant_prefill:
+        assistant_prefill = _strip_thinking(assistant_prefill)
+    # gen_cache was built against the unstripped token sequence; invalidate it
+    # if the strip actually changed the text so we don't reuse a stale KV cache.
+    if cot_only_text != pre_strip_cot or assistant_prefill != pre_strip_prefill:
+        gen_cache = None
 
     logger.info("compute_all_confidence_scores: truncated generated_text from %d to %d chars",
                 len(generated_text), len(cot_only_text))
@@ -391,6 +407,12 @@ def compute_all_confidence_scores(
             crop_cache(precomputed_early_cache, early_late_split)
     else:
         # No generation cache available — one forward pass to build early_cache
+        if llm.backend == "vllm":
+            raise ValueError(
+                "Confidence scoring requires KV cache from generation, "
+                "which is not available with vLLM backend. "
+                "Use --backend hf for confidence scoring."
+            )
         device = next(llm.model.parameters()).device
         early_tokens = base_tokens[:, :early_late_split].to(device)
         empty_cache = Qwen3_5DynamicCache(llm.model.config) if "qwen" in llm.model_name.lower() else DynamicCache()
@@ -399,8 +421,15 @@ def compute_all_confidence_scores(
         precomputed_early_cache = early_output.past_key_values
 
     # --- Coin-flip dropout (skipped when mode is "default" or "true") ---
-    _coinflip_samples = 0 if experimental_jackknife in ["default", "true"] or experimental_coinflip_true or not can_run_step_dropout else nb_dropout_samples
-    vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks, masked_steps_dbg = \
+    timings["setup"] = time.perf_counter() - _t_setup_start
+    _t_vanilla_start = time.perf_counter()
+
+    # Initialize confidence timings
+    from utils.structures import ConfidenceTimings
+    conf_timings = ConfidenceTimings()
+
+    _coinflip_samples = 0 if experimental_jackknife in ["default", "true"] or experimental_coinflip_true or experimental_bootstrap or not can_run_step_dropout else nb_dropout_samples
+    vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks, masked_steps_dbg, meanprob_timings = \
         dropout_answerlogits(llm, messages, cot_only_text, parsed_output, _coinflip_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                              gen_cache=gen_cache, base_tokens=base_tokens,
                              precomputed_early_cache=precomputed_early_cache,
@@ -408,12 +437,19 @@ def compute_all_confidence_scores(
                              consume_early_cache=vanilla_only,
                              recrop_early_cache_len=early_late_split if vanilla_only else None,
                              preserve_final_step=preserve_final_step)
+
+    # Collect meanprob and meanent timing (same function call)
+    conf_timings.vanilla_meanprob_total_seconds = meanprob_timings["total_seconds"]
+    conf_timings.vanilla_meanprob_forward_seconds = meanprob_timings["forward_seconds"]
+    conf_timings.vanilla_meanent_total_seconds = meanprob_timings["total_seconds"]
+    conf_timings.vanilla_meanent_forward_seconds = meanprob_timings["forward_seconds"]
+
     if dbg:
         debug_info["answer_logits"] = dbg
     if masked_steps_dbg:
         debug_info["masked_steps"] = masked_steps_dbg
 
-    vanilla_ptrue1, vanilla_ptrue2, vanilla_ptrue3, dropout_ptrue1, dropout_ptrue2, dropout_ptrue3, dbg, _ = \
+    vanilla_ptrue1, vanilla_ptrue2, vanilla_ptrue3, dropout_ptrue1, dropout_ptrue2, dropout_ptrue3, dbg, _, indirect_timings = \
         dropout_indirectlogits(llm, messages, cot_only_text, parsed_output, _coinflip_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                                gen_cache=gen_cache, base_tokens=base_tokens,
                                precomputed_early_cache=precomputed_early_cache,
@@ -421,27 +457,40 @@ def compute_all_confidence_scores(
                                consume_early_cache=vanilla_only,
                                recrop_early_cache_len=early_late_split if vanilla_only else None,
                                preserve_final_step=preserve_final_step)
+
+    # Collect indirect1 timing
+    conf_timings.vanilla_indirect1_total_seconds = indirect_timings["total_seconds"]
+    conf_timings.vanilla_indirect1_forward_seconds = indirect_timings["forward_seconds"]
+
     if dbg:
         debug_info["indirect_logits"] = dbg
 
     (vanilla_verbconf, dropout_verbconf,
      v_verbconf_dist, v_verbconf_top_score, v_verbconf_top_prob,
      d_verbconf_dist, d_verbconf_top_scores, d_verbconf_top_probs,
-     dbg, _) = \
+     dbg, _, verbconf_timings) = \
         dropout_verbalconf(llm, messages, cot_only_text, parsed_output, _coinflip_samples, use_fullstring, assistant_prefill, debug_conf=debug_conf,
                            gen_cache=gen_cache, base_tokens=base_tokens,
                            precomputed_early_cache=precomputed_early_cache,
                            consume_early_cache=(experimental_jackknife is None),
                            vanilla_only=vanilla_only,
                            preserve_final_step=preserve_final_step)
+
+    # Collect verbconf timing
+    conf_timings.vanilla_verbconf_total_seconds = verbconf_timings["total_seconds"]
+    conf_timings.vanilla_verbconf_forward_seconds = verbconf_timings["forward_seconds"]
+    conf_timings.vanilla_verbconf_joint_probs_seconds = verbconf_timings["joint_probs_seconds"]
+
     if dbg:
         debug_info["verbconf"] = dbg
 
     # --- Jackknife dropout (only when mode is set) ---
+    timings["vanilla_coinflip_dropout"] = time.perf_counter() - _t_vanilla_start
     jackknife_scores = None
     jk_step_masks = None
     jk_kept_indices = None
     if experimental_jackknife == "default":
+        _t_jk_start = time.perf_counter()
         if can_run_step_dropout:
             # Sample jackknife step masks once, reuse across all methods
             jk_kept_indices, jk_step_masks = _jackknife_sample_steps(
@@ -494,8 +543,10 @@ def compute_all_confidence_scores(
             )
         else:
             jackknife_scores = _empty_sampled_confidence_scores()
+        timings["jackknife_default"] = time.perf_counter() - _t_jk_start
 
     elif experimental_jackknife == "true":
+        _t_jkt_start = time.perf_counter()
         if can_run_step_dropout:
             jackknife_scores, jk_step_masks = _jackknife_true_forward(
                 llm, messages, cot_only_text, parsed_output,
@@ -509,6 +560,7 @@ def compute_all_confidence_scores(
             )
         else:
             jackknife_scores = _empty_sampled_confidence_scores()
+        timings["jackknife_true"] = time.perf_counter() - _t_jkt_start
 
     # --- Collect all prompts for debug ---
     if debug_conf:
@@ -535,8 +587,9 @@ def compute_all_confidence_scores(
     # --- Bootstrap (only when flag is set) ---
     bootstrap_scores = None
     if experimental_bootstrap:
+        _t_bs_start = time.perf_counter()
         if len(parsed_output.cot_steps) >= 1:
-            bootstrap_scores, bs_step_counts = _bootstrap_forward(
+            bootstrap_scores, bs_step_counts, bs_timings = _bootstrap_forward(
                 llm, messages, cot_only_text, parsed_output,
                 nb_dropout_samples=nb_dropout_samples,
                 assistant_prefill=assistant_prefill,
@@ -544,12 +597,22 @@ def compute_all_confidence_scores(
                 debug_info=debug_info,
                 normalized_content=normalized_content,
             )
+            # Populate bootstrap-specific timing fields
+            conf_timings.bootstrap_meanprob_total_seconds = bs_timings["meanprob_total_seconds"]
+            conf_timings.bootstrap_meanprob_forward_seconds = bs_timings["meanprob_forward_seconds"]
+            conf_timings.bootstrap_indirect1_total_seconds = bs_timings["indirect1_total_seconds"]
+            conf_timings.bootstrap_indirect1_forward_seconds = bs_timings["indirect1_forward_seconds"]
+            conf_timings.bootstrap_verbconf_total_seconds = bs_timings["verbconf_total_seconds"]
+            conf_timings.bootstrap_verbconf_forward_seconds = bs_timings["verbconf_forward_seconds"]
+            conf_timings.bootstrap_verbconf_joint_probs_seconds = bs_timings["verbconf_joint_probs_seconds"]
         else:
             bootstrap_scores = _empty_sampled_confidence_scores()
+        timings["bootstrap"] = time.perf_counter() - _t_bs_start
 
     # --- Fake Bootstrap (only when flag is set) ---
     fake_bootstrap_scores = None
     if experimental_fake_bootstrap:
+        _t_fb_start = time.perf_counter()
         if can_run_step_dropout:
             fake_bootstrap_scores = _fake_bootstrap_forward(
                 llm, messages, cot_only_text, parsed_output,
@@ -564,10 +627,12 @@ def compute_all_confidence_scores(
             )
         else:
             fake_bootstrap_scores = _empty_sampled_confidence_scores()
+        timings["fake_bootstrap"] = time.perf_counter() - _t_fb_start
 
     # --- Fake Bootstrap Hook (only when flag is set) ---
     fake_bootstrap_hook_scores = None
     if experimental_fake_bootstrap_hook:
+        _t_fbh_start = time.perf_counter()
         if can_run_step_dropout:
             fake_bootstrap_hook_scores = _fake_bootstrap_hook_forward(
                 llm, messages, cot_only_text, parsed_output,
@@ -582,10 +647,12 @@ def compute_all_confidence_scores(
             )
         else:
             fake_bootstrap_hook_scores = _empty_sampled_confidence_scores()
+        timings["fake_bootstrap_hook"] = time.perf_counter() - _t_fbh_start
 
     # --- Coinflip-true (only when flag is set) ---
     coinflip_true_scores = None
     if experimental_coinflip_true:
+        _t_cft_start = time.perf_counter()
         if can_run_step_dropout:
             coinflip_true_scores, _cf_masks = _coinflip_true_forward(
                 llm, messages, cot_only_text, parsed_output,
@@ -598,10 +665,12 @@ def compute_all_confidence_scores(
             )
         else:
             coinflip_true_scores = _empty_sampled_confidence_scores()
+        timings["coinflip_true"] = time.perf_counter() - _t_cft_start
 
     # --- Hollow (only when flag is set) ---
     hollow_scores = None
     if experimental_hollow is not None:
+        _t_hollow_start = time.perf_counter()
         if len(parsed_output.cot_steps) >= 1:
             hollow_scores = _hollow_forward(
                 llm, messages, cot_only_text, parsed_output,
@@ -613,6 +682,11 @@ def compute_all_confidence_scores(
             )
         else:
             hollow_scores = _empty_sampled_confidence_scores()
+        timings["hollow"] = time.perf_counter() - _t_hollow_start
+
+    timings["total"] = time.perf_counter() - _t_total_start
+    if debug_conf:
+        debug_info["timings_seconds"] = {k: round(v, 4) for k, v in timings.items()}
 
     return AllConfidenceData(
         vanilla_confidences=ConfidenceScores(
@@ -645,11 +719,34 @@ def compute_all_confidence_scores(
         coinflip_true_confidences=coinflip_true_scores,
         hollow_confidences=hollow_scores,
         debug_info=debug_info,
+        timings=conf_timings,
     )
 
 
 # Regex to match and capture step numbers for renumbering
 _STEP_NUMBER_RE = re.compile(r'^(Step\s+)\d+(\s*:)', re.IGNORECASE)
+
+# Regexes to strip <think>...</think> blocks from reconstructed prompts.
+_THINK_BLOCK_RE = re.compile(r'<think>.*?</think>\s*', re.DOTALL | re.IGNORECASE)
+_STRAY_THINK_RE = re.compile(r'</?think>\s*', re.IGNORECASE)
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove <think>...</think> blocks plus prefill-opened thinking content.
+
+    Three cases handled:
+      1. Complete `<think>...</think>` blocks within `text` are removed.
+      2. A lone `</think>` (no preceding `<think>` in `text`) means the opener
+         was in the assistant prefill / chat template. Drop everything up to
+         and including that closer — the entire span is thinking content.
+      3. Any remaining stray `<think>` / `</think>` tags are stripped.
+    """
+    text = _THINK_BLOCK_RE.sub('', text)
+    close_idx = text.find('</think>')
+    if close_idx != -1 and '<think>' not in text[:close_idx]:
+        text = text[close_idx + len('</think>'):]
+    text = _STRAY_THINK_RE.sub('', text)
+    return text.lstrip()
 
 
 def _renumber_step(step_text: str, new_number: int) -> str:
@@ -938,7 +1035,7 @@ def _coinflip_true_forward(
 
     ans_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
     ptrue1_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}.\nTrue/False:"
-    ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"
+    # ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"  # Not used
     verbconf_suffix = (
         f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
         "\nPlease respond with a score from 0 to 100 in <confidence> </confidence> tags."
@@ -948,10 +1045,10 @@ def _coinflip_true_forward(
 
     positive_true_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' True'])
     negative_false_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' False'])
-    positive_yes_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' Yes'])
-    negative_no_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' No'])
-    yes_only_id = llm.tokenizer.encode(' Yes', add_special_tokens=False)
-    no_only_id = llm.tokenizer.encode(' No', add_special_tokens=False)
+    # positive_yes_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' Yes'])  # Not used
+    # negative_no_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' No'])  # Not used
+    # yes_only_id = llm.tokenizer.encode(' Yes', add_special_tokens=False)  # Not used
+    # no_only_id = llm.tokenizer.encode(' No', add_special_tokens=False)  # Not used
 
     verbconf_strings = ANSWER_TOKENS['VERBCONF']
     token_seqs = [llm.tokenizer.encode(s, add_special_tokens=False) for s in verbconf_strings]
@@ -960,8 +1057,8 @@ def _coinflip_true_forward(
     all_answer_probs = []
     all_answer_entropy = []
     all_ptrue1 = []
-    all_ptrue2 = []
-    all_ptrue3 = []
+    # all_ptrue2 = []  # Not used
+    # all_ptrue3 = []  # Not used
     all_verbconf = []
     all_verbconf_dist = []
     all_verbconf_top_scores = []
@@ -969,7 +1066,7 @@ def _coinflip_true_forward(
 
     dbg_prompts_answer = []
     dbg_prompts_ptrue1 = []
-    dbg_prompts_ptrue2 = []
+    # dbg_prompts_ptrue2 = []  # Not used
     dbg_prompts_verbconf = []
 
     for sample_idx in range(effective_nb_samples):
@@ -1031,26 +1128,26 @@ def _coinflip_true_forward(
         p1_sm = torch.softmax(torch.stack([p1_pos.double(), p1_neg.double()]), dim=0)
         all_ptrue1.append({"True": p1_sm[0].item(), "False": p1_sm[1].item()})
 
-        # --- indirect_ptrue2 (also used for ptrue3) ---
-        ptrue2_content = (reconstructed_base + ptrue2_suffix).strip()
-        ptrue2_prompt = _build_prompt_text(llm, messages, ptrue2_content)
-        ptrue2_tokens = llm.tokenizer(ptrue2_prompt, return_tensors="pt")["input_ids"].to(device)
+        # # --- indirect_ptrue2 (also used for ptrue3) ---
+        # ptrue2_content = (reconstructed_base + ptrue2_suffix).strip()
+        # ptrue2_prompt = _build_prompt_text(llm, messages, ptrue2_content)
+        # ptrue2_tokens = llm.tokenizer(ptrue2_prompt, return_tensors="pt")["input_ids"].to(device)
 
-        if debug_conf:
-            dbg_prompts_ptrue2.append(ptrue2_prompt)
+        # if debug_conf:
+        #     dbg_prompts_ptrue2.append(ptrue2_prompt)
 
-        with torch.no_grad():
-            ptrue2_output = llm.model.forward(input_ids=ptrue2_tokens)
+        # with torch.no_grad():
+        #     ptrue2_output = llm.model.forward(input_ids=ptrue2_tokens)
 
-        p2_pos = ptrue2_output.logits[0, -1, positive_yes_ids].sum()
-        p2_neg = ptrue2_output.logits[0, -1, negative_no_ids].sum()
-        p2_sm = torch.softmax(torch.stack([p2_pos.double(), p2_neg.double()]), dim=0)
-        all_ptrue2.append({"Yes": p2_sm[0].item(), "No": p2_sm[1].item()})
+        # p2_pos = ptrue2_output.logits[0, -1, positive_yes_ids].sum()
+        # p2_neg = ptrue2_output.logits[0, -1, negative_no_ids].sum()
+        # p2_sm = torch.softmax(torch.stack([p2_pos.double(), p2_neg.double()]), dim=0)
+        # all_ptrue2.append({"Yes": p2_sm[0].item(), "No": p2_sm[1].item()})
 
-        p3_pos = ptrue2_output.logits[0, -1, yes_only_id[0]]
-        p3_neg = ptrue2_output.logits[0, -1, no_only_id[0]]
-        p3_sm = torch.softmax(torch.stack([p3_pos.double(), p3_neg.double()]), dim=0)
-        all_ptrue3.append({"Yes": p3_sm[0].item(), "No": p3_sm[1].item()})
+        # p3_pos = ptrue2_output.logits[0, -1, yes_only_id[0]]
+        # p3_neg = ptrue2_output.logits[0, -1, no_only_id[0]]
+        # p3_sm = torch.softmax(torch.stack([p3_pos.double(), p3_neg.double()]), dim=0)
+        # all_ptrue3.append({"Yes": p3_sm[0].item(), "No": p3_sm[1].item()})
 
         # --- verbconf ---
         verbconf_content = (reconstructed_base + verbconf_suffix).strip()
@@ -1287,16 +1384,25 @@ def _bootstrap_forward(
     debug_conf: bool,
     debug_info: dict,
     normalized_content: str,
-) -> tuple[ConfidenceScores, list[list[int]]]:
+) -> tuple[ConfidenceScores, list[list[int]], dict]:
     """Bootstrap confidence: resample steps with replacement and run fresh forward passes.
 
     For each bootstrap sample, draws (n-1) steps with replacement from the
     first (n-1) eligible steps, sorts them, appends the final step, rebuilds
     the prompt, and runs all four confidence methods via fresh forward passes.
 
-    Returns (ConfidenceScores, step_counts).
+    Returns (ConfidenceScores, step_counts, timings_dict).
     """
     device = next(llm.model.parameters()).device
+
+    # Bootstrap-specific timing accumulators
+    bs_meanprob_total = 0.0
+    bs_meanprob_forward = 0.0
+    bs_indirect1_total = 0.0
+    bs_indirect1_forward = 0.0
+    bs_verbconf_total = 0.0
+    bs_verbconf_forward = 0.0
+    bs_verbconf_joint_probs = 0.0
 
     kept_indices_per_sample, step_counts = _bootstrap_sample_steps(
         parsed_output.cot_steps, nb_dropout_samples)
@@ -1305,7 +1411,7 @@ def _bootstrap_forward(
 
     ans_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
     ptrue1_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}.\nTrue/False:"
-    ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"
+    # ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"  # Not used
     verbconf_suffix = (
         f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
         "\nPlease respond with a score from 0 to 100 in <confidence> </confidence> tags."
@@ -1315,10 +1421,10 @@ def _bootstrap_forward(
 
     positive_true_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' True'])
     negative_false_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' False'])
-    positive_yes_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' Yes'])
-    negative_no_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' No'])
-    yes_only_id = llm.tokenizer.encode(' Yes', add_special_tokens=False)
-    no_only_id = llm.tokenizer.encode(' No', add_special_tokens=False)
+    # positive_yes_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' Yes'])  # Not used
+    # negative_no_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' No'])  # Not used
+    # yes_only_id = llm.tokenizer.encode(' Yes', add_special_tokens=False)  # Not used
+    # no_only_id = llm.tokenizer.encode(' No', add_special_tokens=False)  # Not used
 
     verbconf_strings = ANSWER_TOKENS['VERBCONF']
     token_seqs = [llm.tokenizer.encode(s, add_special_tokens=False) for s in verbconf_strings]
@@ -1327,8 +1433,8 @@ def _bootstrap_forward(
     all_answer_probs = []
     all_answer_entropy = []
     all_ptrue1 = []
-    all_ptrue2 = []
-    all_ptrue3 = []
+    # all_ptrue2 = []  # Not used
+    # all_ptrue3 = []  # Not used
     all_verbconf = []
     all_verbconf_dist = []
     all_verbconf_top_scores = []
@@ -1336,7 +1442,7 @@ def _bootstrap_forward(
 
     dbg_prompts_answer = []
     dbg_prompts_ptrue1 = []
-    dbg_prompts_ptrue2 = []
+    # dbg_prompts_ptrue2 = []  # Not used
     dbg_prompts_verbconf = []
 
     for sample_idx in range(effective_nb_samples):
@@ -1348,6 +1454,8 @@ def _bootstrap_forward(
         reconstructed_base = (assistant_prefill + reconstructed_cot).strip() if assistant_prefill else reconstructed_cot.strip()
 
         # --- answer_logits ---
+        _t_ans_start = time.perf_counter()
+        _t_fwd_start = time.perf_counter()
         ans_content = (reconstructed_base + ans_suffix).strip()
         ans_prompt = _build_prompt_text(llm, messages, ans_content)
         ans_tokens = llm.tokenizer(ans_prompt, return_tensors="pt")["input_ids"].to(device)
@@ -1358,6 +1466,7 @@ def _bootstrap_forward(
         boxed_string = f"\\boxed{{{parsed_output.final_answer}}}"
         with torch.no_grad():
             ans_output = llm.model.forward(input_ids=ans_tokens)
+        bs_meanprob_forward += time.perf_counter() - _t_fwd_start
 
         ans_token_ids = ans_tokens[0]
         boxed_start, boxed_end = find_token_indices_from_end(
@@ -1381,8 +1490,11 @@ def _bootstrap_forward(
         entropy_values = (-(v_probs * v_logprobs).sum(dim=-1)).cpu().numpy().tolist()
         sample_entropy = [{token_strings[t]: entropy_values[t]} for t in range(nb_answer_tokens)]
         all_answer_entropy.append(sample_entropy)
+        bs_meanprob_total += time.perf_counter() - _t_ans_start
 
         # --- indirect_ptrue1 ---
+        _t_ptrue1_start = time.perf_counter()
+        _t_fwd_start = time.perf_counter()
         ptrue1_content = (reconstructed_base + ptrue1_suffix).strip()
         ptrue1_prompt = _build_prompt_text(llm, messages, ptrue1_content)
         ptrue1_tokens = llm.tokenizer(ptrue1_prompt, return_tensors="pt")["input_ids"].to(device)
@@ -1392,34 +1504,38 @@ def _bootstrap_forward(
 
         with torch.no_grad():
             ptrue1_output = llm.model.forward(input_ids=ptrue1_tokens)
+        bs_indirect1_forward += time.perf_counter() - _t_fwd_start
 
         p1_pos = ptrue1_output.logits[0, -1, positive_true_ids].sum()
         p1_neg = ptrue1_output.logits[0, -1, negative_false_ids].sum()
         p1_sm = torch.softmax(torch.stack([p1_pos.double(), p1_neg.double()]), dim=0)
         all_ptrue1.append({"True": p1_sm[0].item(), "False": p1_sm[1].item()})
+        bs_indirect1_total += time.perf_counter() - _t_ptrue1_start
 
-        # --- indirect_ptrue2 (also used for ptrue3) ---
-        ptrue2_content = (reconstructed_base + ptrue2_suffix).strip()
-        ptrue2_prompt = _build_prompt_text(llm, messages, ptrue2_content)
-        ptrue2_tokens = llm.tokenizer(ptrue2_prompt, return_tensors="pt")["input_ids"].to(device)
+        # # --- indirect_ptrue2 (also used for ptrue3) ---
+        # ptrue2_content = (reconstructed_base + ptrue2_suffix).strip()
+        # ptrue2_prompt = _build_prompt_text(llm, messages, ptrue2_content)
+        # ptrue2_tokens = llm.tokenizer(ptrue2_prompt, return_tensors="pt")["input_ids"].to(device)
 
-        if debug_conf:
-            dbg_prompts_ptrue2.append(ptrue2_prompt)
+        # if debug_conf:
+        #     dbg_prompts_ptrue2.append(ptrue2_prompt)
 
-        with torch.no_grad():
-            ptrue2_output = llm.model.forward(input_ids=ptrue2_tokens)
+        # with torch.no_grad():
+        #     ptrue2_output = llm.model.forward(input_ids=ptrue2_tokens)
 
-        p2_pos = ptrue2_output.logits[0, -1, positive_yes_ids].sum()
-        p2_neg = ptrue2_output.logits[0, -1, negative_no_ids].sum()
-        p2_sm = torch.softmax(torch.stack([p2_pos.double(), p2_neg.double()]), dim=0)
-        all_ptrue2.append({"Yes": p2_sm[0].item(), "No": p2_sm[1].item()})
+        # p2_pos = ptrue2_output.logits[0, -1, positive_yes_ids].sum()
+        # p2_neg = ptrue2_output.logits[0, -1, negative_no_ids].sum()
+        # p2_sm = torch.softmax(torch.stack([p2_pos.double(), p2_neg.double()]), dim=0)
+        # all_ptrue2.append({"Yes": p2_sm[0].item(), "No": p2_sm[1].item()})
 
-        p3_pos = ptrue2_output.logits[0, -1, yes_only_id[0]]
-        p3_neg = ptrue2_output.logits[0, -1, no_only_id[0]]
-        p3_sm = torch.softmax(torch.stack([p3_pos.double(), p3_neg.double()]), dim=0)
-        all_ptrue3.append({"Yes": p3_sm[0].item(), "No": p3_sm[1].item()})
+        # p3_pos = ptrue2_output.logits[0, -1, yes_only_id[0]]
+        # p3_neg = ptrue2_output.logits[0, -1, no_only_id[0]]
+        # p3_sm = torch.softmax(torch.stack([p3_pos.double(), p3_neg.double()]), dim=0)
+        # all_ptrue3.append({"Yes": p3_sm[0].item(), "No": p3_sm[1].item()})
 
         # --- verbconf ---
+        _t_verbconf_start = time.perf_counter()
+        _t_fwd_start = time.perf_counter()
         verbconf_content = (reconstructed_base + verbconf_suffix).strip()
         verbconf_prompt = _build_prompt_text(llm, messages, verbconf_content)
         verbconf_tokens = llm.tokenizer(verbconf_prompt, return_tensors="pt")["input_ids"].to(device)
@@ -1429,8 +1545,11 @@ def _bootstrap_forward(
 
         with torch.no_grad():
             verbconf_output = llm.model.forward(input_ids=verbconf_tokens)
+        bs_verbconf_forward += time.perf_counter() - _t_fwd_start
 
+        _t_joint_start = time.perf_counter()
         vc_probs = _compute_verbconf_joint_probs(llm, verbconf_output, token_seqs, device)
+        bs_verbconf_joint_probs += time.perf_counter() - _t_joint_start
         vc_probs_1d = vc_probs[0] if vc_probs.dim() > 1 else vc_probs
         sample_verbconf = (score_values * vc_probs_1d).sum().item()
         all_verbconf.append(sample_verbconf)
@@ -1438,6 +1557,7 @@ def _bootstrap_forward(
         top_idx = vc_probs_1d.argmax().item()
         all_verbconf_top_scores.append(top_idx)
         all_verbconf_top_probs.append(vc_probs_1d[top_idx].item())
+        bs_verbconf_total += time.perf_counter() - _t_verbconf_start
 
         torch.cuda.empty_cache()
 
@@ -1445,7 +1565,7 @@ def _bootstrap_forward(
         debug_info["bootstrap_prompts"] = {
             "answer_logits": dbg_prompts_answer,
             "indirect_ptrue1": dbg_prompts_ptrue1,
-            "indirect_ptrue2": dbg_prompts_ptrue2,
+            # "indirect_ptrue2": dbg_prompts_ptrue2,  # Commented out - not computed
             "verbconf": dbg_prompts_verbconf,
         }
         debug_info["bootstrap_samples"] = [
@@ -1462,8 +1582,8 @@ def _bootstrap_forward(
         answer_probabilities=all_answer_probs,
         answer_entropy=all_answer_entropy,
         indirect_ptrue1_probabilities=all_ptrue1,
-        indirect_ptrue2_probabilities=all_ptrue2,
-        indirect_ptrue3_probabilities=all_ptrue3,
+        indirect_ptrue2_probabilities=[],  # Not computed
+        indirect_ptrue3_probabilities=[],  # Not computed
         verbconf_probabilities=all_verbconf,
         verbconf_distribution=all_verbconf_dist,
         verbconf_top_score=all_verbconf_top_scores,
@@ -1471,7 +1591,17 @@ def _bootstrap_forward(
         step_masks=step_counts,
     )
 
-    return scores, step_counts
+    bs_timings = {
+        "meanprob_total_seconds": bs_meanprob_total,
+        "meanprob_forward_seconds": bs_meanprob_forward,
+        "indirect1_total_seconds": bs_indirect1_total,
+        "indirect1_forward_seconds": bs_indirect1_forward,
+        "verbconf_total_seconds": bs_verbconf_total,
+        "verbconf_forward_seconds": bs_verbconf_forward,
+        "verbconf_joint_probs_seconds": bs_verbconf_joint_probs,
+    }
+
+    return scores, step_counts, bs_timings
 
 
 def _fake_bootstrap_forward(
@@ -1607,10 +1737,12 @@ def _fake_bootstrap_hook_forward(
 
 def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None, vanilla_only=False, recrop_early_cache_len=None, preserve_final_step=False, use_hooks=False):
     """Logit-based confidence on the answer tokens themselves."""
+    _t_start = time.perf_counter()
+
     suffix_text = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
     # logger.info("dropout_answerlogits: generated_text='%s', suffix='%s'", generated_text[:100], suffix_text)
 
-    late_tokens, vanilla_out, dropout_out, ans_start, ans_end, dropout_step_masks, masked_steps_debug = \
+    late_tokens, vanilla_out, dropout_out, ans_start, ans_end, dropout_step_masks, masked_steps_debug, forward_timings = \
         dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text=suffix_text, nb_dropout_samples=nb_dropout_samples,
                         use_fullstring=use_fullstring, assistant_prefill=assistant_prefill,
@@ -1658,11 +1790,20 @@ def dropout_answerlogits(llm, messages, generated_text, parsed_output, nb_dropou
     # --- Debug ---
     dbg = _debug_answer_logit_tokens(llm, late_tokens, ans_start, ans_end, v_probs, vanilla_answer_probs) if debug_conf else None
 
-    return vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks, masked_steps_debug
+    # --- Timing ---
+    total_time = time.perf_counter() - _t_start
+    metric_timings = {
+        "total_seconds": total_time,
+        "forward_seconds": forward_timings["vanilla_forward_seconds"] + forward_timings["dropout_forward_seconds"],
+    }
+
+    return vanilla_answer_probs, vanilla_answer_entropy, dropout_answer_probs, dropout_answer_entropy, dbg, dropout_step_masks, masked_steps_debug, metric_timings
 
 
 def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None, vanilla_only=False, recrop_early_cache_len=None, preserve_final_step=False, use_hooks=False):
     """P(True) and P(Yes) probing after the answer."""
+    _t_start = time.perf_counter()
+
     # logger.info("dropout_indirectlogits: generated_text='%s'", generated_text[:100])
 
     positive_true_ids = get_token_ids(llm.tokenizer, ANSWER_TOKENS[' True'])
@@ -1673,7 +1814,7 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
     # ptrue1: "True/False:"
     ptrue1_suffix = f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}.\nTrue/False:"
     # logger.info("dropout_indirectlogits ptrue1: suffix='%s'", ptrue1_suffix)
-    _, vanilla1, dropout1, _, _, dropout_step_masks, _ = \
+    _, vanilla1, dropout1, _, _, dropout_step_masks, _, forward_timings1 = \
         dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text=ptrue1_suffix,
                         nb_dropout_samples=nb_dropout_samples,
@@ -1690,7 +1831,7 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
     # ptrue2: "Is the answer \boxed{<X>}?"
     ptrue2_suffix = f"\nIs the answer \\boxed{{{parsed_output.final_answer}}}?"
     # logger.info("dropout_indirectlogits ptrue2: suffix='%s'", ptrue2_suffix)
-    _, vanilla2, dropout2, _, _, _, _ = \
+    _, vanilla2, dropout2, _, _, _, _, forward_timings2 = \
         dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text=ptrue2_suffix,
                         nb_dropout_samples=nb_dropout_samples,
@@ -1759,7 +1900,19 @@ def dropout_indirectlogits(llm, messages, generated_text, parsed_output, nb_drop
     else:
         dbg = None
 
-    return [vanilla_ptrue1], [vanilla_ptrue2], [vanilla_ptrue3], dropout_ptrue1, dropout_ptrue2, dropout_ptrue3, dbg, dropout_step_masks
+    # --- Timing ---
+    total_time = time.perf_counter() - _t_start
+    forward_time = (forward_timings1["vanilla_forward_seconds"] +
+                    forward_timings1["dropout_forward_seconds"] +
+                    forward_timings2["vanilla_forward_seconds"] +
+                    forward_timings2["dropout_forward_seconds"])
+
+    metric_timings = {
+        "total_seconds": total_time,
+        "forward_seconds": forward_time,
+    }
+
+    return [vanilla_ptrue1], [vanilla_ptrue2], [vanilla_ptrue3], dropout_ptrue1, dropout_ptrue2, dropout_ptrue3, dbg, dropout_step_masks, metric_timings
 
 
 def _slice_cache_batch(cache, start, end):
@@ -1888,6 +2041,8 @@ def _compute_verbconf_joint_probs(llm, model_output, token_seqs, device):
 
 def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_samples=10, use_fullstring=False, assistant_prefill="", debug_conf=False, gen_cache=None, base_tokens=None, use_jackknife=False, precomputed_early_cache=None, consume_early_cache=False, jk_kept_indices=None, jk_step_masks=None, vanilla_only=False, recrop_early_cache_len=None, preserve_final_step=False, use_hooks=False):
     """Verbalized confidence (0-100 score)."""
+    _t_start = time.perf_counter()
+
     suffix = (
         f"\nThe answer is \\boxed{{{parsed_output.final_answer}}}."
         "\nPlease respond with a score from 0 to 100 in <confidence> </confidence> tags."
@@ -1896,7 +2051,7 @@ def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_
     )
     # logger.info("dropout_verbalconf: generated_text='%s', suffix='%s'", generated_text[:100], suffix)
 
-    _, vanilla_out, dropout_out, _, _, dropout_step_masks, _ = \
+    _, vanilla_out, dropout_out, _, _, dropout_step_masks, _, forward_timings = \
         dropout_forward(llm, messages, generated_text, parsed_output,
                         suffix_text=suffix,
                         nb_dropout_samples=nb_dropout_samples,
@@ -1916,7 +2071,10 @@ def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_
     device = next(llm.model.parameters()).device
 
     # Vanilla
+    _t_joint_start = time.perf_counter()
     v_probs = _compute_verbconf_joint_probs(llm, vanilla_out, token_seqs, device)
+    joint_probs_time = time.perf_counter() - _t_joint_start
+
     v_probs_1d = v_probs[0] if v_probs.dim() > 1 else v_probs
     vanilla_verbconf = (score_values * v_probs_1d).sum().item()
     vanilla_distribution = v_probs_1d.tolist()
@@ -1926,7 +2084,10 @@ def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_
 
     # Dropout
     if dropout_out is not None:
+        _t_joint_dropout_start = time.perf_counter()
         d_probs = _compute_verbconf_joint_probs(llm, dropout_out, token_seqs, device)
+        joint_probs_time += time.perf_counter() - _t_joint_dropout_start
+
         dropout_verbconf = (score_values * d_probs).sum(-1).numpy().tolist()
         dropout_distribution = d_probs.tolist()
         dropout_top_idxs = d_probs.argmax(dim=-1)
@@ -1941,12 +2102,23 @@ def dropout_verbalconf(llm, messages, generated_text, parsed_output, nb_dropout_
     # --- Debug ---
     dbg = _debug_verbconf_tokens(llm, token_seqs, v_probs, vanilla_verbconf) if debug_conf else None
 
+    # --- Timing ---
+    total_time = time.perf_counter() - _t_start
+    forward_time = forward_timings["vanilla_forward_seconds"] + forward_timings["dropout_forward_seconds"]
+
+    metric_timings = {
+        "total_seconds": total_time,
+        "forward_seconds": forward_time,
+        "joint_probs_seconds": joint_probs_time,
+    }
+
     return (
         [vanilla_verbconf], dropout_verbconf,
         vanilla_distribution, vanilla_top_score, vanilla_top_prob,
         dropout_distribution, dropout_top_scores, dropout_top_probs,
         dbg,
         dropout_step_masks,
+        metric_timings,
     )
 
 
@@ -2141,83 +2313,118 @@ def dropout_forward(
             early_output = llm.model(input_ids=early_tokens, past_key_values=empty_cache)
         early_cache = early_output.past_key_values
 
-    # -- Vanilla forward --------------------------------------------------------
-    if suffix_text and gen_cache is not None and not vanilla_only:
-        overlap_len = min(find_token_overlap(base_tokens[0], tokens[0]), gen_cache_len)
-        nb_discarded = gen_cache_len - overlap_len
-        logger.info(
-            "KV cache reuse: overlap=%d, discarded=%d (of %d)",
-            overlap_len, nb_discarded, gen_cache_len,
-        )
+    # -- Vanilla forward (fresh full-sequence pass, no KV-cache reuse) ---------
+    # The cached scheme below relied on `base_tokens == tokens[:early_late_split]`,
+    # which can fail when BPE merges across the CoT/suffix boundary and yields
+    # logits that don't match a full-sequence forward. The fresh full forward
+    # matches the _bootstrap_forward / _jackknife_true_forward / _coinflip_true_forward
+    # paths and removes that inconsistency. Logits are sliced to the late region
+    # so downstream indexing with `ans_start`/`ans_end` (late-relative) is
+    # unchanged.
+    forward_timings = {
+        "vanilla_forward_seconds": 0.0,
+        "dropout_forward_seconds": 0.0,
+    }
 
-        if overlap_len > early_late_split:
-            # Reuse more of the cache via overlap — forward only the tail
-            _t0 = time.perf_counter()
-            vanilla_cache = copy.deepcopy(gen_cache)
-            logger.info("deepcopy(gen_cache) for vanilla_cache (suffix+overlap) took %.4fs", time.perf_counter() - _t0)
-            crop_cache(vanilla_cache, overlap_len)
-            remaining_tokens = tokens[:, overlap_len:].to(device)
-            logger.info(
-                "KV cache overlap boundary: cache_tail='%s' | remaining_head='%s'",
-                llm.tokenizer.decode(tokens[0, overlap_len-3:overlap_len].tolist()),
-                llm.tokenizer.decode(remaining_tokens[0, :3].tolist()),
-            )
+    _t_vanilla_start = time.perf_counter()
+    with torch.no_grad():
+        _full_vanilla_output = llm.model.forward(input_ids=tokens.to(device))
+    forward_timings["vanilla_forward_seconds"] = time.perf_counter() - _t_vanilla_start
 
-            with torch.no_grad():
-                vanilla_output = llm.model.forward(
-                    input_ids=remaining_tokens,
-                    past_key_values=vanilla_cache,
-                    # output_hidden_states=True,
-                )
-        else:
-            # Pathological case: overlap doesn't extend past split
-            with torch.no_grad():
-                if _owns_early_cache and not will_run_dropout:
-                    logger.info("consuming early_cache directly for vanilla (suffix, no overlap)")
-                    vanilla_output = llm.model.forward(
-                        input_ids=late_tokens,
-                        past_key_values=early_cache,
-                        # output_hidden_states=True,
-                    )
-                else:
-                    _t0 = time.perf_counter()
-                    _early_cache_copy = copy.deepcopy(early_cache)
-                    logger.info("deepcopy(early_cache) for vanilla (suffix, no overlap) took %.4fs", time.perf_counter() - _t0)
-                    vanilla_output = llm.model.forward(
-                        input_ids=late_tokens,
-                        past_key_values=_early_cache_copy,
-                        # output_hidden_states=True,
-                    )
-    else:
-        if gen_cache is not None:
-            nb_discarded = gen_cache_len - early_late_split
-            logger.info(
-                "KV cache reuse (suffix=%s): reused=%d, discarded=%d (of %d)",
-                bool(suffix_text), early_late_split, nb_discarded, gen_cache_len,
-            )
-            logger.info(
-                "KV cache overlap boundary (suffix=%s): cache_tail='%s' | remaining_head='%s'",
-                bool(suffix_text),
-                llm.tokenizer.decode(tokens[0, early_late_split-3:early_late_split].tolist()),
-                llm.tokenizer.decode(late_tokens[0, :3].tolist()),
-            )
-        with torch.no_grad():
-            if _owns_early_cache and not will_run_dropout:
-                logger.info("consuming early_cache directly for vanilla (suffix=%s)", bool(suffix_text))
-                vanilla_output = llm.model.forward(
-                    input_ids=late_tokens,
-                    past_key_values=early_cache,
-                    # output_hidden_states=True,
-                )
-            else:
-                _t0 = time.perf_counter()
-                _early_cache_copy = copy.deepcopy(early_cache)
-                logger.info("deepcopy(early_cache) for vanilla (suffix=%s) took %.4fs", bool(suffix_text), time.perf_counter() - _t0)
-                vanilla_output = llm.model.forward(
-                    input_ids=late_tokens,
-                    past_key_values=_early_cache_copy,
-                    # output_hidden_states=True,
-                )
+    class _VanillaForwardWrapper:
+        __slots__ = ("logits", "past_key_values")
+
+        def __init__(self, logits, past_key_values):
+            self.logits = logits
+            self.past_key_values = past_key_values
+
+    vanilla_output = _VanillaForwardWrapper(
+        logits=_full_vanilla_output.logits[:, early_late_split:, :],
+        past_key_values=_full_vanilla_output.past_key_values,
+    )
+
+    # --- [OLD CACHED VANILLA SCHEME — commented out] ---------------------------
+    # Why: this scheme built an `early_cache` from `base_tokens` (tokenization of
+    # system+user+CoT only) and forwarded just `late_tokens` (the suffix) on top
+    # of it, assuming `base_tokens == tokens[:early_late_split]` where `tokens`
+    # is the tokenization of system+user+CoT+suffix. That assumption breaks
+    # whenever BPE merges across the CoT/suffix boundary differ between the two
+    # tokenizations, which silently produces logits that don't match a
+    # full-sequence forward. Empirically this caused vanilla P(answer) and
+    # ptrue2/3 to diverge dramatically from bootstrap-with-full-CoT on Qwen
+    # (e.g. P(C) = 0.16 vs 0.98, ptrue2 Yes/No flipped). The fresh full forward
+    # above removes the assumption entirely.
+    # if suffix_text and gen_cache is not None and not vanilla_only:
+    #     overlap_len = min(find_token_overlap(base_tokens[0], tokens[0]), gen_cache_len)
+    #     nb_discarded = gen_cache_len - overlap_len
+    #     logger.info(
+    #         "KV cache reuse: overlap=%d, discarded=%d (of %d)",
+    #         overlap_len, nb_discarded, gen_cache_len,
+    #     )
+    #
+    #     if overlap_len > early_late_split:
+    #         # Reuse more of the cache via overlap — forward only the tail
+    #         _t0 = time.perf_counter()
+    #         vanilla_cache = copy.deepcopy(gen_cache)
+    #         logger.info("deepcopy(gen_cache) for vanilla_cache (suffix+overlap) took %.4fs", time.perf_counter() - _t0)
+    #         crop_cache(vanilla_cache, overlap_len)
+    #         remaining_tokens = tokens[:, overlap_len:].to(device)
+    #         logger.info(
+    #             "KV cache overlap boundary: cache_tail='%s' | remaining_head='%s'",
+    #             llm.tokenizer.decode(tokens[0, overlap_len-3:overlap_len].tolist()),
+    #             llm.tokenizer.decode(remaining_tokens[0, :3].tolist()),
+    #         )
+    #
+    #         with torch.no_grad():
+    #             vanilla_output = llm.model.forward(
+    #                 input_ids=remaining_tokens,
+    #                 past_key_values=vanilla_cache,
+    #             )
+    #     else:
+    #         # Pathological case: overlap doesn't extend past split
+    #         with torch.no_grad():
+    #             if _owns_early_cache and not will_run_dropout:
+    #                 logger.info("consuming early_cache directly for vanilla (suffix, no overlap)")
+    #                 vanilla_output = llm.model.forward(
+    #                     input_ids=late_tokens,
+    #                     past_key_values=early_cache,
+    #                 )
+    #             else:
+    #                 _t0 = time.perf_counter()
+    #                 _early_cache_copy = copy.deepcopy(early_cache)
+    #                 logger.info("deepcopy(early_cache) for vanilla (suffix, no overlap) took %.4fs", time.perf_counter() - _t0)
+    #                 vanilla_output = llm.model.forward(
+    #                     input_ids=late_tokens,
+    #                     past_key_values=_early_cache_copy,
+    #                 )
+    # else:
+    #     if gen_cache is not None:
+    #         nb_discarded = gen_cache_len - early_late_split
+    #         logger.info(
+    #             "KV cache reuse (suffix=%s): reused=%d, discarded=%d (of %d)",
+    #             bool(suffix_text), early_late_split, nb_discarded, gen_cache_len,
+    #         )
+    #         logger.info(
+    #             "KV cache overlap boundary (suffix=%s): cache_tail='%s' | remaining_head='%s'",
+    #             bool(suffix_text),
+    #             llm.tokenizer.decode(tokens[0, early_late_split-3:early_late_split].tolist()),
+    #             llm.tokenizer.decode(late_tokens[0, :3].tolist()),
+    #         )
+    #     with torch.no_grad():
+    #         if _owns_early_cache and not will_run_dropout:
+    #             logger.info("consuming early_cache directly for vanilla (suffix=%s)", bool(suffix_text))
+    #             vanilla_output = llm.model.forward(
+    #                 input_ids=late_tokens,
+    #                 past_key_values=early_cache,
+    #             )
+    #         else:
+    #             _t0 = time.perf_counter()
+    #             _early_cache_copy = copy.deepcopy(early_cache)
+    #             logger.info("deepcopy(early_cache) for vanilla (suffix=%s) took %.4fs", bool(suffix_text), time.perf_counter() - _t0)
+    #             vanilla_output = llm.model.forward(
+    #                 input_ids=late_tokens,
+    #                 past_key_values=_early_cache_copy,
+    #             )
 
     # -- Dropout forward --------------------------------------------------------
     dropout_output = None
@@ -2231,6 +2438,8 @@ def dropout_forward(
             _t0 = time.perf_counter()
             _dropout_cache = copy.deepcopy(early_cache)
             logger.info("deepcopy(early_cache) for dropout_late_forward took %.4fs", time.perf_counter() - _t0)
+
+        _t_dropout_start = time.perf_counter()
         dropout_output, dropout_step_masks, masked_steps_debug = dropout_late_forward(
             llm,
             parsed_output.cot_steps,
@@ -2249,6 +2458,7 @@ def dropout_forward(
             preserve_final_step=preserve_final_step,
             use_hooks=use_hooks,
         )
+        forward_timings["dropout_forward_seconds"] = time.perf_counter() - _t_dropout_start
 
     # In vanilla_only mode the early_cache was mutated in place by the vanilla
     # forward (extended with late_tokens). Crop it back so the next caller can
@@ -2256,7 +2466,7 @@ def dropout_forward(
     if vanilla_only and recrop_early_cache_len is not None and precomputed_early_cache is not None:
         crop_cache(precomputed_early_cache, recrop_early_cache_len)
 
-    return late_tokens, vanilla_output, dropout_output, answer_start_late, answer_end_late, dropout_step_masks, masked_steps_debug
+    return late_tokens, vanilla_output, dropout_output, answer_start_late, answer_end_late, dropout_step_masks, masked_steps_debug, forward_timings
 
 
 def dropout_late_forward(

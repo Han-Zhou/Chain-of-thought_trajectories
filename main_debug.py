@@ -141,6 +141,15 @@ def parse():
         help="Number of dropout samples for confidence scoring."
     )
     args.add_argument(
+        "--experimental_modification",
+        type=str,
+        default=None,
+        help=(
+            "Confidence-only prompt modification mode. Supported values: "
+            "'no-cots' and 'gibberish'."
+        ),
+    )
+    args.add_argument(
         "--tag",
         type=str,
         default=None,
@@ -211,7 +220,7 @@ def reconstruct_cot_from_partial(partial_cots: list[str], cot_answer: str) -> st
     return cot_text
 
 
-def score_trajectories(model_name, pickle_data, out_dir, confidence=False, debug_conf=False, experimental_jackknife=False, discord=False, nb_dropout_samples=3, shot_mode="zero", dataset_name=None):
+def score_trajectories(model_name, pickle_data, out_dir, confidence=False, debug_conf=False, experimental_jackknife=False, discord=False, nb_dropout_samples=3, shot_mode="zero", dataset_name=None, experimental_modification=None, tag=None):
     """Score pre-generated trajectories from pickle data using confidence metrics."""
     llm = LLM(model_name, thinking=False)
     tokenizer = llm.tokenizer
@@ -219,7 +228,8 @@ def score_trajectories(model_name, pickle_data, out_dir, confidence=False, debug
     few_shot = (shot_mode == "few")
 
     progress = tqdm_discord if discord else tqdm
-    for i, entry in enumerate(progress(pickle_data, desc="Scoring", unit="sample")):
+    desc = f"Scoring [{tag}]" if tag else "Scoring"
+    for i, entry in enumerate(progress(pickle_data, desc=desc, unit="sample")):
         logger.info(f"Scoring {i}/{len(pickle_data)}")
         t0 = time.time()
 
@@ -270,6 +280,7 @@ def score_trajectories(model_name, pickle_data, out_dir, confidence=False, debug
                         debug_conf=debug_conf,
                         gen_cache=None,
                         experimental_jackknife=experimental_jackknife,
+                        experimental_modification=experimental_modification,
                     )
                     llm.switch_attn_implementation("cot")
                     debug_info = confidence_data.debug_info if debug_conf else None
@@ -303,6 +314,7 @@ def score_trajectories(model_name, pickle_data, out_dir, confidence=False, debug
                     "answer_token_start_position":  answer_token_start_position,
                     "confidence_score":             confidence_score,
                     "confidence_method":            "coin_flip+jackknife" if experimental_jackknife else "coin_flip",
+                    "confidence_modification":      experimental_modification if confidence_score else None,
                     "debug_info":                   debug_info if debug_conf else None,
                     "runtime_seconds":              time.time() - t0,
                     "correct":                      correct,
@@ -330,6 +342,7 @@ def score_trajectories(model_name, pickle_data, out_dir, confidence=False, debug
                 "answer_token_start_position":  None,
                 "confidence_score":             None,
                 "confidence_method":            None,
+                "confidence_modification":      None,
                 "runtime_seconds":              time.time() - t0,
                 "correct":                      None,
             }
@@ -373,7 +386,8 @@ def main(args):
         logger.info(f"Extracted dataset name from pickle: {dataset_name}")
 
     pickle_basename = os.path.splitext(os.path.basename(args.pickle_path))[0]
-    dir_name = f"{args.model}_{pickle_basename}_{start}_{end}_{'conf' if args.confidence else 'vanilla'}_{'jackknife' if args.experimental_jackknife else 'coinflip'}"
+    mod_suffix = args.experimental_modification or "none"
+    dir_name = f"{args.model}_{pickle_basename}_{start}_{end}_{'conf' if args.confidence else 'vanilla'}_{'jackknife' if args.experimental_jackknife else 'coinflip'}_mod-{mod_suffix}"
     if args.tag:
         dir_name = f"{args.tag}_{dir_name}"
     out_dir = f"trajectories/{dir_name}"
@@ -388,6 +402,8 @@ def main(args):
         nb_dropout_samples=args.nb_dropout_samples,
         shot_mode=args.shot_mode,
         dataset_name=dataset_name,
+        experimental_modification=args.experimental_modification,
+        tag=args.tag,
     )
 
     if errors:

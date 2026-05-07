@@ -66,37 +66,68 @@ def _resolve_attn_implementation(model_name: str) -> str:
 
     if "qwen" in model_name.lower():
         return "sdpa"
+        # return "flash_attention_2"
     if "gpt" in model_name.lower():
         return "flash_attention_3"
     return "sdpa"
 
 
 class LLM():
-    def __init__(self, model_name: str, thinking: bool):
+    def __init__(self, model_name: str, thinking: bool, backend: str = "hf"):
 
-        logger.info(f"Loading model {model_name}...")
+        logger.info(f"Loading model {model_name} with backend {backend}...")
         self.model_name = model_name
-
-        self._generation_attn_impl = _resolve_attn_implementation(model_name)
-
-        logger.info(f"Using attention implementation: {self._generation_attn_impl}")
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-            attn_implementation=self._generation_attn_impl,
-        )
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-
         self.thinking = thinking
+        self.backend = backend
+
+        if backend == "vllm":
+            # vLLM backend: lazy import and load
+            try:
+                from vllm import LLM as vLLM_LLM, SamplingParams
+                self.vllm_model = vLLM_LLM(
+                    model=model_name,
+                    dtype="bfloat16",
+                    trust_remote_code=True,
+                )
+                self.vllm_sampling_params_class = SamplingParams
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+                logger.info("vLLM backend loaded successfully")
+                # HF model attributes set to None for vLLM backend
+                self.model = None
+                self._generation_attn_impl = None
+            except ImportError:
+                raise ImportError(
+                    "vLLM backend requires the vllm package. "
+                    "Install it with: pip install vllm"
+                )
+        else:
+            # HuggingFace backend: existing logic
+            self._generation_attn_impl = _resolve_attn_implementation(model_name)
+            logger.info(f"Using attention implementation: {self._generation_attn_impl}")
+
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto",
+                torch_dtype=torch.bfloat16,
+                attn_implementation=self._generation_attn_impl,
+            )
+
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            # vLLM attributes set to None for HF backend
+            self.vllm_model = None
+            self.vllm_sampling_params_class = None
     
 
     def switch_attn_implementation(self, mode: str):
         """Switch attention implementation using transformers' built-in API.
             mode can be 'confidence' or 'cot'
         """
+        if self.backend == "vllm":
+            raise RuntimeError(
+                "Cannot switch attention implementation with vLLM backend. "
+                "Confidence scoring requires HuggingFace backend."
+            )
+
         if mode == "confidence":
             if 'qwen' in self.model_name.lower():
                 self.model.set_attn_implementation("sdpa")
@@ -142,6 +173,21 @@ class LLM():
             temperature=0.0 → greedy decoding (deterministic, good for evals).
             temperature>0.0 → multinomial sampling.
         """
+        if self.backend == "vllm":
+            return self._generate_one_vllm(messages, max_new_tokens, temperature, has_assistant_prefill, stop_strings)
+        else:
+            return self._generate_one_hf(messages, max_new_tokens, temperature, output_scores, has_assistant_prefill, stop_strings)
+
+    def _generate_one_hf(
+        self,
+        messages: list[dict[str, str]],
+        max_new_tokens: int,
+        temperature: float = 0.0,
+        output_scores: bool = False,
+        has_assistant_prefill: bool = True,
+        stop_strings: list[str] | None = None,
+    ) -> GenerationResult:
+        """HuggingFace backend implementation of generate_one."""
 
         device = next(self.model.parameters()).device
 
@@ -236,6 +282,78 @@ class LLM():
             generated_ids=generated_ids_tensor,
         )
 
+    def _generate_one_vllm(
+        self,
+        messages: list[dict[str, str]],
+        max_new_tokens: int,
+        temperature: float = 0.0,
+        has_assistant_prefill: bool = True,
+        stop_strings: list[str] | None = None,
+    ) -> GenerationResult:
+        """vLLM backend implementation of generate_one."""
+
+        if has_assistant_prefill:
+            prompt_text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+                continue_final_message=True,
+            )
+        else:
+            prompt_text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                continue_final_message=False,
+            )
+
+        # Post processing (same as HF backend)
+        if "qwen" in self.model_name.lower():
+            prompt_text = re.sub(r"<think>\s*</think>\s*", "", prompt_text)
+
+        if "gpt" in self.model_name.lower() and self.thinking:
+            target = "<|channel|>final"
+            last_idx = prompt_text.rfind(target)
+            if last_idx != -1:
+                prompt_text = prompt_text[:last_idx] + "<|channel|>analysis" + prompt_text[last_idx + len(target):]
+
+        logger.info(prompt_text)
+
+        # Create sampling params
+        sampling_params = self.vllm_sampling_params_class(
+            temperature=temperature if temperature > 0.0 else 0.0,
+            max_tokens=max_new_tokens,
+            stop=stop_strings if stop_strings else None,
+        )
+
+        # Generate with vLLM
+        outputs = self.vllm_model.generate([prompt_text], sampling_params)
+        output = outputs[0]
+
+        # Extract generated text
+        generated_text = output.outputs[0].text
+
+        # Compute token positions
+        prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        prompt_len = len(prompt_ids)
+        generated_ids = output.outputs[0].token_ids
+        total_len = prompt_len + len(generated_ids)
+
+        # Convert to tensors for compatibility
+        generated_ids_tensor = torch.tensor(generated_ids, dtype=torch.long)
+        prompt_tail_ids = torch.tensor(prompt_ids[max(0, prompt_len - 10):], dtype=torch.long)
+
+        return GenerationResult(
+            prompt_text=prompt_text,
+            generated_text=generated_text,
+            prompt_end_position=prompt_len,
+            generated_end_position=total_len,
+            past_key_values=None,  # vLLM does not expose KV cache
+            prompt_tail_ids=prompt_tail_ids,
+            scores=None,
+            generated_ids=generated_ids_tensor,
+        )
+
     def generate_raw(
         self,
         prompt_text: str,
@@ -245,6 +363,20 @@ class LLM():
         stop_strings: list[str] | None = None,
     ) -> GenerationResult:
         """Generate from an already-formatted prompt string, bypassing apply_chat_template."""
+        if self.backend == "vllm":
+            return self._generate_raw_vllm(prompt_text, max_new_tokens, temperature, stop_strings)
+        else:
+            return self._generate_raw_hf(prompt_text, max_new_tokens, temperature, output_scores, stop_strings)
+
+    def _generate_raw_hf(
+        self,
+        prompt_text: str,
+        max_new_tokens: int,
+        temperature: float = 0.0,
+        output_scores: bool = False,
+        stop_strings: list[str] | None = None,
+    ) -> GenerationResult:
+        """HuggingFace backend implementation of generate_raw."""
 
         device = next(self.model.parameters()).device
         inputs = self.tokenizer(prompt_text, return_tensors="pt").to(device)
@@ -284,6 +416,52 @@ class LLM():
             past_key_values=outputs.past_key_values,
             prompt_tail_ids=prompt_tail_ids,
             scores=outputs.scores if output_scores else None,
+            generated_ids=generated_ids_tensor,
+        )
+
+    def _generate_raw_vllm(
+        self,
+        prompt_text: str,
+        max_new_tokens: int,
+        temperature: float = 0.0,
+        stop_strings: list[str] | None = None,
+    ) -> GenerationResult:
+        """vLLM backend implementation of generate_raw."""
+
+        logger.info(prompt_text)
+
+        # Create sampling params
+        sampling_params = self.vllm_sampling_params_class(
+            temperature=temperature if temperature > 0.0 else 0.0,
+            max_tokens=max_new_tokens,
+            stop=stop_strings if stop_strings else None,
+        )
+
+        # Generate with vLLM
+        outputs = self.vllm_model.generate([prompt_text], sampling_params)
+        output = outputs[0]
+
+        # Extract generated text
+        generated_text = output.outputs[0].text
+
+        # Compute token positions
+        prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        prompt_len = len(prompt_ids)
+        generated_ids = output.outputs[0].token_ids
+        total_len = prompt_len + len(generated_ids)
+
+        # Convert to tensors for compatibility
+        generated_ids_tensor = torch.tensor(generated_ids, dtype=torch.long)
+        prompt_tail_ids = torch.tensor(prompt_ids[max(0, prompt_len - 10):], dtype=torch.long)
+
+        return GenerationResult(
+            prompt_text=prompt_text,
+            generated_text=generated_text,
+            prompt_end_position=prompt_len,
+            generated_end_position=total_len,
+            past_key_values=None,  # vLLM does not expose KV cache
+            prompt_tail_ids=prompt_tail_ids,
+            scores=None,
             generated_ids=generated_ids_tensor,
         )
 

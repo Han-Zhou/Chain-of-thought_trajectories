@@ -2,38 +2,37 @@
 
 echo "Starting run ..."
 
-# python3 main.py \
-#     --dataset logiqa \
-#     --model qwen \
-#     --sample_size 1 \
-#     --shot_mode few \
-#     --thinking \
-#     --max_new_tokens 7000 \
-#     --type 1
+PICKLE_DIR="pickles"
 
 python3 main.py \
-    --dataset logiqa \
+    --pickle_path $PICKLE_DIR/bigbench_movie.pkl \
+    --dataset bigbench_movie \
     --model llama \
-    --sample_size 5 \
     --shot_mode zero \
-    --max_new_tokens 20000 \
-    --type 2 \
-    --tag debug-llama
-
-python3 main.py \
-    --dataset logiqa \
-    --model llama \
-    --sample_size 5 \
-    --shot_mode zero \
-    --max_new_tokens 20000 \
+    --max_new_tokens 2000 \
+    --type 1 \
     --confidence \
-    --type 2 \
-    --debug \
     --debug_conf \
-    --tag debug-llama \
+    --tag debug_412-gibberish-conf-llama-boxed-type2 \
     --nb_dropout_samples 10 \
-    --experimental_jackknife
+    --experimental_jackknife \
+    --experimental_modification gibberish \
+    --experimental_extra_box \
+    --sample_size 10
+    # --sample_range 3 4
 
-    # --debug \
 
-
+# python3 main.py \
+#     --pickle_path $PICKLE_DIR/bigbench_movie.pkl \
+#     --dataset bigbench_movie \
+#     --model llama \
+#     --shot_mode zero \
+#     --max_new_tokens 20000 \
+#     --type 2 \
+#     --confidence \
+#     --debug_conf \
+#     --tag debug-409-llama-boxed-type2 \
+#     --nb_dropout_samples 10 \
+#     --experimental_jackknife \
+#     --experimental_extra_box \
+#     --sample_size 10

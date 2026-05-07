@@ -19,6 +19,11 @@ import sys
 
 from openai import AsyncOpenAI
 
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
+
 
 DEFAULT_JUDGE_MODEL = "gpt-5-mini"
 JUDGE_MAX_COMPLETION_TOKENS = 4096
@@ -193,12 +198,16 @@ async def _process_file(
             "parse_ok": result["parse_ok"],
             "usage": result["usage"],
         }
-        if result["correct"] == "yes":
-            traj["correct_llm_judge"] = True
+        # Overwrite the correct field with the judge's verdict
+        traj["correct"] = result["correct"] == "yes"
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
 
     return record
+
+
+async def _with_index(index: int, task: asyncio.Task) -> tuple[int, dict]:
+    return index, await task
 
 
 async def run_async(
@@ -213,8 +222,38 @@ async def run_async(
 
     client = _get_client()
     semaphore = asyncio.Semaphore(num_workers)
-    tasks = [_process_file(client, p, judge_model, semaphore, write) for p in files]
-    records = await asyncio.gather(*tasks)
+    tasks = [
+        asyncio.create_task(_process_file(client, p, judge_model, semaphore, write))
+        for p in files
+    ]
+    indexed_tasks = [
+        asyncio.create_task(_with_index(idx, task)) for idx, task in enumerate(tasks)
+    ]
+    records: list[dict | None] = [None] * len(tasks)
+
+    if tqdm is not None:
+        iterator = tqdm(
+            asyncio.as_completed(indexed_tasks),
+            total=len(indexed_tasks),
+            desc="Judging trajectories",
+            unit="file",
+        )
+        for done_task in iterator:
+            idx, result = await done_task
+            records[idx] = result
+    else:
+        completed = 0
+        total = len(indexed_tasks)
+        print(f"[progress] judging {total} files...")
+        for done_task in asyncio.as_completed(indexed_tasks):
+            idx, result = await done_task
+            records[idx] = result
+            completed += 1
+            if completed == 1 or completed % 10 == 0 or completed == total:
+                print(f"[progress] {completed}/{total} files processed")
+
+    # Typing guard: all entries are filled after awaiting all tasks above.
+    records = [r for r in records if r is not None]
 
     total_files = len(records)
     judged = [r for r in records if r.get("judged")]

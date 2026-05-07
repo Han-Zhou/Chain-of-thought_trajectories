@@ -8,8 +8,7 @@ import sys
 # ]
 
 folders = [
-    "trajectories/llama_regular_logiqa_zero_0_300_type2_conf_jackknife_0331",
-    "trajectories/llama_regular_logiqa_zero_300_651_type2_conf_jackknife_0331",
+    "trajectories/406-llama-type1_llama_regular_bigbench_movie_zero_0_250_type1_conf_jackknife"
 ]
 
 def count_accuracies(folder_paths):

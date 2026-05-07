@@ -12,7 +12,7 @@ class GenerationResult:
     generated_text: str                  # only the newly generated tokens (no prompt echo)
     prompt_end_position: int             # prompt_len = last prompt position + 1
     generated_end_position: int          # last generated position + 1
-    past_key_values: DynamicCache | Qwen3_5DynamicCache       # the fully populated KV cache
+    past_key_values: DynamicCache | Qwen3_5DynamicCache | None       # the fully populated KV cache (None for vLLM backend)
     prompt_tail_ids: torch.Tensor = field(default_factory=lambda: torch.tensor([], dtype=torch.long))
     scores: tuple | None = field(default=None)
     generated_ids: torch.Tensor | None = field(default=None)
@@ -44,11 +44,44 @@ class ConfidenceScores:
 
 
 @dataclass
+class ConfidenceTimings:
+    """Granular timing for confidence computation components."""
+    # Vanilla per-metric timing (includes forward pass + post-processing)
+    vanilla_meanprob_total_seconds: float = 0.0
+    vanilla_meanprob_forward_seconds: float = 0.0
+
+    vanilla_meanent_total_seconds: float = 0.0
+    vanilla_meanent_forward_seconds: float = 0.0
+
+    vanilla_indirect1_total_seconds: float = 0.0
+    vanilla_indirect1_forward_seconds: float = 0.0
+
+    vanilla_verbconf_total_seconds: float = 0.0
+    vanilla_verbconf_forward_seconds: float = 0.0
+    vanilla_verbconf_joint_probs_seconds: float = 0.0
+
+    # Bootstrap-specific timing (when experimental_bootstrap=True)
+    bootstrap_meanprob_total_seconds: float = 0.0
+    bootstrap_meanprob_forward_seconds: float = 0.0
+
+    bootstrap_indirect1_total_seconds: float = 0.0
+    bootstrap_indirect1_forward_seconds: float = 0.0
+
+    bootstrap_verbconf_total_seconds: float = 0.0
+    bootstrap_verbconf_forward_seconds: float = 0.0
+    bootstrap_verbconf_joint_probs_seconds: float = 0.0
+
+
+@dataclass
 class AllConfidenceData:
     """All confidence data for a single question, for both non-dropout and dropout versions."""
     vanilla_confidences: ConfidenceScores
     dropout_confidences: ConfidenceScores
     jackknife_confidences: ConfidenceScores | None = None
     bootstrap_confidences: ConfidenceScores | None = None
+    fake_bootstrap_confidences: ConfidenceScores | None = None
+    fake_bootstrap_hook_confidences: ConfidenceScores | None = None
     coinflip_true_confidences: ConfidenceScores | None = None
+    hollow_confidences: ConfidenceScores | None = None
     debug_info: dict = field(default_factory=dict)
+    timings: ConfidenceTimings = field(default_factory=ConfidenceTimings)

@@ -35,6 +35,7 @@ from utils.enum import MODEL_DICT
 from utils.model_utils import (
     clean_phase1_generated_text,
     is_llama_model_name,
+    is_qwen_model_name,
     phase1_stop_strings_for_model,
 )
 from dataclasses import asdict
@@ -122,6 +123,13 @@ def parse():
         action="store_true",
         default=False,
         help="Whether to use thinking.",
+    )
+    args.add_argument(
+        "--backend",
+        type=str,
+        default="hf",
+        choices=["hf", "vllm"],
+        help="Backend for model inference. vLLM is faster but incompatible with --confidence.",
     )
 
     args.add_argument(
@@ -378,6 +386,12 @@ def parse():
             args.error("--from_pregenerated requires --confidence.")
         if parsed.debug:
             args.error("--from_pregenerated and --debug are mutually exclusive.")
+    if parsed.backend == "vllm" and parsed.confidence:
+        logger.warning(
+            "vLLM backend is incompatible with confidence scoring. "
+            "Falling back to HuggingFace backend."
+        )
+        parsed.backend = "hf"
     return parsed
 
 
@@ -393,15 +407,176 @@ def _available_pregenerated_indices(pregen_dir: str) -> set[int]:
     return indices
 
 
-def _load_pregenerated_traj(pregen_dir: str, index: int) -> dict:
+def _load_pregenerated_envelope(pregen_dir: str, index: int) -> dict:
     for fname in (f"traj_{index}_sample_0.json", f"traj_{index}.json"):
         path = os.path.join(pregen_dir, fname)
         if os.path.exists(path):
             with open(path) as f:
-                return json.load(f)["trajectory"]
+                return json.load(f)
     raise FileNotFoundError(
         f"No pregenerated trajectory found for index {index} in {pregen_dir}"
     )
+
+
+def _load_pregenerated_traj(pregen_dir: str, index: int) -> dict:
+    return _load_pregenerated_envelope(pregen_dir, index)["trajectory"]
+
+
+def _answer_lookup_value(answer) -> str:
+    if isinstance(answer, (dict, list)):
+        return json.dumps(answer, sort_keys=True, default=str)
+    return str(answer)
+
+
+def _build_dataset_lookup(dataset_entries) -> dict[str, dict]:
+    by_id: dict[str, list[dict]] = {}
+    by_qa: dict[tuple[str, str], list[dict]] = {}
+
+    for entry in dataset_entries:
+        entry_id = entry.get("id")
+        if entry_id is not None:
+            by_id.setdefault(str(entry_id), []).append(entry)
+
+        key = (entry.get("question"), _answer_lookup_value(entry.get("answer")))
+        by_qa.setdefault(key, []).append(entry)
+
+    return {"by_id": by_id, "by_qa": by_qa}
+
+
+def _merge_pregenerated_entry(dataset_entry: dict, traj_saved: dict, dataset_lookup: dict | None = None) -> dict:
+    """Use pregenerated identity as source of truth, resolve prompt fields by identity."""
+    resolved_entry = dataset_entry
+
+    if dataset_lookup is not None:
+        traj_id = traj_saved.get("id")
+        if traj_id is not None:
+            matches = dataset_lookup["by_id"].get(str(traj_id), [])
+            if len(matches) == 1:
+                resolved_entry = matches[0]
+            elif len(matches) > 1:
+                raise ValueError(f"Ambiguous dataset lookup for pregenerated id={traj_id}")
+
+        if resolved_entry is dataset_entry:
+            key = (traj_saved["question"], _answer_lookup_value(traj_saved["ground_truth"]))
+            matches = dataset_lookup["by_qa"].get(key, [])
+            if len(matches) == 1:
+                resolved_entry = matches[0]
+            elif len(matches) > 1:
+                raise ValueError(
+                    "Ambiguous dataset lookup for pregenerated question/ground_truth pair"
+                )
+
+    merged = copy.deepcopy(resolved_entry)
+    merged["id"] = traj_saved["id"]
+    merged["question"] = traj_saved["question"]
+    merged["answer"] = traj_saved["ground_truth"]
+    return merged
+
+
+def _codeqa_pregenerated_pickle_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "pickles", "codeqa.pkl")
+
+
+def _load_pregenerated_source_entries(dataset_name: str | None, dataloader) -> tuple[list[dict] | None, dict | None]:
+    dataset_key = (dataset_name or "").strip().lower()
+    if dataset_key == "codeqa":
+        pickle_path = _codeqa_pregenerated_pickle_path()
+        source_entries = load_pickle_data(pickle_path)
+        logger.info(
+            "Using %d entries from %s as pregenerated source data for codeqa (live dataloader has %d rows)",
+            len(source_entries),
+            pickle_path,
+            len(dataloader),
+        )
+        return source_entries, None
+
+    return None, _build_dataset_lookup(dataloader.dataset)
+
+
+def _resolve_pregenerated_source_entry(
+    dataset_name: str | None,
+    entry: dict,
+    index: int,
+    traj_saved: dict,
+    dataset_lookup: dict | None = None,
+    pregenerated_source_entries: list[dict] | None = None,
+) -> dict:
+    dataset_key = (dataset_name or "").strip().lower()
+    if dataset_key == "codeqa":
+        if pregenerated_source_entries is None:
+            raise ValueError(
+                "codeqa from_pregenerated requires pickle-backed source entries"
+            )
+        if index >= len(pregenerated_source_entries):
+            raise IndexError(
+                f"Pregenerated codeqa index {index} exceeds pickle size {len(pregenerated_source_entries)}"
+            )
+        return _merge_pregenerated_entry(pregenerated_source_entries[index], traj_saved)
+
+    return _merge_pregenerated_entry(entry, traj_saved, dataset_lookup=dataset_lookup)
+
+
+def _extract_boxed_answer(generated_text):
+    depth = 1
+    answer_text = generated_text
+    for i, char in enumerate(generated_text):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                answer_text = generated_text[:i + 1]
+                break
+    return answer_text
+
+
+def generate_qwen_outside_cot(llm, messages, max_new_tokens, temperature=0.0, prompt_type=1, experimental_extra_box=False):
+    has_assistant_prefill = messages[-1]["role"] == "assistant"
+    assistant_prefill = messages[-1]["content"] if has_assistant_prefill else ""
+
+    gen1 = llm.generate_one(
+        messages, max_new_tokens=max_new_tokens, temperature=temperature,
+        has_assistant_prefill=has_assistant_prefill,
+        stop_strings=["</think>"],
+    )
+
+    # Strip trailing </think> — stop_strings includes it in generated_text
+    if gen1.generated_text.rstrip().endswith("</think>"):
+        gen1.generated_text = gen1.generated_text.rstrip()
+        gen1.generated_text = gen1.generated_text[:-len("</think>")]
+
+    if prompt_type == 1:
+        cot_scaffold = "\n</think>\nLet's think step-by-step.\nStep 1: "
+    else:
+        cot_scaffold = "\n</think>\n"
+
+    phase2_prompt = gen1.prompt_text + gen1.generated_text + cot_scaffold
+
+    if experimental_extra_box:
+        gen2 = llm.generate_raw(phase2_prompt, max_new_tokens=max_new_tokens, temperature=temperature, stop_strings=[])
+        # Strip trailing special tokens (e.g. <|im_end|>) before appending suffix
+        for special_tok in llm.tokenizer.all_special_tokens:
+            if gen2.generated_text.endswith(special_tok):
+                gen2.generated_text = gen2.generated_text[:-len(special_tok)]
+                break
+        suffix = "\nTherefore the answer is \\boxed{"
+        phase3_prompt = phase2_prompt + gen2.generated_text + suffix
+        gen3 = llm.generate_raw(phase3_prompt, max_new_tokens=200, temperature=temperature, stop_strings=[])
+        answer_text = _extract_boxed_answer(gen3.generated_text)
+        combined_new = gen1.generated_text + cot_scaffold + gen2.generated_text + suffix + answer_text
+        full_generated_text = assistant_prefill + combined_new
+        final_gen = gen3
+        final_gen.generated_text = combined_new
+    else:
+        gen2 = llm.generate_raw(phase2_prompt, max_new_tokens=max_new_tokens, temperature=temperature, stop_strings=[])
+        combined_new = gen1.generated_text + cot_scaffold + gen2.generated_text
+        full_generated_text = assistant_prefill + combined_new
+        final_gen = gen2
+        final_gen.generated_text = combined_new
+
+    final_gen.prompt_text = gen1.prompt_text
+    final_gen.prompt_end_position = gen1.prompt_end_position
+    return final_gen, assistant_prefill, full_generated_text
 
 
 def generate_continuation(llm, messages, max_new_tokens, temperature=0.0, suffix="\nTherefore the answer is \\boxed{", stop_strings=None):
@@ -442,28 +617,18 @@ def generate_continuation(llm, messages, max_new_tokens, temperature=0.0, suffix
     gen2 = llm.generate_raw(phase2_prompt, max_new_tokens=200, temperature=temperature, stop_strings=[])
 
     # Find matching closing brace to handle answers containing "}"
-    # Start at depth=1 since suffix already opened the \boxed{ brace
-    depth = 1
-    answer_text = gen2.generated_text
-    for i, char in enumerate(gen2.generated_text):
-        if char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                answer_text = gen2.generated_text[:i + 1]
-                break
+    answer_text = _extract_boxed_answer(gen2.generated_text)
 
     full_generated_text = phase1_text + suffix + answer_text
     gen2.generated_text = gen1.generated_text + suffix + answer_text
     return gen2, assistant_prefill, full_generated_text
 
 
-def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=None, discord=False, nb_dropout_samples=3, experimental_extra_box=False, experimental_modification=None, experimental_grid=False, tag=None, cot_dir=None, temperature=0.0, nb_cot_samples=1, vanilla_only=False, from_pregenerated=None, experimental_preserve_final_step=False, experimental_bootstrap=False, experimental_coinflip_true=False, experimental_hollow=None, cot_sample_idx=None, experimental_fake_bootstrap=False, experimental_fake_bootstrap_hook=False):
+def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=None, discord=False, nb_dropout_samples=3, experimental_extra_box=False, experimental_modification=None, experimental_grid=False, tag=None, cot_dir=None, temperature=0.0, nb_cot_samples=1, vanilla_only=False, from_pregenerated=None, experimental_preserve_final_step=False, experimental_bootstrap=False, experimental_coinflip_true=False, experimental_hollow=None, cot_sample_idx=None, experimental_fake_bootstrap=False, experimental_fake_bootstrap_hook=False, backend="hf"):
 
     debug_dir = "debug_cache"
 
-    llm = LLM(model_name, thinking)
+    llm = LLM(model_name, thinking, backend=backend)
     tokenizer = llm.tokenizer
     is_llama = is_llama_model_name(model_name)
 
@@ -485,8 +650,11 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
     if from_pregenerated:
         _pregen_indices = _available_pregenerated_indices(from_pregenerated)
         logger.info(f"Pregenerated dir has {len(_pregen_indices)} indices available")
+        pregenerated_source_entries, dataset_lookup = _load_pregenerated_source_entries(dataset_name, dataloader)
     else:
         _pregen_indices = None
+        pregenerated_source_entries = None
+        dataset_lookup = None
 
     progress = tqdm_discord if discord else tqdm
     desc = f"Generating [{tag}]" if tag else "Generating"
@@ -498,14 +666,25 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
         t0 = time.time()
 
         try:
+            source_entry = entry
+            traj_saved = None
             if debug:
                 gen, parsed, assistant_prefill, full_generated_text, messages = cached_entries[i]
                 nb_samples_for_entry = 1
             elif from_pregenerated:
-                messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type, experimental_extra_box=experimental_extra_box)
+                traj_saved = _load_pregenerated_traj(from_pregenerated, i)
+                source_entry = _resolve_pregenerated_source_entry(
+                    dataset_name,
+                    entry,
+                    i,
+                    traj_saved,
+                    dataset_lookup=dataset_lookup,
+                    pregenerated_source_entries=pregenerated_source_entries,
+                )
+                messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=source_entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type, experimental_extra_box=experimental_extra_box)
                 nb_samples_for_entry = 1
             else:
-                messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type, experimental_extra_box=experimental_extra_box)
+                messages = load_messages(dataset_name, few_shot=(shot_mode=="few"), entry=source_entry, model_name=model_name, thinking=thinking, prompt_type=prompt_type, experimental_extra_box=experimental_extra_box)
                 nb_samples_for_entry = nb_cot_samples
 
             sample_indices = [cot_sample_idx] if cot_sample_idx is not None else range(nb_samples_for_entry)
@@ -513,9 +692,14 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
               try:
                 t_sample = time.time()
 
-                if not debug:
+                # Track generation time separately
+                t_generation_start = time.time()
+
+                if debug:
+                    gen, parsed, assistant_prefill, full_generated_text, messages = cached_entries[i]
+                    generation_time = 0.0  # Debug mode loads from cache, no generation
+                elif not debug:
                     if from_pregenerated:
-                        traj_saved = _load_pregenerated_traj(from_pregenerated, i)
                         full_generated_text = traj_saved["generated_text"]
                         assistant_prefill = messages[-1]["content"] if messages[-1]["role"] == "assistant" else ""
                         gen = GenerationResult(
@@ -524,6 +708,11 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                             prompt_end_position=traj_saved["prompt_end_position"],
                             generated_end_position=traj_saved["generated_end_position"],
                             past_key_values=None,
+                        )
+                    elif is_qwen_model_name(model_name) and thinking:
+                        gen, assistant_prefill, full_generated_text = generate_qwen_outside_cot(
+                            llm, messages, max_new_tokens, temperature=temperature,
+                            prompt_type=prompt_type, experimental_extra_box=experimental_extra_box,
                         )
                     elif experimental_extra_box:
                         gen, assistant_prefill, full_generated_text = generate_continuation(llm, messages, max_new_tokens, temperature=temperature)
@@ -534,12 +723,34 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                         assistant_prefill = messages[-1]["content"] if messages[-1]["role"] == "assistant" else ""
                         full_generated_text = assistant_prefill + gen.generated_text
 
+                    generation_time = time.time() - t_generation_start
+
+                    # For Qwen, CoT steps are outside </think>. Even without
+                    # --thinking the chat template emits the <think> opener in
+                    # the prefill, so a generated trajectory often contains a
+                    # lone </think> mid-stream. Strip everything up to and
+                    # including that closer so parse_output doesn't pick up
+                    # the model's scratchwork "Step N:" lines from inside.
+                    if is_qwen_model_name(model_name) and "</think>" in full_generated_text:
+                        think_end = full_generated_text.find("</think>")
+                        post_think_start = think_end + len("</think>")
+                        post_think_content = full_generated_text[post_think_start:]
+                        extra_box_suffix = "\nTherefore the answer is \\boxed{" if experimental_extra_box else None
+                        parsed: ParsedOutput = parse_output(
+                            post_think_content,
+                            extra_box_suffix=extra_box_suffix,
+                            llama_answer_cleanup=False,
+                        )
+                        for attr in ("answer_fullstring_start", "answer_start", "answer_sentence_start"):
+                            val = getattr(parsed, attr)
+                            if val is not None:
+                                setattr(parsed, attr, post_think_start + val)
                     # For type 2 the model generates freely and may wrap reasoning in
                     # <think>...</think>.  CoT steps are extracted from *inside* the
                     # think block, while the answer is extracted from the text *after*
                     # </think>.  We then shift all character offsets back so they are
                     # relative to full_generated_text (which confidence.py indexes into).
-                    if prompt_type == 2:
+                    elif prompt_type == 2:
                         think_match = re.search(r"<think>(.*?)</think>(.*)", full_generated_text, re.DOTALL)
                         if think_match:
                             # Parse CoT steps from inside <think>...</think>
@@ -614,6 +825,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                     answer_token_start_position = None
 
                 confidence_error = None
+                confidence_timings = None
                 if confidence and parsed.final_answer:
                     llm.switch_attn_implementation("confidence")
                     try:
@@ -643,7 +855,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                             confidence_error = str(exc)
                             logger.warning(
                                 "Confidence scoring skipped for entry %s due to step-alignment failure: %s",
-                                entry["id"],
+                                source_entry["id"],
                                 exc,
                             )
                             confidence_score = None
@@ -655,6 +867,26 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                                 debug_info["confidence_error"] = confidence_error
                             confidence_score = asdict(confidence_score_obj)
                             confidence_score.pop("debug_info", None)
+
+                            # Extract granular timing from confidence_score_obj.timings
+                            confidence_timings = {
+                                "vanilla_meanprob_total_seconds": confidence_score_obj.timings.vanilla_meanprob_total_seconds,
+                                "vanilla_meanprob_forward_seconds": confidence_score_obj.timings.vanilla_meanprob_forward_seconds,
+                                "vanilla_meanent_total_seconds": confidence_score_obj.timings.vanilla_meanent_total_seconds,
+                                "vanilla_meanent_forward_seconds": confidence_score_obj.timings.vanilla_meanent_forward_seconds,
+                                "vanilla_indirect1_total_seconds": confidence_score_obj.timings.vanilla_indirect1_total_seconds,
+                                "vanilla_indirect1_forward_seconds": confidence_score_obj.timings.vanilla_indirect1_forward_seconds,
+                                "vanilla_verbconf_total_seconds": confidence_score_obj.timings.vanilla_verbconf_total_seconds,
+                                "vanilla_verbconf_forward_seconds": confidence_score_obj.timings.vanilla_verbconf_forward_seconds,
+                                "vanilla_verbconf_joint_probs_seconds": confidence_score_obj.timings.vanilla_verbconf_joint_probs_seconds,
+                                "bootstrap_meanprob_total_seconds": confidence_score_obj.timings.bootstrap_meanprob_total_seconds,
+                                "bootstrap_meanprob_forward_seconds": confidence_score_obj.timings.bootstrap_meanprob_forward_seconds,
+                                "bootstrap_indirect1_total_seconds": confidence_score_obj.timings.bootstrap_indirect1_total_seconds,
+                                "bootstrap_indirect1_forward_seconds": confidence_score_obj.timings.bootstrap_indirect1_forward_seconds,
+                                "bootstrap_verbconf_total_seconds": confidence_score_obj.timings.bootstrap_verbconf_total_seconds,
+                                "bootstrap_verbconf_forward_seconds": confidence_score_obj.timings.bootstrap_verbconf_forward_seconds,
+                                "bootstrap_verbconf_joint_probs_seconds": confidence_score_obj.timings.bootstrap_verbconf_joint_probs_seconds,
+                            }
                     finally:
                         # Always reset to "cot" mode, even if compute_all_confidence_scores throws
                         llm.switch_attn_implementation("cot")
@@ -674,7 +906,7 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                         "prompt_end_position": gen.prompt_end_position,
                         "generated_end_position": gen.generated_end_position,
                         "parsed_output": parsed,
-                        "entry": {"id": entry["id"], "question": entry["question"], "answer": entry["answer"]},
+                        "entry": {"id": source_entry["id"], "question": source_entry["question"], "answer": source_entry["answer"]},
                         # All inputs for compute_all_confidence_scores (except llm)
                         "confidence_info": {
                             "generated_text": gen.generated_text,
@@ -703,10 +935,10 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                 else:
                     eval_result = evaluate_one({
                         "generated_text": full_generated_text,
-                        "ground_truth": entry["answer"],
+                        "ground_truth": source_entry["answer"],
                         "prediction": parsed.final_answer,
-                        "func_description": (entry.get("metadata") or {}).get("functions", []),
-                        "test_category": (entry.get("metadata") or {}).get("bfcl_type", "simple_python"),
+                        "func_description": (source_entry.get("metadata") or {}).get("functions", []),
+                        "test_category": (source_entry.get("metadata") or {}).get("bfcl_type", "simple_python"),
                     }, dataset_name)
 
                     if eval_result:
@@ -720,9 +952,9 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                         correct = None
 
                 traj = {
-                    "id":                           entry["id"],
-                    "question":                     entry["question"],
-                    "ground_truth":                 entry["answer"],
+                    "id":                           source_entry["id"],
+                    "question":                     source_entry["question"],
+                    "ground_truth":                 source_entry["answer"],
                     "prompt":                       gen.prompt_text,
                     "cot_steps":                    parsed.cot_steps,
                     "final_answer":                 parsed.final_answer,
@@ -735,38 +967,40 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                     "confidence_method": ("vanilla_only" if vanilla_only else "bootstrap" if experimental_bootstrap else "fake_bootstrap" if experimental_fake_bootstrap else "fake_bootstrap_hook" if experimental_fake_bootstrap_hook else "coinflip_true" if experimental_coinflip_true else {None: "coin_flip", "default": f"jackknife{'_grid' if experimental_grid else ''}_default", "true": f"coin_flip+jackknife{'_grid' if experimental_grid else ''}_true"}[experimental_jackknife]) if confidence_score else None,
                     "confidence_modification": experimental_modification if confidence_score else None,
                     "confidence_error":            confidence_error,
+                    "confidence_timings":          confidence_timings,
                     "debug_info":                   debug_info if debug_conf else None,
                     "runtime_seconds":              time.time() - t_sample,
+                    "generation_seconds":           generation_time,
                     "correct":                      correct,
                 }
 
                 if dataset_name == "bfcl":
-                    meta = entry.get("metadata") or {}
+                    meta = source_entry.get("metadata") or {}
                     traj["func_description"] = meta.get("functions", [])
                     traj["test_category"] = meta.get("bfcl_type", "simple_python")
 
                 if nb_cot_samples > 1:
                     traj["sample_idx"] = sample_idx
                     traj_file = os.path.join(out_dir, f"traj_{i}_sample_{sample_idx}.json")
-                    envelope = {"index": i, "sample_idx": sample_idx, "question": entry["question"], "trajectory": traj}
+                    envelope = {"index": i, "sample_idx": sample_idx, "question": source_entry["question"], "trajectory": traj}
                 else:
                     traj_file = os.path.join(out_dir, f"traj_{i}.json")
-                    envelope = {"index": i, "question": entry["question"], "trajectory": traj}
+                    envelope = {"index": i, "question": source_entry["question"], "trajectory": traj}
 
                 with open(traj_file, "w") as f:
                     json.dump(envelope, f, indent=2)
 
               except Exception as e:
-                logger.error(f"Error processing entry {i} sample {sample_idx} (id={entry['id']}): {e}", exc_info=True)
+                logger.error(f"Error processing entry {i} sample {sample_idx} (id={source_entry['id']}): {e}", exc_info=True)
                 # Recover GPU memory after OOM so subsequent iterations can proceed
                 if isinstance(e, torch.cuda.OutOfMemoryError):
                     torch.cuda.empty_cache()
                     logger.warning("Cleared CUDA cache after OOM error")
-                errors.append({"index": i, "sample_idx": sample_idx, "id": entry["id"], "error": str(e)})
+                errors.append({"index": i, "sample_idx": sample_idx, "id": source_entry["id"], "error": str(e)})
                 traj = {
-                    "id":                           entry["id"],
-                    "question":                     entry["question"],
-                    "ground_truth":                 entry["answer"],
+                    "id":                           source_entry["id"],
+                    "question":                     source_entry["question"],
+                    "ground_truth":                 source_entry["answer"],
                     "prompt":                       None,
                     "error":                        str(e),
                     "cot_steps":                    None,
@@ -780,30 +1014,32 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                     "confidence_method":           None,
                     "confidence_modification":     None,
                     "confidence_error":            None,
+                    "confidence_timings":          None,
                     "runtime_seconds":              time.time() - t_sample,
+                    "generation_seconds":           None,
                     "correct":                      None,
                 }
                 if nb_cot_samples > 1:
                     traj["sample_idx"] = sample_idx
                     traj_file = os.path.join(out_dir, f"traj_{i}_sample_{sample_idx}.json")
-                    envelope = {"index": i, "sample_idx": sample_idx, "question": entry["question"], "trajectory": traj}
+                    envelope = {"index": i, "sample_idx": sample_idx, "question": source_entry["question"], "trajectory": traj}
                 else:
                     traj_file = os.path.join(out_dir, f"traj_{i}.json")
-                    envelope = {"index": i, "question": entry["question"], "trajectory": traj}
+                    envelope = {"index": i, "question": source_entry["question"], "trajectory": traj}
                 with open(traj_file, "w") as f:
                     json.dump(envelope, f, indent=2)
 
         except Exception as e:
             # Entry-level error (e.g., load_messages failed before sample loop)
-            logger.error(f"Error processing entry {i} (id={entry['id']}): {e}", exc_info=True)
+            logger.error(f"Error processing entry {i} (id={source_entry['id']}): {e}", exc_info=True)
             if isinstance(e, torch.cuda.OutOfMemoryError):
                 torch.cuda.empty_cache()
                 logger.warning("Cleared CUDA cache after OOM error")
-            errors.append({"index": i, "id": entry["id"], "error": str(e)})
+            errors.append({"index": i, "id": source_entry["id"], "error": str(e)})
             traj = {
-                "id":                           entry["id"],
-                "question":                     entry["question"],
-                "ground_truth":                 entry["answer"],
+                "id":                           source_entry["id"],
+                "question":                     source_entry["question"],
+                "ground_truth":                 source_entry["answer"],
                 "prompt":                       None,
                 "error":                        str(e),
                 "cot_steps":                    None,
@@ -817,12 +1053,14 @@ def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, datas
                 "confidence_method":           None,
                 "confidence_modification":     None,
                 "confidence_error":            None,
+                "confidence_timings":          None,
                 "runtime_seconds":              time.time() - t0,
+                "generation_seconds":           None,
                 "correct":                      None,
             }
             traj_file = os.path.join(out_dir, f"traj_{i}.json")
             with open(traj_file, "w") as f:
-                json.dump({"index": i, "question": entry["question"], "trajectory": traj}, f, indent=2)
+                json.dump({"index": i, "question": source_entry["question"], "trajectory": traj}, f, indent=2)
 
     if not debug:
         cache_file = os.path.join(debug_dir, f"gen_parsed_type{prompt_type}.pkl")
@@ -948,6 +1186,7 @@ def main(args):
         cot_sample_idx=args.cot_sample_idx,
         experimental_fake_bootstrap=args.experimental_fake_bootstrap,
         experimental_fake_bootstrap_hook=args.experimental_fake_bootstrap_hook,
+        backend=args.backend,
     )
 
     if errors:

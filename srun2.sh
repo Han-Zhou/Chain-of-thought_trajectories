@@ -5,7 +5,7 @@ srun \
     --qos=high \
     --partition=compute \
     --nodes=1 \
-    --gres=gpu:1 \
+    --gres=gpu:2 \
     --time=2:00:00 \
     --mem=128G \
     --cpus-per-task=24 \

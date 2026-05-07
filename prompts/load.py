@@ -8,8 +8,9 @@ from prompts.cot_prompt import (
     SYSTEM_WITHOUT_BOXED,
     SYSTEM_COT_ONLY,
     SYSTEM_QWEN_THINKING,
+    SYSTEM_QWEN_THINKING_OUTSIDE,
 )
-from utils.model_utils import is_llama_model_name
+from utils.model_utils import is_llama_model_name, is_qwen_model_name
 from prompts.few_shot_prompt import FEW_SHOT_PROMPT_REGISTRY, THINKING_TOKENS
 
 # Canonical dataset names supported by the registry.
@@ -101,12 +102,18 @@ def _build_messages(
     thinking_token_open, _ = _resolve_thinking_tokens(model_name, thinking)
 
     if prompt_type == 1:
-        assistant_start = assistant_start.format(thinking_token_open=thinking_token_open)
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-            {"role": "assistant", "content": assistant_start},
-        ]
+        if thinking and is_qwen_model_name(model_name):
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+        else:
+            assistant_start = assistant_start.format(thinking_token_open=thinking_token_open)
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+                {"role": "assistant", "content": assistant_start},
+            ]
     else:
         user_prompt += "\n\nLet's think step-by-step."
         messages = [
@@ -181,7 +188,7 @@ def load_messages(dataset: str, few_shot: bool, entry: dict, model_name: str, th
 
     # Swap system prompt for Qwen + thinking
     if thinking and "qwen" in model_name.lower():
-        system_prompt = system_prompt.replace(SYSTEM, SYSTEM_QWEN_THINKING)
+        system_prompt = system_prompt.replace(SYSTEM, SYSTEM_QWEN_THINKING_OUTSIDE)
 
     # Append dataset-specific answer-format instruction
     answer_format = DATASET_ANSWER_FORMAT.get(registry_key)
