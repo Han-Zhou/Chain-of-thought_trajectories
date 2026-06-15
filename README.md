@@ -9,18 +9,12 @@ Generate Chain-of-Thought trajectories for the following datasets:
 5. CodeQA
 6. CS1QA
 7. HotPotQA
-8. College_Math_Test
-9. OlympiadBench
-10. Math500
-11. HLE
+8. Math500
 
 
 Use the following models:
 ```
 llama3.1-8B (Instruct)
-openai/gpt-oss-20b
 qwen3.5/27B
 ```
 
-# temp
-# temp
