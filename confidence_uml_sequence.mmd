@@ -1,0 +1,48 @@
+sequenceDiagram
+    autonumber
+    participant Caller
+    participant R as SamplerRunner
+    participant M as SamplerMethod
+    participant B as Backend
+    participant E as ConfidenceEngine
+    participant S as AnswerSuffix
+
+    Caller->>R: run(method, ctx)
+    R->>R: t0 = now()
+    R->>M: propose(ctx)
+    M->>B: generate(prefix, nb, temperature, ctx.question_cache)
+    B-->>M: GenerationBatch
+    M-->>R: list~Candidate~
+    R->>R: t1 = now()  (generation_time = t1 - t0)
+
+    loop for each Candidate
+        R->>M: validate(cand, ctx)
+        alt rejected (e.g. answer != reference)
+            M-->>R: false
+        else accepted
+            M-->>R: true
+            R->>M: to_scored_completion(cand, ctx)
+            alt cand has cache (vanilla / rejection)
+                M-->>R: ScoredCompletion(cache=cand.cache, atp=cand.probs)
+            else string-only candidate (lawyer / stepbootstrap)
+                M->>S: format_boxed(reference_answer)
+                S-->>M: "\nThe answer is \\boxed{...}."
+                M->>B: forward(question + cot + suffix, ctx.question_cache)
+                B-->>M: ForwardResult
+                M-->>R: ScoredCompletion(cache, atp)
+            end
+
+            R->>E: score(question, sc)
+            E->>S: indirect_continuation()
+            E->>B: forward(prefix_with_answer + indirect, sc.cache)
+            B-->>E: ForwardResult
+            E->>S: verbal_continuation()
+            E->>B: forward(prefix_with_answer + verbal, sc.cache)
+            B-->>E: ForwardResult
+            E-->>R: Confidence
+            R->>R: samples.append(Sample(...))
+        end
+    end
+
+    R->>R: t2 = now()  (confidence_time = t2 - t1)
+    R-->>Caller: SamplerResult(samples, Timings(t1-t0, t2-t1))
