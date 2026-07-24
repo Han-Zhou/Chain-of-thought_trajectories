@@ -8,7 +8,7 @@ import os
 import re
 import urllib.request
 
-import datasets as hf_datasets
+# import datasets as hf_datasets
 
 from dataloader.base import BaseBenchmarkDataset
 

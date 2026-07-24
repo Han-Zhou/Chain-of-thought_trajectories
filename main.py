@@ -131,6 +131,36 @@ def parse():
         choices=["hf", "vllm"],
         help="Backend for model inference. vLLM is faster but incompatible with --confidence.",
     )
+    args.add_argument(
+        "--vllm_max_model_len",
+        type=int,
+        default=None,
+        help="Maximum vLLM context length. Uses the model default when omitted.",
+    )
+    args.add_argument(
+        "--vllm_gpu_memory_utilization",
+        type=float,
+        default=0.92,
+        help="Fraction of GPU memory available to the vLLM engine.",
+    )
+    args.add_argument(
+        "--vllm_tensor_parallel_size",
+        type=int,
+        default=1,
+        help="Number of GPUs used for vLLM tensor parallelism.",
+    )
+    args.add_argument(
+        "--vllm_max_num_seqs",
+        type=int,
+        default=None,
+        help="Maximum number of sequences scheduled concurrently by vLLM.",
+    )
+    args.add_argument(
+        "--vllm_language_model_only",
+        action="store_true",
+        default=False,
+        help="Load only the language model for hybrid text/multimodal models.",
+    )
 
     args.add_argument(
         "--type",
@@ -329,6 +359,14 @@ def parse():
         args.error("--dataset is required when not using --pickle_path.")
     if parsed.pickle_path is not None and parsed.dataset is None:
         args.error("--dataset is required when using --pickle_path (needed for evaluation).")
+    if parsed.vllm_max_model_len is not None and parsed.vllm_max_model_len < 1:
+        args.error("--vllm_max_model_len must be >= 1.")
+    if not 0 < parsed.vllm_gpu_memory_utilization <= 1:
+        args.error("--vllm_gpu_memory_utilization must be in (0, 1].")
+    if parsed.vllm_tensor_parallel_size < 1:
+        args.error("--vllm_tensor_parallel_size must be >= 1.")
+    if parsed.vllm_max_num_seqs is not None and parsed.vllm_max_num_seqs < 1:
+        args.error("--vllm_max_num_seqs must be >= 1.")
     if parsed.vanilla_only:
         if parsed.experimental_jackknife is not None:
             args.error("--vanilla_only is mutually exclusive with --experimental_jackknife.")
@@ -624,11 +662,20 @@ def generate_continuation(llm, messages, max_new_tokens, temperature=0.0, suffix
     return gen2, assistant_prefill, full_generated_text
 
 
-def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=None, discord=False, nb_dropout_samples=3, experimental_extra_box=False, experimental_modification=None, experimental_grid=False, tag=None, cot_dir=None, temperature=0.0, nb_cot_samples=1, vanilla_only=False, from_pregenerated=None, experimental_preserve_final_step=False, experimental_bootstrap=False, experimental_coinflip_true=False, experimental_hollow=None, cot_sample_idx=None, experimental_fake_bootstrap=False, experimental_fake_bootstrap_hook=False, backend="hf"):
+def generate_trajectories(model_name, dataloader, max_new_tokens, out_dir, dataset_name=None, shot_mode="zero", thinking=False, confidence=None, debug=False, prompt_type=1, debug_conf=False, experimental_jackknife=None, discord=False, nb_dropout_samples=3, experimental_extra_box=False, experimental_modification=None, experimental_grid=False, tag=None, cot_dir=None, temperature=0.0, nb_cot_samples=1, vanilla_only=False, from_pregenerated=None, experimental_preserve_final_step=False, experimental_bootstrap=False, experimental_coinflip_true=False, experimental_hollow=None, cot_sample_idx=None, experimental_fake_bootstrap=False, experimental_fake_bootstrap_hook=False, backend="hf", vllm_max_model_len=None, vllm_gpu_memory_utilization=0.92, vllm_tensor_parallel_size=1, vllm_max_num_seqs=None, vllm_language_model_only=False):
 
     debug_dir = "debug_cache"
 
-    llm = LLM(model_name, thinking, backend=backend)
+    llm = LLM(
+        model_name,
+        thinking,
+        backend=backend,
+        vllm_max_model_len=vllm_max_model_len,
+        vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+        vllm_tensor_parallel_size=vllm_tensor_parallel_size,
+        vllm_max_num_seqs=vllm_max_num_seqs,
+        vllm_language_model_only=vllm_language_model_only,
+    )
     tokenizer = llm.tokenizer
     is_llama = is_llama_model_name(model_name)
 
@@ -1187,6 +1234,11 @@ def main(args):
         experimental_fake_bootstrap=args.experimental_fake_bootstrap,
         experimental_fake_bootstrap_hook=args.experimental_fake_bootstrap_hook,
         backend=args.backend,
+        vllm_max_model_len=args.vllm_max_model_len,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_tensor_parallel_size=args.vllm_tensor_parallel_size,
+        vllm_max_num_seqs=args.vllm_max_num_seqs,
+        vllm_language_model_only=args.vllm_language_model_only,
     )
 
     if errors:

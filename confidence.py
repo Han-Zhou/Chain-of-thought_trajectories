@@ -8,11 +8,10 @@ import torch
 import torch.nn as nn
 import copy
 from collections import defaultdict
-from transformers import DynamicCache
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.llama.modeling_llama import eager_attention_forward, repeat_kv
 from llm import LLM
+from utils.cache_compat import DynamicCache, Qwen3_5DynamicCache
 from utils.confidence_modification import apply_confidence_modification
 from utils.text_utils import find_token_indices_from_end, find_token_overlap
 from parsing import parse_output
@@ -415,7 +414,11 @@ def compute_all_confidence_scores(
             )
         device = next(llm.model.parameters()).device
         early_tokens = base_tokens[:, :early_late_split].to(device)
-        empty_cache = Qwen3_5DynamicCache(llm.model.config) if "qwen" in llm.model_name.lower() else DynamicCache()
+        empty_cache = (
+            Qwen3_5DynamicCache(config=llm.model.config)
+            if "qwen" in llm.model_name.lower()
+            else DynamicCache(config=llm.model.config)
+        )
         with torch.no_grad():
             early_output = llm.model(input_ids=early_tokens, past_key_values=empty_cache)
         precomputed_early_cache = early_output.past_key_values
@@ -2309,7 +2312,11 @@ def dropout_forward(
         crop_cache(early_cache, early_late_split)
     else:
         with torch.no_grad():
-            empty_cache = Qwen3_5DynamicCache(llm.model.config) if "qwen" in llm.model_name.lower() else DynamicCache()
+            empty_cache = (
+                Qwen3_5DynamicCache(config=llm.model.config)
+                if "qwen" in llm.model_name.lower()
+                else DynamicCache(config=llm.model.config)
+            )
             early_output = llm.model(input_ids=early_tokens, past_key_values=empty_cache)
         early_cache = early_output.past_key_values
 

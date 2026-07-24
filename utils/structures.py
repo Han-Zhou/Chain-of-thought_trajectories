@@ -1,7 +1,7 @@
 import torch
 from dataclasses import dataclass, field
-from transformers import DynamicCache
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+
+from utils.cache_compat import DynamicCache, Qwen3_5DynamicCache
 
 
 

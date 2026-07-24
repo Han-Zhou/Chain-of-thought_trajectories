@@ -13,13 +13,13 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 from pathlib import Path
 import numpy as np
 import torch
-from flash_attn import flash_attn_func
+# from flash_attn import flash_attn_func
 from dotenv import load_dotenv
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, StoppingCriteriaList, StopStringCriteria, StoppingCriteria, DynamicCache, FineGrainedFP8Config, GPTQConfig, Qwen3_5ForConditionalGeneration, Qwen3_5ForCausalLM
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, StoppingCriteriaList, StopStringCriteria, StoppingCriteria, FineGrainedFP8Config, GPTQConfig, Qwen3_5ForConditionalGeneration, Qwen3_5ForCausalLM
 # from auto_fp8 import AutoFP8ForCausalLM, BaseQuantizeConfig
 
 
+from utils.cache_compat import DynamicCache, Qwen3_5DynamicCache
 from utils.enum import MODEL_DICT
 from utils.structures import GenerationResult
 
@@ -73,7 +73,17 @@ def _resolve_attn_implementation(model_name: str) -> str:
 
 
 class LLM():
-    def __init__(self, model_name: str, thinking: bool, backend: str = "hf"):
+    def __init__(
+        self,
+        model_name: str,
+        thinking: bool,
+        backend: str = "hf",
+        vllm_max_model_len: int | None = None,
+        vllm_gpu_memory_utilization: float = 0.92,
+        vllm_tensor_parallel_size: int = 1,
+        vllm_max_num_seqs: int | None = None,
+        vllm_language_model_only: bool = False,
+    ):
 
         logger.info(f"Loading model {model_name} with backend {backend}...")
         self.model_name = model_name
@@ -84,11 +94,22 @@ class LLM():
             # vLLM backend: lazy import and load
             try:
                 from vllm import LLM as vLLM_LLM, SamplingParams
-                self.vllm_model = vLLM_LLM(
+
+                vllm_kwargs = dict(
                     model=model_name,
                     dtype="bfloat16",
                     trust_remote_code=True,
+                    gpu_memory_utilization=vllm_gpu_memory_utilization,
+                    tensor_parallel_size=vllm_tensor_parallel_size,
+                    language_model_only=vllm_language_model_only,
                 )
+                if vllm_max_model_len is not None:
+                    vllm_kwargs["max_model_len"] = vllm_max_model_len
+                if vllm_max_num_seqs is not None:
+                    vllm_kwargs["max_num_seqs"] = vllm_max_num_seqs
+
+                logger.info("vLLM engine parameters: %s", vllm_kwargs)
+                self.vllm_model = vLLM_LLM(**vllm_kwargs)
                 self.vllm_sampling_params_class = SamplingParams
                 self.tokenizer = AutoTokenizer.from_pretrained(model_name)
                 logger.info("vLLM backend loaded successfully")
@@ -473,7 +494,5 @@ class LLM():
 #     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
 #         last_ids = input_ids[:,-len(self.eos_sequence):].tolist()
 #         return self.eos_sequence in last_ids
-
-
 
 
