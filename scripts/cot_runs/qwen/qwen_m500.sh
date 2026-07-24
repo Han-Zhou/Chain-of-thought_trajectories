@@ -16,7 +16,8 @@ python3 main.py \
     --vanilla_only \
     --temperature 0.9 \
     --debug_conf \
-    --tag cots-429-qwen-m500-8 \
+    --tag debug3-cots-723-qwen-m500-32 \
     --experimental_extra_box \
-    --nb_cot_samples 8 \
+    --nb_cot_samples 32 \
+    --sample_size 3 \
     --discord

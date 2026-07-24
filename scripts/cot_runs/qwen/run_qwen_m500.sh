@@ -19,7 +19,7 @@ notify_discord() {
     "$DISCORD_WEBHOOK" > /dev/null 2>&1
 }
 
-trap 'notify_discord "❌ **qwen-cot-m500-8** failed on $(hostname) (Job $SLURM_JOB_ID) at line $LINENO with exit code $?"' ERR
+trap 'notify_discord "❌ **qwen-cot-m500-32** failed on $(hostname) (Job $SLURM_JOB_ID) at line $LINENO with exit code $?"' ERR
 
 set -euo pipefail
 
@@ -29,4 +29,4 @@ conda activate cot
 
 ./scripts/cot_runs/qwen/qwen_m500.sh
 
-notify_discord "✅ **qwen-cot-m500-8** completed successfully (Job $SLURM_JOB_ID)"
+notify_discord "✅ **qwen-cot-m500-32** completed successfully (Job $SLURM_JOB_ID)"
